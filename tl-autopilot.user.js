@@ -285,7 +285,7 @@
       const notes = [];
       if (same) notes.push('与“出售快捷键”相同，出售快捷键暂不生效');
       if (ctrlDeposit && depositKeys.includes('shift')) notes.push('游戏自带 Shift + 右键使用 / 穿戴物品，这个组合会改为整组存入');
-      return { depositKeys: notes.join('；'), sellKeys: same ? '与“整组存入快捷键”相同，暂不生效，请换一个组合' : '' };
+      return { depositKeys: notes.join('；'), sellKeys: same ? '与“整组存取快捷键”相同，暂不生效，请换一个组合' : '' };
     }
     const transferObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
     function transferFile(text) {
@@ -2174,9 +2174,16 @@
         [2, 3, 4].includes(item.itemTmpl?.type) && !['HP', 'MP', 'hp', 'mp'].some(attr => potionEffect(item.itemTmpl, attr) > 0))
         .map(({ id, itemId, count, itemTmpl }) => ({ bagItemId: id, itemId, count, name: itemTmpl.name }));
     }
-    function bagTabItems(tabText, character) {
+    // Bag and warehouse tabs file stacks alike: 道具 is template type 2, 材料 types 3 and 4.
+    function tabItems(tabText, items) {
       const types = tabText === '道具' ? [2] : tabText === '材料' ? [3, 4] : [];
-      return array(character?.bagItems).filter(item => types.includes(item?.itemTmpl?.type));
+      return array(items).filter(item => types.includes(item?.itemTmpl?.type));
+    }
+    function bagTabItems(tabText, character) {
+      return tabItems(tabText, character?.bagItems);
+    }
+    function warehouseTabItems(tabText, character) {
+      return tabItems(tabText, character?.warehouseItems);
     }
     function bagCellItem(tabText, index, character) {
       if (!Number.isInteger(index) || index < 0 || index >= 72) return null;
@@ -3787,7 +3794,7 @@
       statsNumber,
       doubleExpUntil,
       potionEffect,
-      sortDepositPlan, bagCellItem, bagTabItems, warehouseKeys, keysMatch, shortcutConflicts, loadoutProtection,
+      sortDepositPlan, bagCellItem, bagTabItems, warehouseTabItems, warehouseKeys, keysMatch, shortcutConflicts, loadoutProtection,
       potionChoices,
       potionSettings,
       potionPick,
@@ -8275,7 +8282,8 @@
         this.controller.manualUntil = Math.max(this.controller.manualUntil, Date.now() + ms + 5000);
       }
       async sort(event) {
-        if (this.sorting || this.runKind === 'sell' || !this.controller.prefs.convenience.sortDeposit) return;
+        // Only a deposit run is waited for: sorting during a sale or withdrawal could put items straight back.
+        if (this.sorting || (this.runKind && this.runKind !== 'deposit') || !this.controller.prefs.convenience.sortDeposit) return;
         const button = event.target?.closest?.('.btn-sort-bag, .btn-sort-bag-small');
         if (!this.bagWindow(button) || !this.open()) return;
         this.sorting = true;
@@ -8309,29 +8317,37 @@
         if (cells.filter(filled).length !== Math.min(72, P.bagTabItems(tab, character).length)) return null;
         return P.bagCellItem(tab, cells.indexOf(cell), character);
       }
+      warehouseTab(target) {
+        return target?.closest?.('.warehouse-window')?.querySelector('.game-tab-button.is-active')?.textContent.trim();
+      }
       warehouseCell(target) {
         const cell = target?.closest?.('div.grid-slot'), grid = cell?.parentElement;
         if (!grid?.matches('.warehouse-grid') || !cell.querySelector('.v-img')) return;
-        const win = grid.closest('.warehouse-window');
-        if (win?.querySelector('.game-tab-button.is-active')?.textContent.trim() !== '装备') return;
+        const tab = this.warehouseTab(grid), character = this.bridge.character();
+        const list = tab === '装备' ? P.array(character?.warehouseEquips).filter(e => e?.equipTmpl) :
+          P.warehouseTabItems(tab, character);
         const cells = Array.from(grid.children).filter(node => node.matches('div.grid-slot'));
-        const list = P.array(this.bridge.character()?.warehouseEquips).filter(e => e?.equipTmpl);
         if (cells.filter(node => node.querySelector('.v-img')).length !== Math.min(P.WAREHOUSE_CAPACITY, list.length)) return;
         const index = cells.indexOf(cell);
         if (index < P.WAREHOUSE_CAPACITY) return list[index];
       }
+      shortcutKind(target) {
+        if (this.bagWindow(target)) return 'deposit';
+        return this.warehouseTab(target) === '装备' ? 'sell' : 'withdraw';
+      }
       async shortcut(event) {
         if (this.sorting || !this.open()) return;
         const prefs = this.controller.prefs.convenience;
-        const kind = this.bagWindow(event.target) ? 'deposit' : 'sell';
+        const kind = this.shortcutKind(event.target);
         if (this.runKind && this.runKind !== kind) return;
-        const deposit = kind === 'deposit';
+        // Deposit and withdrawal move whole stacks of 道具 and 材料 and share one switch and one shortcut.
+        const stack = kind !== 'sell';
         const mode = this.bridge.stores().get('interaction')?.mode;
         if (mode != null && mode !== 'NORMAL') return;
-        if (deposit ? !prefs.ctrlDeposit : !prefs.sellWarehouse || P.shortcutConflicts(prefs).sellKeys) return;
-        if (!P.keysMatch(event, deposit ? prefs.depositKeys : prefs.sellKeys)) return;
-        const item = deposit ? this.cellItem(event.target) : this.warehouseCell(event.target);
-        if (item?.id == null || (deposit && !(item.count >= 1))) return;
+        if (stack ? !prefs.ctrlDeposit : !prefs.sellWarehouse || P.shortcutConflicts(prefs).sellKeys) return;
+        if (!P.keysMatch(event, stack ? prefs.depositKeys : prefs.sellKeys)) return;
+        const item = kind === 'deposit' ? this.cellItem(event.target) : this.warehouseCell(event.target);
+        if (item?.id == null || (stack && !(item.count >= 1))) return;
         event.preventDefault();
         event.stopPropagation();
         this.queue.push(item.id);
@@ -8371,13 +8387,18 @@
         }
         return true;
       }
-      async deposit(id) {
-        const type = 'WAREHOUSE_DEPOSIT', timeout = '存入仓库没有回应，已停止';
+      deposit(id) {
+        return this.moveStack('WAREHOUSE_DEPOSIT', 'bagItems', 'bagItemId', id, '存入仓库没有回应，已停止');
+      }
+      withdraw(id) {
+        return this.moveStack('WAREHOUSE_WITHDRAW', 'warehouseItems', 'warehouseItemId', id, '取出到背包没有回应，已停止');
+      }
+      async moveStack(type, list, field, id, timeout) {
         if (this.busy(type) && !await this.waitReady(type, timeout)) return null;
         if (!this.open() || !this.bridge.connected) return null;
-        const stack = this.bridge.character()?.bagItems?.find(item => item?.id === id);
+        const stack = this.bridge.character()?.[list]?.find(item => item?.id === id);
         if (!(stack?.count >= 1)) return false;
-        const packet = await this.send(type, { bagItemId: id, count: stack.count });
+        const packet = await this.send(type, { [field]: id, count: stack.count });
         if (!this.open() || packet === false) return null;
         if (!packet) return this.stop(timeout);
         if (packet.success) return true;
@@ -10325,8 +10346,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('套装装备显示角标', 'market.setTag'), true) +
           g('存取',
             f('打开仓库时，背包“整理”顺便存入仓库已有的物品', 'convenience.sortDeposit', { help: '只存道具和材料里仓库已经有的种类，整组存入；回复气血和内力的药品不存' }) +
-            f('右键整组存入道具或材料', 'convenience.ctrlDeposit', { help: '仓库打开时，按住下面的快捷键右键背包里的道具或材料，整组存入，不弹数量窗口' }) +
-            f('整组存入快捷键', 'convenience.depositKeys', { dependsOn: 'convenience.ctrlDeposit', choices: warehouseKeyChoices }) +
+            f('右键整组存取道具或材料', 'convenience.ctrlDeposit', { help: '仓库打开时，按住下面的快捷键右键背包里的道具或材料整组存入，右键仓库里的道具或材料整组取出，不弹数量窗口' }) +
+            f('整组存取快捷键', 'convenience.depositKeys', { dependsOn: 'convenience.ctrlDeposit', choices: warehouseKeyChoices }) +
             f('快捷出售仓库装备', 'convenience.sellWarehouse', { help: '仓库打开并在“装备”页时，按住快捷键右键装备：取出到背包并卖给商店，不可撤销。带宝石、强化、神器或换装方案里的装备先确认。默认关闭' }) +
             f('出售快捷键', 'convenience.sellKeys', { dependsOn: 'convenience.sellWarehouse', choices: warehouseKeyChoices }));
         if (this.section === 'gameTools')
