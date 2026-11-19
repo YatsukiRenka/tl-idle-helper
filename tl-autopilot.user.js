@@ -8534,7 +8534,7 @@
       async pet(root) {
         // This route is not exercised live.
         const slot = root.querySelector('button.material-slot');
-        if (!slot) return this.controller.bridge.stores().get('ui')?.showMessage('请先选择珍兽并进入提升根骨或打书', 'warning');
+        if (!slot) return this.controller.bridge.stores().get('ui')?.showMessage('请先选择珍兽并进入提升悟性或打书', 'warning');
         const before = new Set(root.querySelectorAll('button'));
         slot.click();
         await new Promise((resolve) => requestAnimationFrame(resolve));
@@ -8543,15 +8543,17 @@
         const bags = this.controller.bridge.state().bagItems || [];
         const family = [5025, 5026, 5027].find((id) => options.some((b) => bags.some((item) => item.itemId === id && item.itemTmpl?.name && b.textContent.includes(item.itemTmpl.name))));
         const candidates = bags.filter((b) => b.count > 0 && b.itemId === family);
-        const rank = Number(root.textContent.match(/根骨[^0-9]*([0-9]+)/)?.[1] || 0);
+        const rank = petRootRank(root.textContent);
         const needed = rank % 3 + 1;
         const best = candidates.slice().sort((a, b) => Number(b.count >= needed) - Number(a.count >= needed) || (a.count >= needed && b.count >= needed ? Number(!!b.isBound) - Number(!!a.isBound) : b.count - a.count))[0];
         options[candidates.indexOf(best)]?.click();
       }
     }
+    // The game shows the pet's root rank as "悟性 +N" since the client of 2026-11-19 ("根骨+N" before).
+    const petRootRank = (text) => Number(String(text ?? '').match(/(?:悟性|根骨)\s*\+\s*(\d+)/)?.[1] || 0);
     const arraySafe = (v) => (Array.isArray(v) ? v : []);
     return {
-      WarehouseShortcuts, Filler, Stats, MapRates, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
+      petRootRank, WarehouseShortcuts, Filler, Stats, MapRates, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
     };
   })();
   if (typeof module !== 'undefined' && module.exports) module.exports.TLRuntime = TLRuntime;
