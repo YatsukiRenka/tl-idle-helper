@@ -8167,6 +8167,7 @@
   ('use strict');
   const TLUpdates = (() => {
     const HOUR = 60 * 60 * 1000,
+      IMPORTANT = '【重要】',
       KEY = TLRuntime.PREFIX + ':updates',
       PAGE = 'https://github.com/YatsukiRenka/tl-idle-helper/releases',
       API = 'https://api.github.com/repos/YatsukiRenka/tl-idle-helper/releases/latest',
@@ -8193,6 +8194,17 @@
       const kept = sections.filter((s) => s.items.length).slice(0, 3);
       return kept.length ? { sections: kept } : null;
     }
+    function noteItem(text) {
+      if (typeof text !== 'string') return { text: '', important: false };
+      const important = text.startsWith(IMPORTANT);
+      return { text: important ? text.slice(IMPORTANT.length).trim() : text, important };
+    }
+    function importantItems(notes) {
+      if (!Array.isArray(notes?.sections) || !notes.sections.every(section =>
+        Array.isArray(section?.items) && section.items.every(text => typeof text === 'string'))) return [];
+      return notes.sections.flatMap(section => section.items.map(noteItem)
+        .filter(item => item.important).map(item => item.text));
+    }
     function shouldApply(cache, currentVersion, now) {
       return valid(cache.version) && compare(cache.version, currentVersion) > 0 &&
         (cache.applyVersion !== cache.version ||
@@ -8209,14 +8221,17 @@
       }
       status() {
         const cache = TLRuntime.readStorage(KEY, {}),
-          newer = valid(cache.version) && compare(cache.version, this.currentVersion) > 0;
+          order = valid(cache.version) ? compare(cache.version, this.currentVersion) : -1,
+          important = importantItems(cache.notes).length > 0;
         return {
           busy: this.busy,
           currentVersion: this.currentVersion,
           latestVersion: cache.version || null,
           checkedAt: cache.checkedAt || null,
           nextCheckAt: cache.checkedAt ? cache.checkedAt + HOUR : null,
-          newer,
+          newer: order > 0,
+          important,
+          dialog: order >= 0 && important && cache.dialogVersion !== cache.version && cache.dismissedVersion !== cache.version,
           notes: cache.notes || null,
           error: cache.error || this.localError,
           dismissed: cache.dismissedVersion === cache.version,
@@ -8247,6 +8262,12 @@
         TLRuntime.writeStorage(KEY, cache);
         this.onChange();
       }
+      closeDialog(version) {
+        const cache = TLRuntime.readStorage(KEY, {});
+        if (valid(cache.version) && (version === undefined || version === cache.version))
+          TLRuntime.writeStorage(KEY, { ...cache, dialogVersion: cache.version });
+        this.onChange();
+      }
       markApply(now) {
         const cache = TLRuntime.readStorage(KEY, {});
         cache.applyTries = cache.applyVersion === cache.version ? cache.applyTries + 1 : 1;
@@ -8273,8 +8294,8 @@
           const cache = TLRuntime.readStorage(KEY, {});
           if (cache.checkedAt && Date.now() - cache.checkedAt < (force === true ? 60000 : HOUR)) return;
           this.busy = true;
-          const next = { ...cache, checkedAt: Date.now(), error: '' };
-          TLRuntime.writeStorage(KEY, next);
+          const next = { checkedAt: Date.now(), error: '' };
+          TLRuntime.writeStorage(KEY, { ...cache, ...next });
           if (TLRuntime.readStorage(KEY, {}).checkedAt !== next.checkedAt) {
             this.localError = '浏览器无法保存定时检查记录，请使用油猴管理器检查更新';
             this.busy = false;
@@ -8299,13 +8320,14 @@
               typeof data.html_url !== 'string' || !data.html_url.startsWith(PAGE + '/'))
               throw new Error('GitHub 版本信息格式异常');
             next.version = data.tag_name.slice(1);
+            if (cache.checkedAt == null && compare(next.version, this.currentVersion) === 0) next.dialogVersion = next.version;
             const notes = parseNotes(data.body);
             next.notes = notes ? { title: 'v' + next.version + ' 更新内容', sections: notes.sections } : null;
           } catch (error) {
             next.error = error.message === 'GitHub 版本信息格式异常'
               ? error.message : 'GitHub 暂无法访问';
           } finally {
-            TLRuntime.writeStorage(KEY, next);
+            TLRuntime.writeStorage(KEY, { ...TLRuntime.readStorage(KEY, {}), ...next });
             this.busy = false;
             this.onChange();
           }
@@ -8313,7 +8335,7 @@
         return this.status();
       }
     }
-    return { Checker, compare, parseNotes, shouldApply, HOUR, KEY, PAGE };
+    return { Checker, compare, parseNotes, importantItems, noteItem, shouldApply, IMPORTANT, HOUR, KEY, PAGE };
   })();
 
   ('use strict');
@@ -8379,6 +8401,9 @@
 .hud.compact,:host([data-theme="light"]){--bg:#f3f3f3;--surface:#ffffff;--surface-alt:#ebebeb;--control:#ffffff;--stroke:#d6d6d6;--stroke-strong:#868686;--divider:#e6e6e6;--text:#1a1a1a;--text-strong:#000000;--text-2:#5a5a5a;--text-3:#767676;--accent:#c99a1c;--accent-hover:#b98a12;--on-accent:#1f1700;--accent-text:#7d5800;--accent-soft:rgba(201,154,28,.16);--ok:#0f7b0f;--warn:#9a5b00;--err:#c42b1c;--hover:rgba(0,0,0,.045);--pressed:rgba(0,0,0,.025);--shadow:0 16px 40px rgba(0,0,0,.16);color-scheme:light}
 :host{all:initial;font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;color:var(--text);font-size:13px;line-height:1.5;font-variant-numeric:tabular-nums}
 *{box-sizing:border-box}[hidden]{display:none!important}
+.update-backdrop{position:fixed;inset:0;z-index:2;pointer-events:auto;display:grid;place-items:center;padding:16px;background:color-mix(in srgb,var(--on-accent) 55%,transparent)}
+.update-dialog{width:min(480px,100%);max-height:100%;overflow:auto;overscroll-behavior:contain;overflow-wrap:anywhere;padding:20px;border:1px solid var(--stroke);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}
+.update-dialog h2{margin:0 0 12px;color:var(--text-strong)}
 ::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:var(--stroke);border-radius:4px}::-webkit-scrollbar-track{background:transparent}
 @supports not selector(::-webkit-scrollbar){*{scrollbar-width:thin;scrollbar-color:var(--stroke) transparent}}
 button,input,select,textarea{font:inherit;color:inherit}button,summary{cursor:pointer}
@@ -8608,6 +8633,9 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         this.roleKey = '';
         this.summaryHTML = null;
         window.addEventListener('keydown', event => this.disguiseKeydown(event), true);
+        window.addEventListener('storage', event => {
+          if (event.key === TLUpdates.KEY || event.key === null) this.controller.paint(true);
+        });
         this.mount();
       }
       disguiseKeydown(event) {
@@ -8657,6 +8685,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           this.hudAt = -Infinity;
           this.controller.paint(true);
         } else if (options.enabled) {
+          this.hideUpdateDialog();
           this.reopenWindow = this.windowOpen;
           this.cover = new DisguiseCover(options);
           if (this.windowOpen) {
@@ -9961,9 +9990,78 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             { html: (pets.active?.pet.id === entry.pet.id ? this.chip('出战', 'ok') : '') + (entry.pet.locked ? this.chip('锁定') : '') },
           ]));
       }
+      releaseNotesHTML(notes) {
+        const itemHTML = value => {
+          const item = TLUpdates.noteItem(value), text = esc(item.text);
+          return '<li>' + (item.important ? '<strong class="tone-err">' + text + '</strong>' : text) + '</li>';
+        };
+        if (!Array.isArray(notes?.sections)) return '';
+        return notes.sections.filter(section => Array.isArray(section?.items)).map(section =>
+          '<div class="block-title">' + esc(section.title) + '</div><ul class="release-notes">' +
+          section.items.map(itemHTML).join('') + '</ul>').join('');
+      }
+      updateDialogHTML(u) {
+        const message = u.newer ? '当前版本 v' + u.currentVersion + '，建议尽快更新。' : '已更新到这个版本。';
+        const button = (label, primary = false) => '<button type="button" class="btn' +
+          (primary ? ' primary' : '') + '">' + esc(label) + '</button>';
+        return '<section class="update-dialog" role="alertdialog" aria-modal="true" aria-labelledby="important-update-title">' +
+          '<h2 id="important-update-title">' + esc('重要更新 v' + u.latestVersion) + '</h2>' +
+          this.infoBar(message) + this.releaseNotesHTML(u.notes) +
+          '<div class="actions">' + button(u.newer ? '安装新版本' : '知道了', true) +
+          (u.newer ? button('稍后') : '') + '</div></section>';
+      }
+      hideUpdateDialog() {
+        if (!this.updateBackdrop) return;
+        this.updateBackdrop.remove();
+        this.updateBackdrop = null;
+        this.updateDialogKey = null;
+        this.dialogReturnFocus?.focus({ preventScroll: true });
+        this.dialogReturnFocus = null;
+      }
+      syncUpdateDialog(status) {
+        const u = !this.cover && this.controller.prefs.updates.remind && (status ?? this.controller.updates?.status());
+        if (!u?.dialog) return this.hideUpdateDialog();
+        const key = JSON.stringify([u.latestVersion, u.currentVersion, u.notes]);
+        if (key === this.updateDialogKey) return;
+        this.hideUpdateDialog();
+        this.updateDialogKey = key;
+        this.dialogReturnFocus = this.root.activeElement || document.activeElement;
+        while (this.dialogReturnFocus?.shadowRoot?.activeElement)
+          this.dialogReturnFocus = this.dialogReturnFocus.shadowRoot.activeElement;
+        const backdrop = document.createElement('div');
+        backdrop.className = 'update-backdrop';
+        backdrop.innerHTML = this.updateDialogHTML(u);
+        this.updateBackdrop = this.root.appendChild(backdrop);
+        this.bindUpdateDialog(backdrop, u);
+        backdrop.querySelector('.primary').focus();
+      }
+      bindUpdateDialog(backdrop, u) {
+        const buttons = [...backdrop.querySelectorAll('button')];
+        const close = () => this.controller.updates.closeDialog(u.latestVersion);
+        backdrop.addEventListener('click', event => {
+          event.stopPropagation();
+          const button = event.target.closest('button');
+          if (!button) return;
+          if (button === buttons[0] && u.newer) window.open(u.installUrl, '_blank', 'noopener,noreferrer');
+          close();
+        });
+        backdrop.addEventListener('keydown', event => {
+          event.stopPropagation();
+          if (event.key !== 'Escape' && event.key !== 'Tab') return;
+          event.preventDefault();
+          if (event.key === 'Escape') return close();
+          const next = buttons.indexOf(event.target) + (event.shiftKey ? -1 : 1);
+          buttons[(next + buttons.length) % buttons.length].focus();
+        });
+        backdrop.addEventListener('mousedown', event => {
+          event.stopPropagation();
+          if (!event.target.closest('button')) event.preventDefault();
+        });
+        for (const type of ['keyup', 'keypress', 'pointerdown', 'pointerup', 'mouseup', 'dblclick', 'wheel'])
+          backdrop.addEventListener(type, event => event.stopPropagation());
+      }
       updateHTML(u) {
-        const sections = Array.isArray(u.notes?.sections) ? u.notes.sections : [],
-          date = (value) => value ? new Date(value).toLocaleString() : '—';
+        const date = (value) => value ? new Date(value).toLocaleString() : '—';
         return '<div class="update-summary">' +
           this.statRow('当前版本', 'v' + u.currentVersion) + this.statRow('最新版本', u.latestVersion ? 'v' + u.latestVersion : '—', {
             chip: u.latestVersion ? this.chip(u.newer ? '可更新' : '已是最新', u.newer ? 'accent' : 'ok') : '',
@@ -9971,8 +10069,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           (u.busy ? this.infoBar('正在读取公开版本信息') : u.error ? this.infoBar(u.error, 'err') :
             !u.checkedAt ? this.chip('尚未检查公开版本') : '') +
           (u.newer && u.apply?.exhausted ? this.infoBar('已自动刷新 5 次仍是旧版本，请点“安装新版本”。', 'warn') : '') +
-          (u.notes ? this.sectionHTML(u.notes.title, sections.map((section) => '<div class="block-title">' + esc(section.title) +
-            '</div><ul class="release-notes">' + section.items.map((text) => '<li>' + esc(text) + '</li>').join('') + '</ul>').join(''),
+          (u.notes ? this.sectionHTML(u.notes.title, this.releaseNotesHTML(u.notes),
             false, { id: 'release-notes' }) : u.newer ? this.infoBar('更新内容暂未读取，可在发布页查看。') : '') +
           '<div class="actions"><button type="button" class="btn" data-action="checkUpdate">检查更新</button><button type="button" class="btn primary" data-action="openUpdate">打开发布页</button>' +
           (u.newer ? '<button type="button" class="btn" data-action="installUpdate">安装新版本</button><button type="button" class="btn" data-action="dismissUpdate">关闭本版提醒</button>' : '') +
@@ -10228,9 +10325,10 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       paint() {
         if (!this.root || (typeof document !== 'undefined' && document.hidden)) return;
         this.paintHud();
-        if (this.windowOpen === false) return;
+        if (this.windowOpen === false) return this.syncUpdateDialog();
         const s = this.controller.status();
         const u = s.updates;
+        this.syncUpdateDialog(u);
         const key = s.role?.id || '';
         if (this.roleKey != null && key !== this.roleKey) { this.roleKey = key; this.bodyDirty = true; }
         this.paintUpdates(u);
