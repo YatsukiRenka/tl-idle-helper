@@ -119,7 +119,8 @@
         skillExpPerDay: 1000000,
         smeltExpPerDay: 1000000,
       },
-      battle: { enabled: true, mapId: 0, levelOffset: 5, recoverDeath: true, deathDowngrade: true, maxDeathsPerHour: 3 },
+      battle: { enabled: true, mapId: 0, levelOffset: 5, smart: false, smartGoal: 'exp', smartMaps: 4,
+        smartMinutes: 10, smartHours: 6, recoverDeath: true, deathDowngrade: true, maxDeathsPerHour: 3 },
       activities: {
         enabled: true,
         zl: true,
@@ -283,6 +284,10 @@
       }
       const p = merge(DEFAULTS, value);
       p.version = 2;
+      if (p.battle.smartGoal !== 'gold') p.battle.smartGoal = 'exp';
+      p.battle.smartMaps = Math.max(2, Math.min(8, integer(p.battle.smartMaps)));
+      p.battle.smartMinutes = Math.max(5, Math.min(60, integer(p.battle.smartMinutes)));
+      p.battle.smartHours = Math.max(1, Math.min(48, integer(p.battle.smartHours)));
       if (p.roleConfig !== 'per-role') p.roleConfig = 'shared';
       p.disguise.hotkey = canonicalHotkey(p.disguise.hotkey) || DEFAULTS.disguise.hotkey;
       if (!['baidu', 'google', 'blank'].includes(p.disguise.style)) p.disguise.style = DEFAULTS.disguise.style;
@@ -1870,9 +1875,9 @@
         fmt(verdict.afterRate) + '（' + fmt(verdict.change, 1) + '%），战斗 ' + fmt(check.before.battle / 60000, 1) +
         ' → ' + fmt(verdict.afterMinutes, 1) + ' 分钟 / 至少 ' + verdict.needMinutes + ' 分钟，' + ending;
     }
-    function poolMaps(s) {
+    function poolMaps(s, limit = 6) {
       return array(s.maps).filter((m) => fieldMap(m) && num(m.reqLevel) <= num(s.role?.level))
-        .sort((a, b) => num(b.reqLevel) - num(a.reqLevel) || num(a.id) - num(b.id)).slice(0, 6);
+        .sort((a, b) => num(b.reqLevel) - num(a.reqLevel) || num(a.id) - num(b.id)).slice(0, limit);
     }
     function scoreTargets(s, p, lastMap) {
       const templates = s.monsterTemplates || new Map();
@@ -2000,6 +2005,82 @@
         eligible.sort((a, b) => num(a.reqLevel) - num(b.reqLevel))[0] ||
         null
       );
+    }
+    function statsNumber(value) {
+      const n = Number(value) || 0, a = Math.abs(n);
+      if (a >= 100000000) return (n / 100000000).toFixed(2) + '亿';
+      if (a >= 10000) return (n / 10000).toFixed(a >= 1000000 ? 1 : 2) + '万';
+      return Math.round(n).toLocaleString('zh-CN');
+    }
+    function mapRate(hours, mapId, field, fromHour, toHour) {
+      const index = field === 'net' ? 6 : 3;
+      let n = 0, ms = 0, ms2 = 0, v = 0, v2 = 0, vMs = 0;
+      const suffix = ':' + mapId;
+      for (const [key, sample] of Object.entries(hours || {})) {
+        if (!key.endsWith(suffix)) continue;
+        const hour = Number(key.slice(0, -suffix.length));
+        if (hour < fromHour || hour > toHour) continue;
+        n += sample[0]; ms += sample[1]; ms2 += sample[2];
+        v += sample[index]; v2 += sample[index + 1]; vMs += sample[index + 2];
+      }
+      const r = ms ? v / ms : 0;
+      // Cancellation can leave a rounding error when every sample has the same rate.
+      const error = v2 - 2 * r * vMs + r * r * ms2;
+      const residual = error > Number.EPSILON * (v2 + 2 * Math.abs(r * vMs) + r * r * ms2) ? error : 0;
+      return { n, minutes: ms / 60000, rate: ms ? r * 3600000 : null,
+        se: n < 2 || !ms ? Infinity : Math.sqrt(residual / (n * (n - 1))) / (ms / n) * 3600000 };
+    }
+    function smartCandidate(map, battle, rates, now, hour) {
+      const id = num(map.id), from = hour - battle.smartHours + 1;
+      const exp = mapRate(rates.hours, id, 'exp', from, hour), net = mapRate(rates.hours, id, 'net', from, hour);
+      const objective = battle.smartGoal === 'gold' ? net : exp;
+      let state = objective.minutes >= battle.smartMinutes ? 'measured' : 'trial';
+      if (rates.blocked?.[id] > now) state = 'blocked';
+      else if (battle.smartGoal === 'exp' && state === 'measured' && net.rate < 0) state = 'loss';
+      return { id, name: map.name, reqLevel: num(map.reqLevel), minutes: objective.minutes,
+        rate: objective.rate, se: objective.se, exp: exp.rate, expSe: exp.se, net: net.rate, netSe: net.se, state };
+    }
+    function weakCandidate(row, battle, hours, hour, best) {
+      const field = battle.smartGoal === 'gold' ? 'net' : 'exp';
+      const stored = mapRate(hours, row.id, field, hour - 47, hour);
+      return stored.minutes >= battle.smartMinutes && stored.rate < 0.7 * best.rate &&
+        mapRate(hours, row.id, field, hour - Math.min(48, 4 * battle.smartHours) + 1, hour).n > 0;
+    }
+    function refineCandidate(best, second, current, cap) {
+      if (!second || best.rate - second.rate >= 2 * Math.hypot(best.se, second.se)) return null;
+      if ((current === best || current === second) && best.minutes < cap && second.minutes < cap) return current;
+      const shorter = best.minutes <= second.minutes ? best : second;
+      return shorter.minutes < cap ? shorter : null;
+    }
+    function smartMap(s, prefs, rates = {}, ctx) {
+      const battle = prefs.battle, hour = Math.floor(ctx.now / 3600000);
+      const maps = poolMaps(s, battle.smartMaps);
+      const candidates = maps.map(map => smartCandidate(map, battle, rates, ctx.now, hour));
+      const eligible = candidates.filter(row => row.state !== 'blocked' && row.state !== 'loss');
+      if (!eligible.length) return { map: normalMap(s, prefs, ctx.penalty), phase: 'fallback', candidates,
+        reason: '智能选图：没有可用候选，按等级选图' };
+      const measured = eligible.filter(row => row.state === 'measured').sort((a, b) => b.rate - a.rate);
+      const [best, second] = measured, current = eligible.find(row => row.id === num(ctx.mapId));
+      if (best) best.state = 'best';
+      for (const row of eligible)
+        if (best && row.state === 'trial' && weakCandidate(row, battle, rates.hours, hour, best)) row.state = 'weak';
+      const result = (row, phase, reason) => ({ map: maps.find(map => num(map.id) === row.id), phase, candidates, reason });
+      if (ctx.gearCheck && current) return result(current, 'hold', '智能选图：换装实测中，暂不换图');
+      const prefix = '智能选图·' + (battle.smartGoal === 'gold' ? '金币' : '经验') + '：';
+      if (!(best && battle.smartGoal === 'exp' && ctx.doubleExp)) {
+        const trial = current?.state === 'trial' ? current : eligible.find(row => row.state === 'trial');
+        if (trial) return result(trial, 'trial', prefix + '试打「' + trial.name + '」' +
+          Math.floor(trial.minutes) + '/' + battle.smartMinutes + ' 分钟');
+        const refine = refineCandidate(best, second, current, 3 * battle.smartMinutes);
+        if (refine) {
+          refine.state = 'trial';
+          return result(refine, 'refine', prefix + '两图接近，加测「' + refine.name + '」');
+        }
+      }
+      const stay = measured.includes(current) && best.rate <= current.rate * 1.03;
+      const chosen = stay ? current : best;
+      return result(chosen, 'best', prefix + '「' + chosen.name + '」' +
+        (chosen === best ? '实测最高 ' : '收益接近，继续挂机 ') + statsNumber(chosen.rate) + '/时');
     }
     function potionEffect(item, attr) {
       return array(parse(item?.useEffect || item?.use_effect, []))
@@ -3620,6 +3701,10 @@
       fieldMap,
       gearCheckStart, gearCheckAfter, gearCheckVerdict, gearCheckRestored, gearCheckRollback, gearRejected, gearCheckText,
       normalMap,
+      mapRate,
+      smartMap,
+      statsNumber,
+      doubleExpUntil,
       potionEffect,
       sortDepositPlan, bagCellItem, bagTabItems,
       potionChoices,
@@ -4059,16 +4144,127 @@
     }
     const statsFields = 'wall battle exp expBase gold sell potion hpPotions mpPotions kills deaths hpLost mpUsed low'.split(' ');
     const statsTotals = () => Object.fromEntries(statsFields.map((k) => [k, 0]));
-    const statsNumber = (value) => {
-      const n = Number(value) || 0, a = Math.abs(n);
-      if (a >= 100000000) return (n / 100000000).toFixed(2) + '亿';
-      if (a >= 10000) return (n / 10000).toFixed(a >= 1000000 ? 1 : 2) + '万';
-      return Math.round(n).toLocaleString('zh-CN');
-    };
+    const statsNumber = P.statsNumber;
     const statsDuration = (ms) => {
       const m = Math.floor(ms / 60000);
       return (m >= 60 ? Math.floor(m / 60) + '小时' : '') + m % 60 + '分';
     };
+    function validMapRates(saved) {
+      const dictionary = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+      return saved?.version === 1 && dictionary(saved.hours) && dictionary(saved.blocked) &&
+        Object.entries(saved.hours).every(([key, sums]) => /^\d+:[1-9]\d*$/.test(key) &&
+          Array.isArray(sums) && sums.length === 9 && sums.every(Number.isFinite)) &&
+        Object.entries(saved.blocked).every(([id, until]) => /^[1-9]\d*$/.test(id) && Number.isFinite(until)) &&
+        (saved.death === null || Number.isSafeInteger(saved.death?.mapId) && saved.death.mapId > 0 &&
+          Number.isFinite(saved.death.at));
+    }
+    function mapIncome(stats, hour, mapId) {
+      const b = stats?.buckets?.[hour + ':' + mapId];
+      return { exp: P.num(b?.expBase), net: P.num(b?.gold) + P.num(b?.sell) - P.num(b?.potion) };
+    }
+    class MapRates {
+      constructor({ now, read, write }) {
+        this.now = now;
+        this.write = write;
+        this.lastWrite = now();
+        const saved = read();
+        this.data = validMapRates(saved) ? saved : { version: 1, hours: {}, blocked: {}, death: null };
+        this.prune(now());
+        this.reset();
+      }
+      reset() {
+        this.mapId = 0;
+        this.previous = null;
+        this.inactiveAt = null;
+        this.warmup = 60000;
+        this.sample = { ms: 0, exp: 0, net: 0 };
+      }
+      prune(now) {
+        const oldest = Math.floor(now / 3600000) - 47;
+        for (const key of Object.keys(this.data.hours))
+          if (Number(key.split(':')[0]) < oldest) delete this.data.hours[key];
+        for (const [id, until] of Object.entries(this.data.blocked))
+          if (until <= now) delete this.data.blocked[id];
+      }
+      flush() {
+        this.lastWrite = this.now();
+        this.prune(this.lastWrite);
+        this.write(this.data);
+      }
+      clear() {
+        this.data = { version: 1, hours: {}, blocked: {}, death: null };
+        this.reset();
+        this.flush();
+      }
+      add(now, id, { ms, exp, net }) {
+        const key = Math.floor(now / 3600000) + ':' + id;
+        const sums = this.data.hours[key] ||= Array(9).fill(0);
+        [1, ms, ms * ms, exp, exp * exp, exp * ms, net, net * net, net * ms]
+          .forEach((value, i) => sums[i] += value);
+      }
+      finish(now) {
+        if (this.sample.ms >= 30000) this.add(now, this.mapId, this.sample);
+        this.reset();
+      }
+      died(now, mapId, battle) {
+        this.reset();
+        this.settleDeath(now);
+        this.data.death = { mapId, at: now };
+        // A death is a strong signal: the map rests as long as a weak map before it is tried again.
+        if (battle.deathDowngrade) this.data.blocked[mapId] = now + 4 * battle.smartHours * 3600000;
+      }
+      settleDeath(now) {
+        const death = this.data.death;
+        if (!death) return;
+        this.add(now, death.mapId, { ms: Math.max(0, Math.min(600000, now - death.at)), exp: 0, net: 0 });
+        this.data.death = null;
+      }
+      collect(now, ms, exp, net) {
+        const skip = Math.min(ms, this.warmup);
+        this.warmup -= skip;
+        if (!this.warmup) this.settleDeath(now - (ms - skip));
+        let remaining = ms - skip;
+        while (remaining > 0) {
+          const part = Math.min(remaining, 60000 - this.sample.ms);
+          this.sample.ms += part;
+          this.sample.exp += exp * (part / ms);
+          this.sample.net += net * (part / ms);
+          remaining -= part;
+          if (this.sample.ms !== 60000) continue;
+          this.add(now - remaining, this.mapId, this.sample);
+          this.sample = { ms: 0, exp: 0, net: 0 };
+        }
+      }
+      active(now, ctx) {
+        const hour = Math.floor(now / 3600000), income = mapIncome(ctx.stats, hour, ctx.mapId);
+        const prev = this.previous;
+        this.mapId = ctx.mapId;
+        this.previous = { now, hour, ...income };
+        this.inactiveAt = null;
+        if (!prev) return;
+        let exp = income.exp - prev.exp, net = income.net - prev.net;
+        for (let h = Math.max(prev.hour, hour - 71); h < hour; h++) {
+          const older = mapIncome(ctx.stats, h, ctx.mapId);
+          exp += older.exp;
+          net += older.net;
+        }
+        this.collect(now, Math.max(0, Math.min(now - prev.now, 5000)), exp, net);
+      }
+      tick(now, ctx) {
+        if (this.data.death && now - this.data.death.at >= 600000) this.settleDeath(this.data.death.at + 600000);
+        if (ctx.dead && this.mapId === ctx.mapId) this.reset();
+        if (this.mapId !== ctx.mapId || this.inactiveAt !== null && now - this.inactiveAt > 10000)
+          this.finish(now);
+        if (ctx.enabled && ctx.field && ctx.stage !== 'idle' && !ctx.dead) this.active(now, ctx);
+        else {
+          this.inactiveAt ??= now;
+          this.previous = null;
+        }
+        if (now - this.lastWrite < 60000) return false;
+        this.flush();
+        return true;
+      }
+    }
     class Stats {
       constructor({ now, read, write }) {
         this.now = now;
@@ -4549,7 +4745,7 @@
           }
           const assaultMap = type === 'COMBAT_STATE' && P.mapProfile(this.character()?.role?.mapId);
           if (type === 'COMBAT_STATE' && packet.data?.stage === 'running' &&
-              Array.isArray(packet.data.monsterSlots) && (assaultMap || P.farmMap(P.array(this.character()?.maps).find(
+              Array.isArray(packet.data.monsterSlots) && (assaultMap || !this.holdTargets && P.farmMap(P.array(this.character()?.maps).find(
                 (map) => P.num(map.id) === P.num(this.character()?.role?.mapId))))) {
             const alive = packet.data.monsterSlots.filter((m) => m && !m.isDead && m.currentHp > 0).length;
             const targets = assaultMap ? ((this.cache.profileTargets ||= {})[assaultMap] ||= {}) : this.cache.targets;
@@ -4561,7 +4757,7 @@
               else writeStorage(taggedKey('targets', this.targetRole), { mapId: targets.mapId, list: Array.from(targets.list), alive: targets.alive });
             }
           }
-          if (type === 'COMBAT_STATE' && Array.isArray(packet.data?.monsterSlots) &&
+          if (type === 'COMBAT_STATE' && !this.holdTargets && Array.isArray(packet.data?.monsterSlots) &&
               mergeTargets(this.cache.targets, P.num(this.character()?.role?.mapId),
                 packet.data.monsterSlots, P.farmMap(P.array(this.character()?.maps).find(
                   (map) => P.num(map.id) === P.num(this.character()?.role?.mapId)))))
@@ -6009,6 +6205,10 @@
     function applyConfig(controller, next) {
       const previous = controller.prefs;
       controller.prefs = next;
+      if (!next.battle.smart || next.battle.mapId || !next.battle.enabled) {
+        controller.smartDecision = null;
+        controller.bridge.holdTargets = false;
+      }
       if (!next.disguise.enabled && controller.panel?.cover) controller.panel.toggleDisguise();
       if (previous.storage.indexedDB !== next.storage.indexedDB) controller.logReady = controller.syncLogStorage();
       if (previous.logs.keepDays !== next.logs.keepDays) controller.pruneLogs();
@@ -6143,7 +6343,12 @@
         this.bridge.scoringPrefs = () => this.prefs;
         this.bridge.profilePressure = (name) => this.stats?.pressure((id) => P.mapProfile(id) === name);
         this.bridge.pressure = (maps) => this.stats?.pressure((id) => P.farmMap(P.array(maps).find((m) => P.num(m.id) === id)));
-        window.addEventListener('pagehide', () => { this.stats?.flush(); this.flushLogs(); });
+        window.addEventListener('pagehide', () => {
+          this.stats?.flush();
+          this.mapRates?.flush();
+          this.pendingMapRates?.forEach(rates => rates.flush());
+          this.flushLogs();
+        });
         this.bridge.onDisconnect = () => {
           this.reason = '等待游戏重连';
           if (!this.prefs.reconnect.enabled) this.pause('连接中断，自动恢复已关闭');
@@ -6171,10 +6376,45 @@
         this.ensureGearState(id);
         if (!id || this.statsRoleId === id) return;
         this.stats?.flush();
+        this.pendingMapRates ||= new Map();
+        if (this.mapRates) {
+          this.mapRates.finish(Date.now());
+          this.pendingMapRates.set(this.statsRoleId, this.mapRates);
+        }
+        this.smartDecision = null;
+        this.bridge.holdTargets = false;
         this.statsRoleId = id;
         const key = PREFIX + ':stats:' + id;
         this.stats = new Stats({ now: () => Date.now(), read: () => readStorage(key, null),
           write: (value) => writeStorage(key, value) });
+        const ratesKey = PREFIX + ':mapRates:' + id;
+        this.mapRates = this.pendingMapRates.get(id) ?? new MapRates({ now: () => Date.now(), read: () => readStorage(ratesKey, null),
+          write: value => writeStorage(ratesKey, value) });
+        this.pendingMapRates.delete(id);
+      }
+      sampleMaps(character, now) {
+        for (const [id, rates] of this.pendingMapRates || []) {
+          if (rates.tick(now, { enabled: false, mapId: 0 }) && !rates.data.death) this.pendingMapRates.delete(id);
+        }
+        const role = character?.role, field = !!role && P.fieldMap(P.roleMap(character));
+        const battle = this.mapRates && this.enabled && field ? this.bridge.battle?.() : null;
+        this.mapRates?.tick(now, { enabled: this.enabled, mapId: P.num(role?.mapId), field,
+          stage: battle?.stage ?? 'idle', dead: !!battle?.player?.isDead || battle?.player?.currentHp <= 0, stats: this.stats });
+        if (!this.enabled || !this.prefs.battle?.smart || this.prefs.battle.mapId || !this.prefs.battle.enabled ||
+            role && (!field || this.activity?.mapId === P.num(role.mapId))) {
+          this.smartDecision = null;
+          if (this.bridge) this.bridge.holdTargets = false;
+        }
+        return battle;
+      }
+      farmTarget(s, now) {
+        const battle = this.prefs.battle, penalty = battle.deathDowngrade ? this.penalty : 0;
+        if (!battle.smart || battle.mapId) return P.normalMap(s, this.prefs, penalty);
+        const { map, phase, reason, candidates } = P.smartMap(s, this.prefs, this.mapRates?.data, {
+          now, mapId: s.role.mapId, doubleExp: P.doubleExpUntil(s.role) > now, gearCheck: !!this.gearCheck, penalty });
+        this.smartDecision = { on: true, goal: battle.smartGoal, phase, mapId: map?.id ?? null, reason, candidates };
+        this.bridge.holdTargets = this.enabled && battle.enabled && (phase === 'trial' || phase === 'refine');
+        return map;
       }
       ensureGearState(id, now = Date.now()) {
         if (!id || this.gearRoleId === id) return;
@@ -6896,6 +7136,7 @@
               activity: this.activity || this.arenaPending }, this.prefs, { rings }, Date.now()) : 'farm',
             reason: mode === 'auto' ? '自动' : '手动' },
           stats: this.stats ? { summary: this.stats.summary(), rates: this.stats.rates(), series: this.stats.series() } : null,
+          smartMap: this.prefs.battle.smart && !this.prefs.battle.mapId ? this.smartDecision ?? null : null,
           potions: Object.fromEntries(['HP', 'MP'].map((attr) => {
             const pick = s?.role ? P.potionPick(s, this.prefs, attr, Date.now()) : null;
             return [attr.toLowerCase(), pick ? { name: pick.template.name, need: pick.need, perSecond: pick.perSecond, reason: pick.reason } : null];
@@ -7478,7 +7719,7 @@
       }
       async tick() {
         if (this.adaptiveUntil) this.responseTimeout();
-        const statsRole = this.bridge?.character?.()?.role;
+        const character = this.bridge?.character?.(), statsRole = character?.role;
         const id = P.num(statsRole?.id);
         if (id && this.roleId && id !== this.roleId) this.setRole(id);
         else observeRole(this, id);
@@ -7486,6 +7727,7 @@
         this.ensureStats(statsRole?.id);
         if (statsRole) this.stats?.tick(statsRole.mapId);
         const now = Date.now();
+        const sampleBattle = this.mapRates || this.smartDecision ? this.sampleMaps(character, now) : null;
         const needsSocket = statsRole?.id && !this.bridge.connected;
         const reconnectModal = (this.enabled || needsSocket) && this.bridge.reconnectVisible?.();
         if (needsSocket && !reconnectModal && now >= (this.nextSocketProbe ?? 0)) {
@@ -7503,6 +7745,7 @@
               }
             }
           }
+          if (statsRole && this.prefs.battle?.smart && !this.prefs.battle.mapId) this.farmTarget(character, now);
           this.paint();
           return;
         }
@@ -7608,7 +7851,7 @@
           return;
         }
         if (this.handleArenaMatch(now)) return;
-        const runtime = this.bridge.battle(),
+        const runtime = sampleBattle ?? this.bridge.battle(),
           map = P.roleMap(s),
           special =
             [20050, 20051, 20052].includes(P.num(s.role.mapId)) ||
@@ -7628,6 +7871,7 @@
             this.lastDeathKey = key;
             this.deaths = this.deaths.filter((t) => now - t < 3600000);
             this.deaths.push(now);
+            if (P.fieldMap(map)) this.mapRates?.died(now, P.num(map.id), this.prefs.battle);
             if (this.prefs.battle.deathDowngrade) this.penalty += 5;
             this.log('检测到阵亡，准备按游戏入口返城', 'warning');
           }
@@ -7761,8 +8005,7 @@
           this.paint();
           return;
         }
-        const target = special ? map
-          : P.normalMap(s, this.prefs, this.prefs.battle.deathDowngrade ? this.penalty : 0);
+        const target = special ? map : this.farmTarget(s, now);
         if (!target) {
           this.reason = '没有符合等级与地图策略的免费挂机地图';
           this.paint();
@@ -7792,7 +8035,8 @@
           this.reason = started ? '已通过原页面开始战斗' : '未找到原页面战斗入口，托管等待';
           this.lastLocal = now;
           this.log(this.reason, started ? 'info' : 'warning');
-        } else this.reason = '战斗中：' + (map?.name || s.role.mapId);
+        } else this.reason = '战斗中：' + (map?.name || s.role.mapId) +
+          (!special && this.smartDecision ? ' · ' + this.smartDecision.reason : '');
         this.paint();
       }
       maybeApplyUpdate(now) {
@@ -8174,7 +8418,7 @@
     }
     const arraySafe = (v) => (Array.isArray(v) ? v : []);
     return {
-      WarehouseShortcuts, Filler, Stats, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
+      WarehouseShortcuts, Filler, Stats, MapRates, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
     };
   })();
   if (typeof module !== 'undefined' && module.exports) module.exports.TLRuntime = TLRuntime;
@@ -8866,6 +9110,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           }
           else if (action === 'clearStats') {
             this.controller.stats?.clear();
+            this.controller.mapRates?.clear();
+            this.controller.smartDecision = null;
             this.requestBody();
           }
           else if (action === 'stopBattle') this.controller.stopBattle();
@@ -9586,9 +9832,15 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('自动开始战斗', 'battle.enabled') +
             f('挂机地图', 'battle.mapId', { choices: TLPolicy.mapChoices(s?.maps) }) +
             f('选图等级差', 'battle.levelOffset', { unit: '级', help: '比角色低多少级选图', dependsOn: { path: 'battle.mapId', value: 0 } }) +
+            f('智能选图', 'battle.smart', { dependsOn: { path: 'battle.mapId', value: 0 }, help: '在能进入的最高几张野外挂机地图中各试打一段时间，按实测收益选图，并定时复查。只在“挂机地图”为自动时生效；没有可用候选时按选图等级差选图' }) +
+            f('智能选图目标', 'battle.smartGoal', { dependsOn: 'battle.smart', choices: [['exp', '经验最高（按单倍经验比较）'], ['gold', '净金币最高（击杀金币 + 出售 − 药费）']] }) +
+            f('候选地图数', 'battle.smartMaps', { unit: '张', dependsOn: 'battle.smart', min: 2, max: 8 }) +
+            f('每图试打', 'battle.smartMinutes', { unit: '分钟', dependsOn: 'battle.smart', min: 5, max: 60 }) +
+            f('复查间隔', 'battle.smartHours', { unit: '小时', dependsOn: 'battle.smart', min: 1, max: 48, help: '实测数据超过这个时间就重新试打；明显较差的地图按 4 倍间隔复查' }) +
             f('阵亡后返城重新选择', 'battle.recoverDeath') +
-            f('阵亡后降低选图等级', 'battle.deathDowngrade', { help: '每次阵亡把自动选图的等级再降 5 级，刷新页面后恢复；关闭后一直打能进的最高等级地图', dependsOn: 'battle.recoverDeath' }) +
-            f('每小时阵亡上限', 'battle.maxDeathsPerHour', { unit: '次', help: '达到后暂停托管，0 不限', dependsOn: 'battle.recoverDeath' }), true) +
+            f('阵亡后降低选图等级', 'battle.deathDowngrade', { help: '每次阵亡把自动选图的等级再降 5 级，刷新页面后恢复；关闭后按原选图等级差挂机。智能选图时改为阵亡的地图暂停 4 个复查间隔（默认 24 小时）', dependsOn: 'battle.recoverDeath' }) +
+            f('每小时阵亡上限', 'battle.maxDeathsPerHour', { unit: '次', help: '达到后暂停托管，0 不限', dependsOn: 'battle.recoverDeath' }) +
+            '<div class="smart-map-status">' + this.smartMapHTML(status.smartMap, s?.role?.mapId) + '</div>', true) +
             g('日常活动',
             f('自动完成日常', 'activities.enabled') +
             f('珍珑棋局', 'activities.zl') +
@@ -10151,6 +10403,16 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           f('攻坚：自动调整生存权重', 'gear.assault.autoDefense', { dependsOn: 'gear.assault.enabled' }) +
           f('攻坚生存权重', 'gear.assault.defenseWeight', { min: 0, max: 1, step: 0.1, dependsOn: 'gear.assault.enabled', help: '自动关闭或数据不足时使用；默认 1，输出与生存并重' }), true);
       }
+      smartMapHTML(smart, currentId) {
+        if (!smart) return '';
+        const states = { trial: '试打中', best: '当前最优', measured: '已测', weak: '较差', loss: '亏药费', blocked: '阵亡暂避' };
+        const fmt = TLRuntime.statsNumber;
+        const rate = (v, se) => v == null ? '—' : fmt(v) + ' ± ' + (Number.isFinite(se) ? fmt(2 * se) : '∞');
+        return this.scoreTableHTML(['地图', '状态', '经验/时', '净金币/时', '实测'], smart.candidates.map(row => [
+          { html: esc(row.name) + (row.id === Number(currentId) ? this.chip('所在地图') : '') }, states[row.state],
+          rate(smart.goal === 'exp' ? row.rate : row.exp, smart.goal === 'exp' ? row.se : row.expSe),
+          rate(row.net, row.netSe), Math.floor(row.minutes) + ' 分钟']));
+      }
       scoreTableHTML(headers, rows, mapTable = false) {
         return '<div class="table-scroll"><table class="income-table"><thead><tr>' + headers.map((v) => '<th>' + esc(v) + '</th>').join('') +
           '</tr></thead><tbody>' + rows.map((row) => '<tr>' + row.map((v, i) => (mapTable && i === 0 ? '<td title="' + esc(v) + '">' : '<td>') + (v && typeof v === 'object' && 'html' in v ? v.html : esc(v)) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>';
@@ -10383,6 +10645,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         if (['scoreStatus', 'scoreStats'].includes(this.section) && !this.dirty && Date.now() - this.scorePaintAt >= 5000 &&
           this.scoreKey !== this.liveContentKey(this.profileScoreHTML(s, this.controller.bridge.state()))) this.renderBody(s);
         if (this.section === 'battle') {
+          this.paintFragment('.smart-map-status', this.smartMapHTML(s.smartMap, s.role?.mapId));
           this.paintFragment('.welfare-status', this.welfareHTML(this.controller.bridge.state(), s.ledger));
           this.paintFragment('.arena-status', this.arenaHTML(s.arena));
           this.paintFragment('.rings-status', this.ringsHTML(s.rings));
