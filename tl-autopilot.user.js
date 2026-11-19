@@ -171,7 +171,7 @@
       },
       market: { sort: 'off', showScore: true, bagScore: true, tipScore: true, tipBound: true,
         bagFilter: true, setTag: true, tipSet: true, scoreType: 'combat', bagScoreType: 'combat' },
-      convenience: { sortDeposit: true, ctrlDeposit: true },
+      convenience: { sortDeposit: true, ctrlDeposit: true, depositKeys: 'ctrl', sellWarehouse: false, sellKeys: 'alt' },
       sell: {
         enabled: true,
         maxQuality: 1,
@@ -275,6 +275,18 @@
         /^(?:Key[A-Z]|Digit[0-9])$/.test(event.code) ? event.code.slice(-1) : punctuation[event.code];
       return canonicalHotkey([...modifiers.filter(mod => event[mod.toLowerCase() + 'Key']), key].join('+'));
     }
+    const warehouseKeys = ['ctrl', 'shift', 'alt', 'ctrl+shift', 'ctrl+alt', 'shift+alt', 'ctrl+shift+alt'];
+    function keysMatch(event, keys) {
+      return warehouseKeys.includes(keys) && ['ctrl', 'shift', 'alt'].every(key =>
+        !!event[key + 'Key'] === keys.includes(key));
+    }
+    function shortcutConflicts({ ctrlDeposit, depositKeys, sellWarehouse, sellKeys }) {
+      const same = ctrlDeposit && sellWarehouse && depositKeys === sellKeys;
+      const notes = [];
+      if (same) notes.push('与“出售快捷键”相同，出售快捷键暂不生效');
+      if (ctrlDeposit && depositKeys.includes('shift')) notes.push('游戏自带 Shift + 右键使用 / 穿戴物品，这个组合会改为整组存入');
+      return { depositKeys: notes.join('；'), sellKeys: same ? '与“整组存入快捷键”相同，暂不生效，请换一个组合' : '' };
+    }
     function config(value) {
       if (value?.budget && Object.hasOwn(value.budget, 'expPerDay')) {
         const budget = { ...value.budget };
@@ -283,6 +295,8 @@
         value = { ...value, budget };
       }
       const p = merge(DEFAULTS, value);
+      for (const key of ['depositKeys', 'sellKeys'])
+        if (!warehouseKeys.includes(p.convenience[key])) p.convenience[key] = DEFAULTS.convenience[key];
       p.version = 2;
       if (p.battle.smartGoal !== 'gold') p.battle.smartGoal = 'exp';
       p.battle.smartMaps = Math.max(2, Math.min(8, integer(p.battle.smartMaps)));
@@ -3706,7 +3720,7 @@
       statsNumber,
       doubleExpUntil,
       potionEffect,
-      sortDepositPlan, bagCellItem, bagTabItems,
+      sortDepositPlan, bagCellItem, bagTabItems, warehouseKeys, keysMatch, shortcutConflicts, loadoutProtection,
       potionChoices,
       potionSettings,
       potionPick,
@@ -4553,7 +4567,7 @@
         return [...(this.waiter ? [this.waiter] : []), ...(this.queryWaiters?.values() || [])];
       }
       responsePending(action) {
-        if (this.manualDepositResponse && action.type === 'WAREHOUSE_DEPOSIT') return true;
+        if (this.manualResponse?.type === responseType(action)) return true;
         return this.pendingWaiters().some((waiter) => responseType(waiter) === responseType(action) &&
           (!responseHasId(waiter) || !responseHasId(action) || responseKey(waiter) === responseKey(action)));
       }
@@ -4923,7 +4937,11 @@
             }
           this.recordStats?.(packet);
           this.filler?.response(packet);
-          if (type === 'WAREHOUSE_DEPOSIT_RESPONSE') this.manualDepositResponse?.(packet);
+          const manual = this.manualResponse;
+          if (manual && manual.type === type) {
+            this.manualResponse = null;
+            manual.resolve(packet);
+          }
           setTimeout(() => {
             try {
               this.syncState(packet);
@@ -8081,9 +8099,9 @@
       start() {
         if (this.started) return;
         this.started = true;
-        for (const [type, handler] of [['click', 'sort'], ['contextmenu', 'ctrl']])
+        for (const [type, handler] of [['click', 'sort'], ['contextmenu', 'shortcut']])
           this.doc.addEventListener(type, event => this[handler](event).catch(error =>
-            this.controller.log('仓库存入异常：' + safeMessage(error.message), 'warning')), true);
+            this.controller.log('仓库操作异常：' + safeMessage(error.message), 'warning')), true);
       }
       open() {
         return !!this.doc.querySelector('.warehouse-window');
@@ -8099,14 +8117,14 @@
         this.controller.manualUntil = Math.max(this.controller.manualUntil, Date.now() + ms + 5000);
       }
       async sort(event) {
-        if (this.sorting || !this.controller.prefs.convenience.sortDeposit) return;
+        if (this.sorting || this.runKind === 'sell' || !this.controller.prefs.convenience.sortDeposit) return;
         const button = event.target?.closest?.('.btn-sort-bag, .btn-sort-bag-small');
         if (!this.bagWindow(button) || !this.open()) return;
         this.sorting = true;
         try {
           // The game's click handler sorts the character store before the plan is built.
           await this.delay(0);
-          if (this.ctrlRun) await this.ctrlRun;
+          if (this.run) await this.run;
           const character = this.bridge.character();
           const plan = P.sortDepositPlan(character?.bagItems, character?.warehouseItems);
           let count = 0;
@@ -8133,70 +8151,181 @@
         if (cells.filter(filled).length !== Math.min(72, P.bagTabItems(tab, character).length)) return null;
         return P.bagCellItem(tab, cells.indexOf(cell), character);
       }
-      async ctrl(event) {
-        if (!event.ctrlKey || this.sorting || !this.controller.prefs.convenience.ctrlDeposit || !this.open()) return;
+      warehouseCell(target) {
+        const cell = target?.closest?.('div.grid-slot'), grid = cell?.parentElement;
+        if (!grid?.matches('.warehouse-grid') || !cell.querySelector('.v-img')) return;
+        const win = grid.closest('.warehouse-window');
+        if (win?.querySelector('.game-tab-button.is-active')?.textContent.trim() !== '装备') return;
+        const cells = Array.from(grid.children).filter(node => node.matches('div.grid-slot'));
+        const list = P.array(this.bridge.character()?.warehouseEquips).filter(e => e?.equipTmpl);
+        if (cells.filter(node => node.querySelector('.v-img')).length !== Math.min(P.WAREHOUSE_CAPACITY, list.length)) return;
+        const index = cells.indexOf(cell);
+        if (index < P.WAREHOUSE_CAPACITY) return list[index];
+      }
+      async shortcut(event) {
+        if (this.sorting || !this.open()) return;
+        const prefs = this.controller.prefs.convenience;
+        const kind = this.bagWindow(event.target) ? 'deposit' : 'sell';
+        if (this.runKind && this.runKind !== kind) return;
+        const deposit = kind === 'deposit';
         const mode = this.bridge.stores().get('interaction')?.mode;
         if (mode != null && mode !== 'NORMAL') return;
-        const item = this.cellItem(event.target);
-        if (item?.id == null || !(item.count >= 1)) return;
+        if (deposit ? !prefs.ctrlDeposit : !prefs.sellWarehouse || P.shortcutConflicts(prefs).sellKeys) return;
+        if (!P.keysMatch(event, deposit ? prefs.depositKeys : prefs.sellKeys)) return;
+        const item = deposit ? this.cellItem(event.target) : this.warehouseCell(event.target);
+        if (item?.id == null || (deposit && !(item.count >= 1))) return;
         event.preventDefault();
         event.stopPropagation();
         this.queue.push(item.id);
-        if (!this.ctrlRun) this.ctrlRun = this.drainCtrl();
-        await this.ctrlRun;
+        if (!this.run) this.run = this.drain(kind);
+        await this.run;
       }
-      async drainCtrl() {
+      async drain(kind) {
+        this.runKind = kind;
+        let sold = 0;
         try {
           while (this.queue.length) {
-            if (await this.deposit(this.queue.shift()) === null) break;
+            const result = await this[kind](this.queue.shift());
+            if (result === null) return;
+            if (kind === 'sell' && result) sold++;
           }
+          if (sold >= 2) this.toast('已出售 ' + sold + ' 件仓库装备', 'success');
         } finally {
           this.queue.length = 0;
-          this.ctrlRun = null;
+          this.run = this.runKind = null;
         }
       }
       delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
       }
-      async deposit(id) {
+      busy(type) {
+        return this.bridge.waiter || Array.from(this.bridge.lateWaiters || []).some(waiter =>
+          waiter.type === type && waiter.socket === this.bridge.socket && waiter.lateUntil > Date.now());
+      }
+      async waitReady(type, message) {
         const until = Date.now() + 5000;
-        while (this.bridge.waiter || Array.from(this.bridge.lateWaiters || []).some(waiter =>
-          waiter.type === 'WAREHOUSE_DEPOSIT' && waiter.socket === this.bridge.socket && waiter.lateUntil > Date.now())) {
+        while (this.busy(type)) {
           if (!this.open() || !this.bridge.connected) return null;
-          if (Date.now() >= until) return this.timeout();
+          if (Date.now() >= until) return this.stop(message);
           const ms = Math.min(300, until - Date.now());
           this.pause(ms);
           await this.delay(ms);
         }
+        return true;
+      }
+      async deposit(id) {
+        const type = 'WAREHOUSE_DEPOSIT', timeout = '存入仓库没有回应，已停止';
+        if (this.busy(type) && !await this.waitReady(type, timeout)) return null;
         if (!this.open() || !this.bridge.connected) return null;
         const stack = this.bridge.character()?.bagItems?.find(item => item?.id === id);
         if (!(stack?.count >= 1)) return false;
-        this.pause(5000);
-        const packet = await this.send(id, stack.count);
+        const packet = await this.send(type, { bagItemId: id, count: stack.count });
         if (!this.open() || packet === false) return null;
-        if (!packet) return this.timeout();
+        if (!packet) return this.stop(timeout);
         if (packet.success) return true;
-        this.toast(packet.message, 'warning');
+        return this.stop(packet.message);
+      }
+      stop(message) {
+        this.toast(message, 'warning');
         return null;
       }
-      timeout() {
-        this.toast('存入仓库没有回应，已停止', 'warning');
-        return null;
+      bagEquipment() {
+        return P.array(this.bridge.character()?.equipments).filter(e => e?.id != null && !e.isEquipped);
       }
-      async send(bagItemId, count) {
+      withdrawnItem(equip, oldIds) {
+        const templateId = e => e.tmplId || e.equipTmpl?.id;
+        if (!templateId(equip)) return;
+        const candidates = this.bagEquipment().filter(e => !oldIds.has(e.id) && templateId(e) === templateId(equip));
+        if (candidates.length === 1) return candidates[0];
+        const matches = candidates.filter(e => e.enhanceLevel === equip.enhanceLevel && e.quality === equip.quality &&
+          JSON.stringify(e.extraStats) === JSON.stringify(equip.extraStats));
+        if (matches.length === 1) return matches[0];
+      }
+      confirmSale(equip) {
+        const character = this.bridge.character(), reasons = [];
+        this.controller.ensureGearState?.(P.num(character.role?.id));
+        const state = { artifactSkills: Array.from(character.artifactSkillConfigs?.values() || []),
+          gearProfile: this.controller.gearProfile };
+        if (equip.gemSlots && equip.gemSlots !== '[]' && equip.gemSlots.length > 2) reasons.push('带宝石');
+        if (equip.enhanceLevel > 0) reasons.push('强化 +' + equip.enhanceLevel);
+        if (P.smeltProtected(equip, state) === '神器') reasons.push('神器');
+        const profile = P.loadoutProtection(state).get(Number(equip.id));
+        if (profile) reasons.push(profile);
+        if (!reasons.length) return true;
+        const ui = this.bridge.stores().get('ui');
+        if (!ui?.showConfirm) {
+          this.toast('需要确认的装备请手动出售', 'warning');
+          return false;
+        }
+        const { name, price } = equip.equipTmpl;
+        return this.askSale(ui, reasons.join('、') + '。确认出售 ' + name + '，获得 ' + price + ' 金币？');
+      }
+      async askSale(ui, message) {
         let timer;
+        const renew = cancel => {
+          if (!this.saleActive()) return cancel();
+          this.pause(1000);
+          timer = setTimeout(() => renew(cancel), 1000);
+        };
+        try {
+          return await new Promise(resolve => {
+            const cancel = () => resolve(false);
+            renew(cancel);
+            ui.showConfirm(message, () => resolve(true), cancel, '出售确认');
+          });
+        } finally { clearTimeout(timer); }
+      }
+      saleActive() {
+        const prefs = this.controller.prefs.convenience;
+        return this.open() && this.bridge.connected && prefs.sellWarehouse && !P.shortcutConflicts(prefs).sellKeys;
+      }
+      async sell(id) {
+        const timeout = '仓库操作没有回应，已停止', withdraw = 'WAREHOUSE_WITHDRAW';
+        this.pause(5000);
+        if (!this.saleActive()) return null;
+        const lookup = () => this.bridge.character()?.warehouseEquips?.find(e => e?.id === id);
+        const equip = lookup();
+        if (!equip?.equipTmpl) return false;
+        if (!(equip.equipTmpl.price > 0)) {
+          this.toast('该装备无法出售', 'warning');
+          return false;
+        }
+        if (!await this.confirmSale(equip)) return this.saleActive() ? false : null;
+        if (this.busy(withdraw) && !await this.waitReady(withdraw, timeout)) return null;
+        if (!this.saleActive()) return null;
+        if (!lookup()) return false;
+        const oldIds = new Set(this.bagEquipment().map(e => e.id));
+        const packet = await this.send(withdraw, { roleEquipId: id });
+        if (!this.saleActive() || packet === false) return null;
+        if (!packet?.success) return this.stop(packet?.message || timeout);
+        const item = this.withdrawnItem(equip, oldIds);
+        if (!item) return this.stop('已取出到背包，但没找到这件装备，未出售');
+        return this.sellFromBag(item.id);
+      }
+      async sellFromBag(id) {
+        if (this.busy('SHOP_SELL') && !await this.waitReady('SHOP_SELL', '仓库操作没有回应，已停止')) return null;
+        if (!this.saleActive()) return null;
+        if (!this.bagEquipment().some(e => e.id === id)) return false;
+        const sale = await this.send('SHOP_SELL', { roleEquipId: id, count: 1 });
+        if (!this.open() || sale === false) return null;
+        if (!sale) return this.stop('出售没有回应，装备可能已在背包');
+        return sale.success || this.stop('出售失败：' + sale.message + '，装备已在背包');
+      }
+      async send(type, payload) {
+        let timer;
+        this.pause(5000);
         try {
           const packet = await new Promise(resolve => {
-            this.bridge.manualDepositResponse = resolve;
+            this.bridge.manualResponse = { type: type + '_RESPONSE', resolve };
             timer = setTimeout(() => resolve(null), 5000);
-            if (!this.bridge.sendManual('WAREHOUSE_DEPOSIT', { bagItemId, count })) resolve(false);
+            if (!this.bridge.sendManual(type, payload)) resolve(false);
           });
-          // Let the client finish applying its character snapshot before reading another stack.
+          // The client applies its character snapshot before the next timer turn.
           if (packet) await this.delay(0);
           return packet;
         } finally {
           clearTimeout(timer);
-          this.bridge.manualDepositResponse = null;
+          this.bridge.manualResponse = null;
         }
       }
     }
@@ -8631,6 +8760,8 @@
       ['system', '系统', [['settings', '设置'], ['updates', '更新']]],
     ];
     const PANEL_KEY = 'tl-autopilot-v1:panel';
+    const warehouseKeyChoices = TLPolicy.warehouseKeys.map(keys => [keys, keys.split('+')
+      .map(key => key[0].toUpperCase() + key.slice(1)).concat('右键').join(' + ')]);
     const qualityChoices = [
       [1, '白色（1）'],
       [2, '蓝色（2）'],
@@ -9670,6 +9801,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         }
       }
       validationMessage(path, value, options = {}) {
+        if (path === 'convenience.depositKeys' || path === 'convenience.sellKeys')
+          return TLPolicy.shortcutConflicts(this.pending.convenience)[path.split('.')[1]];
         if (path === 'welfare.numbers') return TLPolicy.welfareNumbers(value) ? '' : '需要 3 个 1～25 的不同数字';
         if (typeof pathGet(TLPolicy.DEFAULTS, path) !== 'number' || options.choices) return '';
         const min = options.min ?? 0, max = options.max ?? Infinity, number = Number(value);
@@ -9680,7 +9813,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         if (!field) return;
         const error = field.querySelector('.field-error');
         if (!error) return;
-        const message = control.disabled || control.tagName === 'SELECT' ? '' : this.validationMessage(control.dataset.path, control.value, {
+        const message = control.disabled ? '' : this.validationMessage(control.dataset.path, control.value, {
+          choices: control.tagName === 'SELECT',
           min: control.min === '' ? 0 : Number(control.min), max: control.max === '' ? undefined : Number(control.max),
         });
         if (control.getAttribute('aria-invalid') !== String(!!message)) control.setAttribute('aria-invalid', String(!!message));
@@ -9961,7 +10095,10 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('套装装备显示角标', 'market.setTag'), true) +
           g('存取',
             f('打开仓库时，背包“整理”顺便存入仓库已有的物品', 'convenience.sortDeposit', { help: '只存道具和材料里仓库已经有的种类，整组存入；回复气血和内力的药品不存' }) +
-            f('按住 Ctrl 右键道具或材料直接整组存入', 'convenience.ctrlDeposit', { help: '仓库打开时生效，不弹数量窗口' }));
+            f('右键整组存入道具或材料', 'convenience.ctrlDeposit', { help: '仓库打开时，按住下面的快捷键右键背包里的道具或材料，整组存入，不弹数量窗口' }) +
+            f('整组存入快捷键', 'convenience.depositKeys', { dependsOn: 'convenience.ctrlDeposit', choices: warehouseKeyChoices }) +
+            f('快捷出售仓库装备', 'convenience.sellWarehouse', { help: '仓库打开并在“装备”页时，按住快捷键右键装备：取出到背包并卖给商店，不可撤销。带宝石、强化、神器或换装方案里的装备先确认。默认关闭' }) +
+            f('出售快捷键', 'convenience.sellKeys', { dependsOn: 'convenience.sellWarehouse', choices: warehouseKeyChoices }));
         if (this.section === 'gameTools')
           html = g('物品详情',
             f('详情和人物面板显示实战评分', 'market.tipScore', { help: '装备详情及人物面板' }) +
