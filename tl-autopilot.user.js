@@ -2075,11 +2075,17 @@
       const entry = collectionValues(entries).find((v) => num(v.role.id) === num(props.roleOverride?.id));
       return viewedState({ ...entry, ...props }, own);
     }
-    function profileScoreValue(info) {
-      return info === null ? '未读到对方技能' : info.pending ? '待战斗数据' : info.score.toLocaleString();
+    // Since the client of 2026-11-19 the server answers GET_PLAYER_INFO without skills: a cached answer without them.
+    function viewedSkillsMissing(props, entries) {
+      if (!isViewedProfile(props) || Array.isArray(props.roleOverride?.skills)) return false;
+      const entry = collectionValues(entries).find((v) => num(v.role.id) === num(props.roleOverride?.id));
+      return !!entry && !Array.isArray(entry.skills);
     }
-    function profileScoreText(info) {
-      return '实战评分 ' + profileScoreValue(info);
+    function profileScoreValue(info, missing = false) {
+      return info === null ? (missing ? '服务器未提供对方技能' : '未读到对方技能') : info.pending ? '待战斗数据' : info.score.toLocaleString();
+    }
+    function profileScoreText(info, missing = false) {
+      return '实战评分 ' + profileScoreValue(info, missing);
     }
     function tooltipContext(item, profiles, own, entries) {
       const profile = array(profiles).find((p) => p.modelValue && isViewedProfile(p) && item?.id != null &&
@@ -3828,7 +3834,7 @@
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
-      viewedState, isViewedProfile, profileState, profileScoreText, profileScoreValue, tooltipContext,
+      viewedState, isViewedProfile, viewedSkillsMissing, profileState, profileScoreText, profileScoreValue, tooltipContext,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       transferKind, transferKeyRole, transferMerge, transferMergeData,
       CRIT_BASE, CRIT_RATE, CRIT_FLOOR, CRIT_DEF_OFFSET, CRIT_DEF_RATE, CRIT_DEF_DIVISOR, critMultiplier,
@@ -5983,7 +5989,9 @@
             if (tipBound) this.drawBound(tip, item);
             if ((!tipScore && !tipSet) || !state) continue;
             const context = P.tooltipContext(item, profileInstances.map((vm) => vm.props), state, entries);
-            if (tipScore) this.drawTip(tip, this.tipInfo(item, context.state, prefs, context), item);
+            // A viewed player without skills has no score: no line rather than one that waits for battle data.
+            if (tipScore && context.state) this.drawTip(tip, this.tipInfo(item, context.state, prefs, context), item);
+            else if (tipScore) for (const node of tip.querySelectorAll('.tl-tip-score, .tl-tip-arrow')) node.remove();
             if (tipSet) {
               const data = context.compare && item?.equipTmpl ? getCollection() : null;
               this.drawTipSet(tip, data, item);
@@ -6024,7 +6032,9 @@
           }
         }
         if (list && list.lastElementChild !== line) list.appendChild(line);
-        const target = list ? line.lastElementChild : line, text = list ? P.profileScoreValue(info) : P.profileScoreText(info);
+        const missing = !selected && P.viewedSkillsMissing(vm?.props, entries);
+        const target = list ? line.lastElementChild : line,
+          text = list ? P.profileScoreValue(info, missing) : P.profileScoreText(info, missing);
         if (target.textContent !== text) target.textContent = text;
       }
       inventoryCollection(state) {
