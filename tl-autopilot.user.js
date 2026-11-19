@@ -287,6 +287,68 @@
       if (ctrlDeposit && depositKeys.includes('shift')) notes.push('游戏自带 Shift + 右键使用 / 穿戴物品，这个组合会改为整组存入');
       return { depositKeys: notes.join('；'), sellKeys: same ? '与“整组存入快捷键”相同，暂不生效，请换一个组合' : '' };
     }
+    const transferObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    function transferFile(text) {
+      let file;
+      try { file = JSON.parse(text); }
+      catch (error) { throw new Error('读取配置文件失败：' + error.message); }
+      if (!transferObject(file)) throw new Error('配置文件格式不对');
+      if (file.format !== 'tl-autopilot-full') return { kind: 'config', config: file, data: {}, logs: [], meta: {} };
+      if (file.formatVersion > 1) throw new Error('不支持的全量配置版本');
+      const { config, data = {}, logs = [], script, exportedAt, host, roleId } = file;
+      if (!transferObject(config) || !transferObject(data) || !Array.isArray(logs)) throw new Error('配置文件格式不对');
+      return { kind: 'full', config, data, logs, meta: { script, exportedAt, host, roleId } };
+    }
+    function configChanges(before, after) {
+      const changes = [];
+      function visit(path, a, b) {
+        if (path === 'roleConfig' || a === b) return;
+        if (transferObject(a) || transferObject(b)) {
+          for (const key of new Set([...Object.keys(a || {}), ...Object.keys(b || {})]))
+            visit(path ? path + '.' + key : key, a?.[key], b?.[key]);
+        } else if (JSON.stringify(a) !== JSON.stringify(b)) changes.push({ path, before: a, after: b });
+      }
+      visit('', before, after);
+      return changes;
+    }
+    // Storage keys a full export carries (key without the prefix). The settings of every role travel too: `config`
+    // (shared settings and the role scope) and `config:<role>`.
+    const transferKey = key => !/^(?:(?:running|lastPause|reloads)(?::|$)|lease:|(?:updates|panel|role)$|keep-awake)/.test(key);
+    const transferRoleKey = key => /^config:\d+$/.test(key);
+    // The settings the current role gets from a file. A full export brings its own role scope; a settings file keeps
+    // the scope of this browser.
+    function transferSettings(file, role, roleConfig) {
+      const global = file.kind === 'full' && transferObject(file.data.config) ? file.data.config : null;
+      if (!global) return config({ ...file.config, roleConfig });
+      const own = global.roleConfig === 'per-role' && role ? file.data['config:' + role] : null;
+      return config(transferObject(own) ? { ...own, roleConfig: 'per-role' } : global);
+    }
+    function transferRoles(data) {
+      const roles = Object.keys(data).filter(transferRoleKey).map(key => key.slice(7));
+      const scope = !transferObject(data.config) ? '' : data.config.roleConfig === 'per-role' ? '每个角色各存一份' : '所有角色共用一份';
+      return scope || roles.length ? ['角色设置：' + [scope, roles.length ? '角色 ' + roles.join('、') : ''].filter(Boolean).join('，')] : [];
+    }
+    function transferSummary(data, logs) {
+      const kinds = [
+        [/^stats:/, '统计', '个角色'], [/^mapRates:/, '智能选图测算', '个角色'],
+        [/^(?:targets(?:$|:)|alive:|monsters$)/, '评分数据', '项'],
+        [/^gear(?:Profile|Rejected|Check):/, '换装方案', '项'], [/^ledger:/, '每日额度记录', '项'],
+        [/^towerFloors:/, '爬塔记录', '项'], [/^potions$/, '药品数据', '项'],
+      ];
+      const counts = new Map(), cached = [];
+      for (const [key, value] of Object.entries(data)) {
+        if (!transferKey(key) || key === 'config' || transferRoleKey(key)) continue;
+        if (/^log(?:$|:)/.test(key) && Array.isArray(value)) {
+          for (const entry of value) if (transferObject(entry)) cached.push(entry);
+          continue;
+        }
+        const [, label, unit] = kinds.find(([pattern]) => pattern.test(key)) || [null, '其他数据', '项'];
+        counts.set(label, [(counts.get(label)?.[0] || 0) + 1, unit]);
+      }
+      if (logs.length || cached.length || Object.keys(data).some(key => /^log(?:$|:)/.test(key)))
+        counts.set('日志', [logs.length + logMissing(cached, logs.filter(transferObject)).length, '条']);
+      return [...transferRoles(data), ...Array.from(counts, ([label, [count, unit]]) => label + '：' + count + ' ' + unit)];
+    }
     function config(value) {
       if (value?.budget && Object.hasOwn(value.budget, 'expPerDay')) {
         const budget = { ...value.budget };
@@ -1943,8 +2005,11 @@
       const entry = collectionValues(entries).find((v) => num(v.role.id) === num(props.roleOverride?.id));
       return viewedState({ ...entry, ...props }, own);
     }
+    function profileScoreValue(info) {
+      return info === null ? '未读到对方技能' : info.pending ? '待战斗数据' : info.score.toLocaleString();
+    }
     function profileScoreText(info) {
-      return '实战评分 ' + (info === null ? '未读到对方技能' : info.pending ? '待战斗数据' : info.score.toLocaleString());
+      return '实战评分 ' + profileScoreValue(info);
     }
     function tooltipContext(item, profiles, own, entries) {
       const profile = array(profiles).find((p) => p.modelValue && isViewedProfile(p) && item?.id != null &&
@@ -3686,7 +3751,8 @@
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
-      viewedState, isViewedProfile, profileState, profileScoreText, tooltipContext,
+      viewedState, isViewedProfile, profileState, profileScoreText, profileScoreValue, tooltipContext,
+      transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       CRIT_BASE, CRIT_RATE, CRIT_FLOOR, CRIT_DEF_OFFSET, CRIT_DEF_RATE, CRIT_DEF_DIVISOR, critMultiplier,
       CRIT_CHANCE_CAP, CRIT_MULT_CAP, critChance,
       MAIN_SOFTCAP, ELEMENT_RATE, hitDamage, setEffects, combatContext, combatParts, combatValue, combatWeights, gearWeights, statScore,
@@ -3824,7 +3890,11 @@
         return fallback;
       }
     };
+    let storageBlocked = false, restoringData = false;
     const writeStorage = (key, value) => {
+      // While a full import runs, in-memory data must not overwrite the imported keys; settings are written by the
+      // import itself.
+      if (storageBlocked || restoringData && P.transferKey(key.slice(PREFIX.length + 1)) && !key.startsWith(CONFIG)) return;
       try {
         localStorage.setItem(key, JSON.stringify(value));
       } catch {}
@@ -3870,10 +3940,11 @@
       target[group][field] = value;
       saveConfig(target, id);
     }
-    function clearRoleConfigs() {
+    function clearRoleConfigs(keep = () => false) {
+      if (storageBlocked) return;
       for (let index = localStorage.length - 1; index >= 0; index--) {
         const key = localStorage.key(index);
-        if (key?.startsWith(CONFIG + ':') && /^\d+$/.test(key.slice(CONFIG.length + 1)))
+        if (key?.startsWith(CONFIG + ':') && /^\d+$/.test(key.slice(CONFIG.length + 1)) && !keep(key.slice(PREFIX.length + 1)))
           localStorage.removeItem(key);
       }
     }
@@ -3912,6 +3983,7 @@
     function createLogStore(factory = typeof indexedDB === 'undefined' ? null : indexedDB) {
       let database = null, opening = null;
       const transaction = (mode, run) => new Promise((resolve, reject) => {
+        if (storageBlocked && mode === 'readwrite') return resolve();
         try {
           const tx = database.transaction('logs', mode);
           let result;
@@ -5013,6 +5085,26 @@
       root() {
         return document.querySelector('#app')?._vnode || this.pinia()?._a?._instance?.vnode || null;
       }
+      // Whether the component rendered the element or something inside it. The character profile of the client of
+      // 2026-11-19 renders a fragment (its root el is a text anchor) with the panel in a teleported dialog. After a
+      // re-render only the block's dynamic vnodes keep their el, so they are searched too.
+      static renders(vm, el, limit = 4000) {
+        const root = vm.subTree;
+        if (root?.el === el || root?.el?.contains?.(el)) return true;
+        const nodes = [root], seen = new Set();
+        const add = list => { if (Array.isArray(list)) for (const child of list.slice(0, Math.max(0, limit - nodes.length))) nodes.push(child); };
+        for (let i = 0; i < nodes.length && i < limit; i++) {
+          const node = nodes[i];
+          if (!node || typeof node !== 'object' || seen.has(node)) continue;
+          if (node.el === el || node.el?.nodeType === 1 && el.contains?.(node.el)) return true;
+          seen.add(node);
+          if (node.component?.subTree) nodes.push(node.component.subTree);
+          if (node.suspense?.activeBranch) nodes.push(node.suspense.activeBranch);
+          add(node.children);
+          add(node.dynamicChildren);
+        }
+        return false;
+      }
       components() {
         const out = [],
           seen = new Set();
@@ -5821,29 +5913,42 @@
             }
           }
         }
-        if (scoreProfiles) {
-          for (const el of profiles) {
-            const vm = profileInstances.find((v) => v.subTree?.el === el || v.subTree?.el?.contains(el));
-            if (!vm && profileInstances.some((v) => v.props.statsOverride != null || v.props.readonly)) continue;
-            const header = el.firstElementChild;
-            if (!header) continue;
-            const selected = P.profileState(vm?.props, state, entries),
-              info = selected ? this.profileScore(vm?.props.statsOverride ?? selected.finalAttributes, selected, prefs) : null,
-              text = P.profileScoreText(info);
-            let line = el.querySelector('.tl-profile-score');
-            if (!line) {
-              line = document.createElement('div');
-              line.className = 'tl-profile-score';
-              const style = getComputedStyle(header);
-              line.style.cssText = 'text-align:right;color:#69f0ae;font-size:' + style.fontSize +
-                ';font-weight:' + style.fontWeight + ';';
-              el.insertBefore(line, header.nextSibling);
-            }
-            if (line.textContent !== text) line.textContent = text;
-          }
-        }
+        if (scoreProfiles) for (const el of profiles) this.drawProfile(el, profileInstances, state, entries, prefs);
         if (cards.length) this.scanMarket(cards, prefs.market?.showScore !== false ? state : null, prefs);
         if (grids.length) this.scanBag(grids, state, prefs, getCollection);
+      }
+      drawProfile(el, profileInstances, state, entries, prefs) {
+        const vm = profileInstances.find(v => Bridge.renders(v, el));
+        if (!vm && profileInstances.some(v => P.isViewedProfile(v.props))) return;
+        const header = el.firstElementChild;
+        if (!header) return;
+        const selected = P.profileState(vm?.props, state, entries);
+        const info = selected ? this.profileScore(vm?.props.statsOverride ?? selected.finalAttributes, selected, prefs) : null;
+        const list = el.querySelector('dl.identity-stats');
+        let line = el.querySelector('.tl-profile-score');
+        if (line && (list ? line.parentNode !== list : line.querySelector('dt'))) {
+          line.remove();
+          line = null;
+        }
+        if (!line) {
+          line = document.createElement('div');
+          line.className = 'tl-profile-score';
+          if (list) {
+            const term = document.createElement('dt'), value = document.createElement('dd');
+            term.textContent = '实战评分';
+            value.style.color = '#69f0ae';
+            line.appendChild(term);
+            line.appendChild(value);
+            list.appendChild(line);
+          } else {
+            const style = getComputedStyle(header);
+            line.style.cssText = 'text-align:right;color:#69f0ae;font-size:' + style.fontSize + ';font-weight:' + style.fontWeight + ';';
+            el.insertBefore(line, header.nextSibling);
+          }
+        }
+        if (list && list.lastElementChild !== line) list.appendChild(line);
+        const target = list ? line.lastElementChild : line, text = list ? P.profileScoreValue(info) : P.profileScoreText(info);
+        if (target.textContent !== text) target.textContent = text;
       }
       inventoryCollection(state) {
         const signature = eq => [eq.id, P.equipmentTemplateId(eq), !!eq.isEquipped];
@@ -6221,7 +6326,7 @@
         }
       }
     }
-    function applyConfig(controller, next) {
+    function applyConfig(controller, next, preserveData = false) {
       const previous = controller.prefs;
       controller.prefs = next;
       if (!next.battle.smart || next.battle.mapId || !next.battle.enabled) {
@@ -6229,14 +6334,14 @@
         controller.bridge.holdTargets = false;
       }
       if (!next.disguise.enabled && controller.panel?.cover) controller.panel.toggleDisguise();
-      if (previous.storage.indexedDB !== next.storage.indexedDB) controller.logReady = controller.syncLogStorage();
-      if (previous.logs.keepDays !== next.logs.keepDays) controller.pruneLogs();
+      if (previous.storage.indexedDB !== next.storage.indexedDB) controller.logReady = controller.syncLogStorage(controller.logs, preserveData);
+      if (!preserveData && previous.logs.keepDays !== next.logs.keepDays) controller.pruneLogs();
       controller.filler?.schedule();
       controller.timer.set(next.tickMs);
       controller.lastSettings = 0;
       controller.suppressed.clear();
       const s = controller.bridge.state();
-      if (s && controller.gearRoleId === P.num(s.role.id)) controller.updateGearCheck(s);
+      if (!preserveData && s && controller.gearRoleId === P.num(s.role.id)) controller.updateGearCheck(s);
       if (!controller.updates) return;
       if (next.updates.checkDaily) {
         controller.updates.start();
@@ -6363,6 +6468,7 @@
         this.bridge.profilePressure = (name) => this.stats?.pressure((id) => P.mapProfile(id) === name);
         this.bridge.pressure = (maps) => this.stats?.pressure((id) => P.farmMap(P.array(maps).find((m) => P.num(m.id) === id)));
         window.addEventListener('pagehide', () => {
+          if (storageBlocked) return;
           this.stats?.flush();
           this.mapRates?.flush();
           this.pendingMapRates?.forEach(rates => rates.flush());
@@ -6603,6 +6709,7 @@
         this.paint();
       }
       flushLogs() {
+        if (storageBlocked) return Promise.resolve();
         clearTimeout(this.logTimer);
         this.logTimer = null;
         this.logs = P.logPrune(this.logs, this.prefs.logs.keepDays);
@@ -6626,7 +6733,7 @@
         this.logQueue = [];
         this.paint();
       }
-      async syncLogStorage(cached = this.logs) {
+      async syncLogStorage(cached = this.logs, preserveData = false) {
         const epoch = ++this.logEpoch, role = roleTag(this);
         this.logDatabaseOn = false;
         this.logError = '';
@@ -6641,7 +6748,7 @@
           }
           await this.logStore.open();
           if (epoch !== this.logEpoch || !this.prefs.storage.indexedDB) return;
-          await this.logStore.prune(P.logCutoff(this.prefs.logs.keepDays, Date.now()));
+          if (!preserveData) await this.logStore.prune(P.logCutoff(this.prefs.logs.keepDays, Date.now()));
           await Promise.all(Array.from(this.logBatches, (batch) => batch.write));
           const saved = await this.logStore.read(500, role), usage = await this.logStore.summary();
           if (epoch !== this.logEpoch || !this.prefs.storage.indexedDB) return;
@@ -6680,6 +6787,7 @@
         } catch (error) { this.failLogStorage(error); return P.logSummary([]); }
       }
       async pruneLogs() {
+        if (storageBlocked) return;
         this.logs = P.logPrune(this.logs, this.prefs.logs.keepDays);
         this.logQueue = P.logPrune(this.logQueue, this.prefs.logs.keepDays);
         writeStorage(taggedKey('log', roleTag(this)), this.logs.slice(0, 60));
@@ -6692,6 +6800,7 @@
         this.paint();
       }
       async clearLogDatabase(role = 0) {
+        if (storageBlocked) return;
         while (this.logClearing) await this.logClearing;
         ++this.logEpoch;
         this.logQueue = this.logQueue.filter((entry) => !visibleLog(entry, role));
@@ -6723,6 +6832,53 @@
         writeStorage(taggedKey('log', roleTag(this)), []);
         this.paint();
         return this.clearLogDatabase(roleTag(this));
+      }
+      async exportData(config) {
+        await this.logReady;
+        await Promise.all(Array.from(this.logBatches, batch => batch.write));
+        const queued = this.logQueue.slice().reverse();
+        const logs = this.logDatabaseOn ? P.logPrune([...queued, ...await this.logStore.read()], this.prefs.logs.keepDays) : [];
+        const data = Object.create(null), prefix = PREFIX + ':';
+        for (let index = 0; index < localStorage.length; index++) {
+          const key = localStorage.key(index);
+          if (!key?.startsWith(prefix) || !P.transferKey(key.slice(prefix.length))) continue;
+          const value = readStorage(key, undefined);
+          if (value !== undefined) data[key.slice(prefix.length)] = value;
+        }
+        return { format: 'tl-autopilot-full', formatVersion: 1, script: this.status().version,
+          exportedAt: Date.now(), host: location.host, roleId: roleTag(this), config, data, logs };
+      }
+      async mergeTransferLogs(logs) {
+        await this.logReady;
+        if (this.logClearing) await this.logClearing;
+        if (this.logDatabaseOn) {
+          await this.flushLogs();
+          await Promise.all(Array.from(this.logBatches, batch => batch.write));
+          const missing = P.logMissing(logs, await this.logStore.read());
+          if (missing.length) await this.logStore.append(missing);
+        }
+      }
+      async importData(data, logs, saveSettings) {
+        if (storageBlocked || restoringData) throw new Error('全量配置已在导入');
+        restoringData = true;
+        try {
+          for (const [key, value] of Object.entries(data)) {
+            if (P.transferKey(key)) localStorage.setItem(PREFIX + ':' + key, JSON.stringify(value));
+          }
+          // The file's settings keys replace the settings of every role; a file without them (none was ever saved
+          // there) gives its settings to the current role only.
+          if (Object.hasOwn(data, 'config')) clearRoleConfigs((key) => Object.hasOwn(data, key));
+          else saveSettings?.();
+          await this.mergeTransferLogs(logs);
+          this.log('已导入全量配置');
+          await this.flushLogs();
+          saveRunning(this, this.enabled);
+          storageBlocked = true;
+          this.reloadPage();
+        } finally { restoringData = false; }
+      }
+      reloadPage() {
+        location.reload();
       }
       async exportLogs() {
         await this.logReady;
@@ -6911,6 +7067,7 @@
         return readStorage(this.leaseKey(), {}).id === this.id;
       }
       releaseLease() {
+        if (storageBlocked) return;
         const lease = readStorage(this.leaseKey(), null);
         if (lease?.id === this.id)
           try {
@@ -7022,14 +7179,14 @@
         this.paint();
         return stopped;
       }
-      updateConfig(value) {
+      updateConfig(value, { preserveData = false } = {}) {
         const next = P.config(value), changed = next.roleConfig !== this.prefs.roleConfig;
         if (!changed) next.roleConfig = readStorage(CONFIG, {})?.roleConfig === 'per-role' ? 'per-role' : 'shared';
         this.configRole = next.roleConfig === 'per-role' ? this.roleId || this.roleHint || 0 : 0;
         if (changed && this.configRole) saveConfig(next, 0);
         saveConfig(next, this.configRole);
         if (changed && next.roleConfig === 'shared') clearRoleConfigs();
-        applyConfig(this, next);
+        applyConfig(this, next, preserveData);
         this.log('策略配置已保存');
         return copy(this.prefs);
       }
@@ -8800,11 +8957,11 @@
       potionOrder: "游戏自动回复每次只用一颗药且有冷却。智能选择会按“最大值×(100%−阈值)”算出触发时的缺口，优先用刚好补满缺口的最小药，补不满的低级药排在后面兜底。填写指定模板ID时按填写顺序。",
       budget: "按本机日期统计。人物升级按目标等级和保留经验执行。技能升级、冶炼各有每日额度。",
       limits: "三项每日额度及各功能的每日操作上限填 0 均表示不限（仍受保留金币、保留经验约束）。保存不会清零已用额度。托管暂停时，保存后需点击“开始托管”。",
-      json: "修改后先载入，再保存。模板ID与评分权重均保存在本机配置中。",
+      json: "精简配置只含当前角色的设置；全量配置含本站所有角色的设置、数据和日志。导入或重置时会先列出改动，确认后立即生效。",
       scoreLink: "评分方式、权重和计算公式在“评分”页。",
       reset: "清除攻坚群攻记录、怪物属性缓存和浮屠楼层，从现在起统计各方案的生存权重。统计页的收益数据不变。挂机需要 30 分钟战斗数据，三环需要 5 分钟或一次挑战失败。",
       points: "点数指装备上的点数，已计入被动技能的加成。详细说明见“计算公式”。",
-      linear: "固定权重与游戏战力相同，可在高级JSON配置中调整。",
+      linear: "固定权重与游戏战力相同，可编辑导出的配置文件后导入。",
       reference: "评分参照的怪物越多，换地图时分数越稳定；怪物属性每天向服务器读取一次。战斗数据不足 30 分钟时生存权重用手动值。",
       defense: "自动生存权重按门槛计算：安全时只等于生命药费占金币收入的比例（接近 0，防御和抗性几乎不加分）。实战评分每 100 分约等于整体实战能力的 1%；人物面板的实战评分是全身装备的合计贡献，换一件装备后它的变化等于两件装备的分数差。",
       attributes: "分数按当前属性和参照怪物实时计算，每 100 分约等于整体实战能力的 1%。点数指装备上的点数，已计入被动技能的加成。抗性只在低于怪物对应元素攻击时有用，超出的部分不加分，所以抗性的“+100 点”远小于“+1 点”的 100 倍。",
@@ -8821,6 +8978,7 @@
 .update-backdrop{position:fixed;inset:0;z-index:2;pointer-events:auto;display:grid;place-items:center;padding:16px;background:color-mix(in srgb,var(--on-accent) 55%,transparent)}
 .update-dialog{width:min(480px,100%);max-height:100%;overflow:auto;overscroll-behavior:contain;overflow-wrap:anywhere;padding:20px;border:1px solid var(--stroke);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}
 .update-dialog h2{margin:0 0 12px;color:var(--text-strong)}
+.transfer-changes{max-height:38vh;overflow:auto;overscroll-behavior:contain}
 ::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:var(--stroke);border-radius:4px}::-webkit-scrollbar-track{background:transparent}
 @supports not selector(::-webkit-scrollbar){*{scrollbar-width:thin;scrollbar-color:var(--stroke) transparent}}
 button,input,select,textarea{font:inherit;color:inherit}button,summary{cursor:pointer}
@@ -9267,14 +9425,18 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             this.uiState().sections['status:计划预览'] = true;
             this.rememberPage();
             this.requestBody();
-          } else if (action === 'defaults') {
-            this.pending = TLPolicy.clone(TLPolicy.DEFAULTS);
-            this.dirty = true;
-            this.requestBody();
-          } else if (action === 'export') this.download('天龙托管配置.json', this.pending);
+          } else if (action === 'reset') this.previewTransfer({ kind: 'reset', config: TLPolicy.DEFAULTS });
+          else if (action === 'export') this.download('天龙托管配置.json', this.pending);
+          else if (action === 'exportFull') {
+            try {
+              const file = await this.controller.exportData(TLPolicy.clone(this.controller.prefs));
+              const stamp = TLRuntime.day(new Date(file.exportedAt)).replaceAll('-', '');
+              this.download('天龙托管全量配置-' + file.host.replaceAll(':', '_') + '-' + stamp + '.json', file);
+            } catch (error) { this.transferError('导出失败：' + error.message); }
+          }
           else if (action === 'diagnostics')
             this.download('天龙托管诊断.json', this.controller.status());
-          else if (action === 'applyJson') this.applyJSON(this.root.querySelector('textarea').value);
+
           else if (action === 'importConfig') this.root.querySelector('.config-file').click();
           else if (['exportLogs', 'clearLogs', 'clearDatabase'].includes(action)) {
             try {
@@ -9369,13 +9531,11 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         this.root.addEventListener('change', async (e) => {
           if (!e.target.matches('.config-file') || !e.target.files?.[0]) return;
           try {
-            const text = await e.target.files[0].text();
-            const textarea = this.root.querySelector('textarea');
-            if (textarea) textarea.value = text;
-            this.applyJSON(text);
+            const file = e.target.files[0];
+            const text = await file.text().catch(error => { throw new Error('读取配置文件失败：' + error.message); });
+            this.previewTransfer(TLPolicy.transferFile(text), file.lastModified);
           } catch (error) {
-            const line = this.root.querySelector('.error');
-            if (line) line.textContent = '读取配置文件失败：' + error.message;
+            this.transferError(error.message);
           }
           e.target.value = '';
         });
@@ -9529,7 +9689,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         const value = JSON.stringify(this.uiState());
         if (value === this.panelStateJSON) return;
         this.panelStateJSON = value;
-        try { localStorage.setItem(PANEL_KEY, value); } catch {}
+        TLRuntime.writeStorage(PANEL_KEY, this.uiState());
       }
       rememberPage() {
         const group = groups.find(([, , items]) => items.some(([id]) => id === this.section));
@@ -9887,16 +10047,79 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           this.fragmentKeys[selector] = key;
         }
       }
-      applyJSON(text) {
+      transferError(message) {
+        const line = this.root.querySelector('.error');
+        if (line) line.textContent = message;
+      }
+      previewTransfer(file, modified) {
+        const status = this.controller.status(), prefs = this.controller.prefs;
+        if (!this.index || this.indexPending !== this.pending || this.indexRole !== status.role?.id)
+          this.buildIndex(status, this.controller.bridge.state());
+        const role = status.role?.id ?? this.controller.roleId ?? this.controller.roleHint ?? 0;
+        file.config = TLPolicy.transferSettings(file, role, prefs.roleConfig);
+        this.transferError('');
+        this.hideUpdateDialog();
+        this.transfer = file;
+        const changes = TLPolicy.configChanges(prefs, file.config);
+        if (file.config.roleConfig !== prefs.roleConfig)
+          changes.unshift({ path: 'roleConfig', before: prefs.roleConfig, after: file.config.roleConfig });
+        const title = file.kind === 'reset' ? '重置配置' : file.kind === 'full' ? '导入全量配置' : '导入配置文件';
+        const rows = changes.map(change => this.transferRow(change));
+        const body = this.transferDetails(file, modified, status.role?.id) +
+          '<h3>设置改动 ' + rows.length + ' 项</h3><div class="transfer-changes">' + (rows.join('') || '设置没有变化') + '</div>' +
+          (this.dirty ? this.infoBar('面板上未保存的修改会被丢弃', 'warn') : '');
+        const html = this.dialogHTML(title, body, ['取消', file.kind === 'reset' ? '重置' : '保存'], 1);
+        const close = () => { if (!this.transferSaving) this.hideUpdateDialog(); };
+        this.showDialog(html, close, index => index ? this.saveTransfer(file) : close());
+      }
+      transferDetails(file, modified, role) {
+        if (file.kind === 'reset') return '';
+        const date = value => value ? new Date(value).toLocaleString() : '—';
+        const lines = ['文件修改时间：' + date(modified)];
+        if (file.kind === 'full') {
+          const { exportedAt, script, host, roleId } = file.meta;
+          const other = String(roleId) !== String(role ?? this.controller.roleId ?? this.controller.roleHint ?? 0);
+          lines.push('导出时间：' + date(exportedAt), '导出版本 v' + (script ?? '—'), '站点：' + (host ?? '—'),
+            '角色 ' + (roleId ?? '—') + (roleId != null && other ? '（不是当前角色）' : ''),
+            ...TLPolicy.transferSummary(file.data, file.logs),
+            (Object.hasOwn(file.data, 'config') ? '本站所有角色的设置换成文件里的，' : '') + '本机同名数据会被覆盖，导入后页面会刷新');
+        }
+        return lines.map(line => '<div>' + esc(line) + '</div>').join('');
+      }
+      transferRow({ path, before, after }) {
+        const field = this.index.find(entry => entry.path === path);
+        const label = field ? field.pageName + ' › ' + field.section + ' · ' + field.label : path;
+        const format = value => {
+          if (value == null) return '—';
+          if (Array.isArray(value)) return value.map(format).join('、');
+          const choice = field?.options.choices?.find(([key]) => String(key) === String(value));
+          if (choice) return choice[1];
+          if (typeof value === 'boolean') return value ? '开' : '关';
+          return String(value) + (typeof value === 'number' ? field?.options.unit || '' : '');
+        };
+        return '<div>' + esc(label + '：' + format(before) + ' → ' + format(after)) + '</div>';
+      }
+      async saveTransfer(file) {
+        if (this.transferSaving || this.transfer !== file) return;
+        this.transferSaving = true;
         try {
-          this.pending = TLPolicy.config(JSON.parse(text));
-          this.dirty = true;
-          this.controller.log('JSON配置已载入，点击保存生效');
+          const config = { ...file.config, roleConfig: this.controller.prefs.roleConfig };
+          const saveSettings = () => {
+            this.pending = TLPolicy.clone(this.controller.updateConfig(config, { preserveData: file.kind !== 'config' }));
+            this.dirty = false;
+          };
+          if (file.kind === 'full') await this.controller.importData(file.data, file.logs, saveSettings);
+          else {
+            saveSettings();
+            this.controller.log(file.kind === 'reset' ? '配置已重置为默认' : '已导入配置文件');
+          }
+          this.hideUpdateDialog();
           this.requestBody();
         } catch (error) {
-          const line = this.root.querySelector('.error');
-          if (line) line.textContent = 'JSON格式错误：' + error.message;
-        }
+          this.hideUpdateDialog();
+          this.renderBody();
+          this.transferError('导入失败：' + error.message);
+        } finally { this.transferSaving = false; }
       }
       async queryDatabaseUsage() {
         this.databaseUsage = await this.controller.queryLogUsage();
@@ -10228,9 +10451,10 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
               choices: [['shared', '所有角色共用一份'], ['per-role', '每个角色各存一份']],
               help: '同一个站点多开角色时，选“每个角色各存一份”后，保存只影响当前角色；改回共用时以这次保存的内容为准，并删除各角色单独的配置。其他已打开的页签刷新后生效',
             })) +
-            g('配置', '<label for="tl-config-json">高级配置JSON</label>' + this.help(HELP.json) + '<textarea id="tl-config-json" spellcheck="false" aria-label="高级配置JSON">' +
-            esc(JSON.stringify(this.pending, null, 2)) +
-            '</textarea><input class="config-file" type="file" accept=".json" hidden><div class="info-bar tone-err" role="alert"><span aria-hidden="true">!</span><span class="error"></span></div><div class="actions"><button type="button" class="btn" data-action="applyJson">载入JSON配置</button><button type="button" class="btn" data-action="importConfig">导入配置文件</button><button type="button" class="btn" data-action="export">导出配置</button><button type="button" class="btn" data-action="defaults">载入默认策略</button><button type="button" class="btn" data-action="diagnostics">导出诊断</button></div>') +
+            g('配置', this.help(HELP.json) + '<input class="config-file" type="file" accept=".json" hidden>' +
+            '<div class="info-bar tone-err" role="alert"><span aria-hidden="true">!</span><span class="error"></span></div><div class="actions">' +
+            [['importConfig', '导入配置文件'], ['export', '导出精简配置'], ['exportFull', '导出全量配置'], ['reset', '重置配置'], ['diagnostics', '导出诊断']]
+              .map(([action, label]) => '<button type="button" class="btn" data-action="' + action + '">' + label + '</button>').join('') + '</div>') +
             g('浏览器数据库', f('使用浏览器数据库保存日志', 'storage.indexedDB') +
             '<div class="database-data">' + this.databaseHTML() + '</div><button type="button" class="btn" data-action="clearDatabase">清理数据库</button>') +
             g('伪装', f('开启伪装', 'disguise.enabled') +
@@ -10435,48 +10659,57 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       }
       updateDialogHTML(u) {
         const message = u.newer ? '当前版本 v' + u.currentVersion + '，建议尽快更新。' : '已更新到这个版本。';
-        const button = (label, primary = false) => '<button type="button" class="btn' +
-          (primary ? ' primary' : '') + '">' + esc(label) + '</button>';
+        return this.dialogHTML('重要更新 v' + u.latestVersion, this.infoBar(message) + this.releaseNotesHTML(u.notes),
+          u.newer ? ['安装新版本', '稍后'] : ['知道了'], 0);
+      }
+      dialogHTML(title, body, buttons, primaryIndex) {
+        const button = (label, index) => '<button type="button" class="btn' +
+          (index === primaryIndex ? ' primary' : '') + '">' + esc(label) + '</button>';
         return '<section class="update-dialog" role="alertdialog" aria-modal="true" aria-labelledby="important-update-title">' +
-          '<h2 id="important-update-title">' + esc('重要更新 v' + u.latestVersion) + '</h2>' +
-          this.infoBar(message) + this.releaseNotesHTML(u.notes) +
-          '<div class="actions">' + button(u.newer ? '安装新版本' : '知道了', true) +
-          (u.newer ? button('稍后') : '') + '</div></section>';
+          '<h2 id="important-update-title">' + esc(title) + '</h2>' + body +
+          '<div class="actions">' + buttons.map(button).join('') + '</div></section>';
       }
       hideUpdateDialog() {
         if (!this.updateBackdrop) return;
         this.updateBackdrop.remove();
         this.updateBackdrop = null;
+        this.transfer = null;
         this.updateDialogKey = null;
         this.dialogReturnFocus?.focus({ preventScroll: true });
         this.dialogReturnFocus = null;
       }
       syncUpdateDialog(status) {
+        if (this.transfer) return;
         const u = !this.cover && this.controller.prefs.updates.remind && (status ?? this.controller.updates?.status());
         if (!u?.dialog) return this.hideUpdateDialog();
         const key = JSON.stringify([u.latestVersion, u.currentVersion, u.notes]);
         if (key === this.updateDialogKey) return;
         this.hideUpdateDialog();
         this.updateDialogKey = key;
+        const close = () => this.controller.updates.closeDialog(u.latestVersion);
+        this.showDialog(this.updateDialogHTML(u), close, index => {
+          if (!index && u.newer) window.open(u.installUrl, '_blank', 'noopener,noreferrer');
+          close();
+        });
+      }
+      showDialog(html, close, choose) {
         this.dialogReturnFocus = this.root.activeElement || document.activeElement;
         while (this.dialogReturnFocus?.shadowRoot?.activeElement)
           this.dialogReturnFocus = this.dialogReturnFocus.shadowRoot.activeElement;
         const backdrop = document.createElement('div');
         backdrop.className = 'update-backdrop';
-        backdrop.innerHTML = this.updateDialogHTML(u);
+        backdrop.innerHTML = html;
         this.updateBackdrop = this.root.appendChild(backdrop);
-        this.bindUpdateDialog(backdrop, u);
-        backdrop.querySelector('.primary').focus();
+        this.bindUpdateDialog(backdrop, close, choose);
+        backdrop.querySelector('button').focus();
       }
-      bindUpdateDialog(backdrop, u) {
+      bindUpdateDialog(backdrop, close, choose) {
         const buttons = [...backdrop.querySelectorAll('button')];
-        const close = () => this.controller.updates.closeDialog(u.latestVersion);
         backdrop.addEventListener('click', event => {
           event.stopPropagation();
           const button = event.target.closest('button');
           if (!button) return;
-          if (button === buttons[0] && u.newer) window.open(u.installUrl, '_blank', 'noopener,noreferrer');
-          close();
+          return choose(buttons.indexOf(button));
         });
         backdrop.addEventListener('keydown', event => {
           event.stopPropagation();
