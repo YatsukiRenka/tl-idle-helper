@@ -1920,6 +1920,11 @@
         { state: own, compare: true, title: null };
     }
     const SUSTAIN_LINE = 0.5, LOW_HP_SHARE = 0.05, HP_LINE = 0.35;
+    // The HP loss that potions had to make up. Skills that heal the character (峨眉) and pets make up part of the
+    // loss, and that part does not bring the potions closer to their limit. Totals without the figure (older
+    // statistics) count the whole loss.
+    const potionLoad = (totals) => Number.isFinite(totals?.hpCovered)
+      ? Math.min(num(totals.hpLost), Math.max(0, totals.hpCovered)) : num(totals?.hpLost);
     function survivalWeight(totals, healPerSecond) {
       if (!totals || totals.battle < 1800000 || !Number.isFinite(healPerSecond) || healPerSecond <= 0) return null;
       const clamp = (v) => Math.max(0, Math.min(1, v));
@@ -1927,18 +1932,19 @@
       const count = num(totals.hpPotions) + num(totals.mpPotions);
       const income = num(totals.gold) + num(totals.sell);
       const share = count && income ? clamp(num(totals.potion) * num(totals.hpPotions) / count / income) : 0;
-      const ratio = clamp(num(totals.hpLost) / (totals.battle / 1000) / healPerSecond);
+      const load = potionLoad(totals), healed = num(totals.hpLost) > 0 ? 1 - load / num(totals.hpLost) : 0;
+      const ratio = clamp(load / (totals.battle / 1000) / healPerSecond);
       const low = num(totals.low) / totals.battle;
       const sustain = clamp((ratio - SUSTAIN_LINE) / (1 - SUSTAIN_LINE)), burst = clamp(low / LOW_HP_SHARE), death = deaths > 0 ? 0.5 : 0;
       const danger = Math.max(sustain, burst, death);
       return { weight: Math.round(clamp(share + danger) * 100) / 100,
-        share, ratio, low, deaths, hours, sustain, burst, death, danger, safe: danger === 0 };
+        share, ratio, healed, low, deaths, hours, sustain, burst, death, danger, safe: danger === 0 };
     }
     function assaultWeight(totals, healPerSecond, failed = false) {
       failed = !!failed || num(totals?.deaths) > 0;
       const battle = num(totals?.battle);
       if (!failed && (battle < 300000 || !(healPerSecond > 0))) return null;
-      const ratio = battle && healPerSecond > 0 ? Math.min(1, num(totals.hpLost) / (battle / 1000) / healPerSecond) : 0;
+      const ratio = battle && healPerSecond > 0 ? Math.min(1, potionLoad(totals) / (battle / 1000) / healPerSecond) : 0;
       const low = battle ? num(totals.low) / battle : 0;
       const sustain = Math.max(0, (ratio - SUSTAIN_LINE) / (1 - SUSTAIN_LINE)), burst = Math.min(1, low / LOW_HP_SHARE);
       const danger = Math.max(sustain, burst);
@@ -4062,7 +4068,8 @@
             key.split(':').every((v) => v !== '' && Number.isInteger(Number(v))) && b && statsFields.every((k) => k === 'low' && b[k] === undefined || Number.isFinite(b[k]) && b[k] >= 0)))
           this.buckets = Object.fromEntries(Object.entries(saved.buckets).map(([k, b]) => [k, { ...b,
             battle: saved.version === 1 && b.battle > 0 && b.hpLost === 0 && b.kills === 0 ? 0 : b.battle,
-            low: saved.version === 1 ? 0 : b.low ?? 0 }]));
+            low: saved.version === 1 ? 0 : b.low ?? 0,
+            potionHp: Number.isFinite(b.potionHp) && b.potionHp >= 0 ? b.potionHp : undefined }]));
         const p = saved?.pressureFrom;
         if (p && Number.isFinite(p.at) && p.at >= 0 && p.hour === Math.floor(p.at / 3600000) &&
           p.base && typeof p.base === 'object' && !Array.isArray(p.base) &&
@@ -4072,7 +4079,7 @@
       }
       resetPressure() {
         const at = this.now(), hour = Math.floor(at / 3600000);
-        const fields = 'battle hpLost gold sell potion hpPotions mpPotions deaths low'.split(' ');
+        const fields = 'battle hpLost gold sell potion hpPotions mpPotions deaths low potionHp'.split(' ');
         const base = Object.fromEntries(Object.entries(this.buckets).filter(([k]) => Number(k.split(':')[0]) === hour)
           .map(([k, b]) => [k, Object.fromEntries(fields.map(f => [f, b[f]]))]));
         this.pressureFrom = { at, hour, base };
@@ -4087,19 +4094,27 @@
       pressure(isFarmMap) {
         const totals = Object.fromEntries('battle hpLost gold sell potion hpPotions mpPotions deaths low'.split(' ').map((k) => [k, 0]));
         const hours = [...new Set(Object.keys(this.buckets).map((k) => Number(k.split(':')[0])))].sort((a, b) => b - a);
+        let covered = 0;
         for (const hour of hours) {
           if (this.pressureFrom && hour < this.pressureFrom.hour) continue;
           const buckets = Object.entries(this.buckets).filter(([k]) => Number(k.split(':')[0]) === hour && isFarmMap(Number(k.split(':')[1])));
-          for (const [key, bucket] of buckets)
-            for (const k of Object.keys(totals)) totals[k] += Math.max(0, bucket[k] - (this.pressureFrom?.base[key]?.[k] || 0));
+          for (const [key, bucket] of buckets) {
+            const base = this.pressureFrom?.base[key];
+            for (const k of Object.keys(totals)) totals[k] += Math.max(0, bucket[k] - (base?.[k] || 0));
+            const lost = Math.max(0, bucket.hpLost - (base?.hpLost || 0));
+            covered += bucket.potionHp === undefined ? lost
+              : Math.min(lost, Math.max(0, bucket.potionHp - (base?.potionHp || 0)));
+          }
           if (totals.battle >= 21600000) break;
         }
+        // The part of the HP loss that potions made up (see potionLoad).
+        totals.hpCovered = covered;
         return totals;
       }
       bucket(mapId) {
         this.prune();
         const key = Math.floor(this.now() / 3600000) + ':' + (mapId || 0);
-        return this.buckets[key] ||= statsTotals();
+        return this.buckets[key] ||= { ...statsTotals(), potionHp: 0 };
       }
       save() {
         if (this.now() - this.lastWrite >= 60000) this.flush();
@@ -4161,7 +4176,11 @@
       potions(d, context, b) {
         const effects = (d.effects || []).filter((v) => v.type === 'HEAL');
         for (const effect of effects) {
-          if (effect.attr === 'HP') b.hpPotions++;
+          if (effect.attr === 'HP') {
+            b.hpPotions++;
+            // Buckets from before this figure existed stay without it: their potion heal is unknown.
+            if (b.potionHp !== undefined) b.potionHp += Math.max(0, Number(effect.value) || 0);
+          }
           if (effect.attr === 'MP') b.mpPotions++;
         }
         if (effects.length) b.potion += context.potionPrice((d.message || '').replace(/^使用了 /, ''));
@@ -10005,7 +10024,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         const percent = (n) => (Number(n || 0) * 100).toFixed(1) + '%',
           rows = [
             ['药费占收入', v ? percent(v.share) : '—', '0–100%', '—'],
-            ['掉血占回血能力', v ? percent(v.ratio) : '—', '安全线 50%', v ? Number(v.sustain).toFixed(2) : '—'],
+            ['掉血占回血能力', v ? percent(v.ratio) + (v.healed > 0.02 ? '（另有 ' + percent(v.healed) + ' 的掉血由技能等回复，不计入）' : '') : '—', '安全线 50%', v ? Number(v.sustain).toFixed(2) : '—'],
             ['低血量时间', v ? percent(v.low) : '—', '5% 升满', v ? Number(v.burst).toFixed(2) : '—'],
             ['阵亡次数', v ? v.deaths + ' 次' : '—', '有阵亡时 0.5', v ? Number(v.death).toFixed(2) : '—'],
             ['战斗数据时长', v ? Number(v.hours).toFixed(1) + ' 小时' : '—', '至少 30 分钟', '—'],
@@ -10082,7 +10101,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           '神器技能：每次命中按触发率触发，额外伤害 = 触发率 × 额外比例；增益与减益按“持续时间内至少触发一次”的概率折算',
           '自动生存权重 = 生命药费 ÷（击杀金币 + 出售收入）+ 危险度',
           `危险度 = max（（掉血占回血能力 − ${percent(p.SUSTAIN_LINE)}）÷ ${percent(1 - p.SUSTAIN_LINE)}，低血量时间占比 ÷ ${percent(p.LOW_HP_SHARE)}，有阵亡时 0.5）`,
-          `低血量 = 气血低于 ${percent(p.HP_LINE)}；回血能力 = 最强可用生命药回复量 ÷ 3 秒`
+          `低血量 = 气血低于 ${percent(p.HP_LINE)}；回血能力 = 最强可用生命药回复量 ÷ 3 秒；掉血只算靠生命药补回的部分，技能和珍兽回复的不算`
         ],
           labels = ['实战值', '分数', '单件装备分数', '人物实战评分', '每次伤害', '主伤害', '元素伤害', '命中与会心率',
             '会心伤害倍率', '会心起点', '会心上限', '技能减益', '技能倍数', '技能轮转', '神器技能', '自动生存权重', '危险度', '低血量'];
