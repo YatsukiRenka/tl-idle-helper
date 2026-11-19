@@ -8300,16 +8300,20 @@
         if (!packet?.success) return this.stop(packet?.message || timeout);
         const item = this.withdrawnItem(equip, oldIds);
         if (!item) return this.stop('已取出到背包，但没找到这件装备，未出售');
-        return this.sellFromBag(item.id);
+        return this.sellFromBag(item.id, equip.equipTmpl.name);
       }
-      async sellFromBag(id) {
+      async sellFromBag(id, name) {
         if (this.busy('SHOP_SELL') && !await this.waitReady('SHOP_SELL', '仓库操作没有回应，已停止')) return null;
         if (!this.saleActive()) return null;
         if (!this.bagEquipment().some(e => e.id === id)) return false;
+        const money = () => P.num(this.bridge.character()?.role?.money), before = money();
         const sale = await this.send('SHOP_SELL', { roleEquipId: id, count: 1 });
         if (!this.open() || sale === false) return null;
         if (!sale) return this.stop('出售没有回应，装备可能已在背包');
-        return sale.success || this.stop('出售失败：' + sale.message + '，装备已在背包');
+        if (!sale.success) return this.stop('出售失败：' + sale.message + '，装备已在背包');
+        // A successful sale leaves a trace: the game itself only writes it to the chat's system channel.
+        this.controller.log('快捷出售仓库装备「' + name + '」：+' + Math.max(0, money() - before) + ' 金币', 'success');
+        return true;
       }
       async send(type, payload) {
         let timer;
