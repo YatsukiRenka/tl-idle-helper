@@ -371,7 +371,7 @@
         sum + (item.count ? item.bytes - 1 : 0), 0) : 2 };
     }
     function logMissing(entries, saved) {
-      const key = (entry) => JSON.stringify([entry.at, entry.time, entry.level, entry.text]), counts = new Map();
+      const key = (entry) => JSON.stringify([entry.role, entry.at, entry.time, entry.level, entry.text]), counts = new Map();
       for (const entry of saved) counts.set(key(entry), (counts.get(key(entry)) || 0) + 1);
       return entries.filter((entry) => {
         const id = key(entry), count = counts.get(id) || 0;
@@ -3714,6 +3714,23 @@
         return Number.isSafeInteger(id) && id > 0 ? id : 0;
       } catch { return 0; }
     }
+    const roleTag = (controller) => controller.roleId || controller.roleHint || 0;
+    const taggedKey = (name, role) => PREFIX + ':' + name + (role ? ':' + role : '');
+    function readTagged(name, role, fallback) {
+      const own = role ? readStorage(taggedKey(name, role), undefined) : undefined;
+      return own === undefined ? readStorage(taggedKey(name, 0), fallback) : own;
+    }
+    // A record without a role (older versions) or with role 0 (written before the role was known) belongs to nobody:
+    // every tab shows it.
+    const visibleLog = (entry, role) => !role || !entry.role || entry.role === role;
+    function quickLogs(role, days, loaded) {
+      const logs = loaded === undefined ? readTagged('log', role, []) : readStorage(taggedKey('log', role), loaded);
+      if (!Array.isArray(logs) || !logs.every((v) => v && ['time', 'level', 'text'].every((k) => typeof v[k] === 'string'))) return [];
+      return P.logPrune(logs.filter((entry) => visibleLog(entry, role)).slice(0, 60), days);
+    }
+    function mergedLogs(lines, saved) {
+      return [...P.logMissing(lines, saved), ...saved].sort((a, b) => b.at - a.at).slice(0, 500);
+    }
     function roleConfig(id) {
       const value = id && readStorage(CONFIG + ':' + id, null);
       return value && typeof value === 'object' && !Array.isArray(value)
@@ -3806,13 +3823,13 @@
         append(entries) {
           return transaction('readwrite', (store) => { for (const entry of entries) store.add(entry); });
         },
-        read(limit = Infinity) {
+        read(limit = Infinity, role = 0) {
           return transaction('readonly', (store, done) => {
             const entries = [], request = store.index('at').openCursor(null, 'prev');
             request.onsuccess = () => {
               const cursor = request.result;
               if (!cursor || entries.length >= limit) return done(entries);
-              entries.push(cursor.value);
+              if (visibleLog(cursor.value, role)) entries.push(cursor.value);
               cursor.continue();
             };
           });
@@ -3838,8 +3855,17 @@
             };
           });
         },
-        clear() {
-          return transaction('readwrite', (store) => { store.clear(); });
+        clear(role = 0) {
+          return transaction('readwrite', (store) => {
+            if (!role) return store.clear();
+            const request = store.openCursor();
+            request.onsuccess = () => {
+              const cursor = request.result;
+              if (!cursor) return;
+              if (visibleLog(cursor.value, role)) cursor.delete();
+              cursor.continue();
+            };
+          });
         },
       };
     }
@@ -3933,7 +3959,9 @@
     };
     function scoringState(c, bridge, prefs = P.DEFAULTS, untracked = false, now = bridge.scoringNow?.() ?? Date.now()) {
       const field = (k) => untracked ? storeField(c, k) : c[k];
-      const s = { role: field('role'), maps: field('maps'), bagItems: field('bagItems'),
+      const role = field('role');
+      bridge.syncTargetRole?.(P.num(role?.id));
+      const s = { role, maps: field('maps'), bagItems: field('bagItems'),
         potionTemplates: bridge.cache.potions, monsterTemplates: bridge.cache.monsterTemplates,
         lastMapId: bridge.cache.targets.mapId, aoeTargets: bridge.cache.targets.alive };
       const selected = P.scoreTargets(s, prefs, farmTargets(bridge.cache.targets, s.maps));
@@ -4221,7 +4249,7 @@
       }
     }
     class Bridge {
-      constructor(log) {
+      constructor(log, roleHint = 0) {
         this.noBatchSell = false;
         this.log = log;
         this.socket = null;
@@ -4249,11 +4277,27 @@
           this.cache.monsterTemplates = new Map(monsters.list);
           this.cache.monsterTemplatesAt = monsters.at;
         }
-        const saved = readStorage(PREFIX + ':targets', null);
+        this.loadTargets(roleHint);
+        this.onMessage = () => {};
+        this.onDisconnect = () => {};
+        this.installSocketHook();
+      }
+      syncTargetRole(role) {
+        if (role && this.targetRole !== role) this.loadTargets(role, !this.targetRole);
+      }
+      loadTargets(role, keepUnknown = false) {
+        // On first identification, the live cache already contains the legacy fallback.
+        const read = (name) => keepUnknown ? readStorage(taggedKey(name, role), undefined) : readTagged(name, role, null);
+        this.targetRole = role;
+        this.scoringHold = this.ringsHold = null;
         this.cache.profileTargets = Object.fromEntries(P.ASSAULT_IDS.map((id) => {
-          const alive = readStorage(PREFIX + ':alive:' + id, null) ?? undefined;
+          const stored = read('alive:' + id);
+          if (stored === undefined && this.cache.profileTargets?.[id]) return [id, this.cache.profileTargets[id]];
+          const alive = stored ?? undefined;
           return [id, { alive, aliveSaved: alive }];
         }));
+        const saved = read('targets');
+        if (saved === undefined && this.cache.targets) return;
         this.cache.targets = { mapId: null, list: new Map() };
         if (saved && Number.isFinite(saved.mapId) && Array.isArray(saved.list) &&
             saved.list.every((e) => Array.isArray(e) && e.length === 2 &&
@@ -4261,9 +4305,6 @@
               Number.isFinite(e[1]?.level) && e[1]?.base &&
               typeof e[1].base === 'object' && !Array.isArray(e[1].base)))
           this.cache.targets = { mapId: saved.mapId, list: new Map(saved.list.slice(-30)), alive: saved.alive };
-        this.onMessage = () => {};
-        this.onDisconnect = () => {};
-        this.installSocketHook();
       }
       requestError(waiter, code, message, receivedType = null) {
         const error = new Error(safeMessage(message));
@@ -4466,6 +4507,7 @@
           if (typeof packet.type !== 'string') return;
           this.lastMessage = Date.now();
           const type = packet.type;
+          if (type === 'COMBAT_STATE') this.syncTargetRole(P.num(this.character()?.role?.id));
           if (type === 'COMBAT_STATE' && (this.cache.rings?.rings?.run ||
               P.RINGS_MAP_IDS.includes(P.num(this.character()?.role?.mapId)))) {
             if (this.ringsCombat && packet.data?.stage !== 'running') this.invalidateRings();
@@ -4481,15 +4523,15 @@
             // Packets arrive about three times a second; store the mean only after a visible change.
             if (targets.aliveSaved === undefined || Math.abs(targets.alive - targets.aliveSaved) >= 0.25) {
               targets.aliveSaved = targets.alive;
-              if (assaultMap) writeStorage(PREFIX + ':alive:' + assaultMap, targets.alive);
-              else writeStorage(PREFIX + ':targets', { mapId: targets.mapId, list: Array.from(targets.list), alive: targets.alive });
+              if (assaultMap) writeStorage(taggedKey('alive:' + assaultMap, this.targetRole), targets.alive);
+              else writeStorage(taggedKey('targets', this.targetRole), { mapId: targets.mapId, list: Array.from(targets.list), alive: targets.alive });
             }
           }
           if (type === 'COMBAT_STATE' && Array.isArray(packet.data?.monsterSlots) &&
               mergeTargets(this.cache.targets, P.num(this.character()?.role?.mapId),
                 packet.data.monsterSlots, P.farmMap(P.array(this.character()?.maps).find(
                   (map) => P.num(map.id) === P.num(this.character()?.role?.mapId)))))
-            writeStorage(PREFIX + ':targets', { mapId: this.cache.targets.mapId,
+            writeStorage(taggedKey('targets', this.targetRole), { mapId: this.cache.targets.mapId,
               list: Array.from(this.cache.targets.list), alive: this.cache.targets.alive });
           if (
             type === 'LOGIN_FAILED' ||
@@ -5962,7 +6004,9 @@
     }
     function observeRole(controller, id) {
       if (!Number.isSafeInteger(id) || id <= 0) return;
+      const previous = controller.roleHint;
       controller.roleHint = id;
+      if (previous !== id) controller.loadRoleData?.(id, previous);
       try { sessionStorage.setItem(PREFIX + ':role', String(id)); } catch {}
       if (controller.prefs?.roleConfig === 'per-role' && controller.configRole !== id) loadRoleConfig(controller, id);
       if (!controller.provisionalResume) return;
@@ -5972,12 +6016,30 @@
       controller.enabled = enabled;
     }
     class Controller {
+      loadPauseAndReloads(role) {
+        const pause = readTagged('lastPause', role, null);
+        this.lastPause = Number.isFinite(pause?.at) && typeof pause.reason === 'string' &&
+          typeof pause.byUser === 'boolean' ? pause : null;
+        this.reloads = readTagged('reloads', role, []);
+      }
+      loadRoleData(role, previous) {
+        this.bridge?.syncTargetRole?.(role);
+        if (!this.logStore) return;
+        if (previous || this.provisionalResume) this.loadPauseAndReloads(role);
+        else writeStorage(taggedKey('lastPause', role), this.lastPause);
+        const visible = this.logs.filter((line) => visibleLog(line, role));
+        const cached = quickLogs(role, this.prefs.logs.keepDays, previous ? undefined : visible);
+        this.logs = mergedLogs(visible, cached);
+        if (this.prefs.storage.indexedDB && this.logStore.supported) this.logReady = this.syncLogStorage(cached);
+      }
       resetScoring() {
         this.stats?.resetPressure();
+        const tag = P.num(this.bridge.character?.()?.role?.id) || roleTag(this);
+        this.bridge.syncTargetRole?.(tag);
         this.bridge.scoringHold = null;
         this.bridge.ringsHold = null;
         this.bridge.cache.profileTargets = {};
-        for (const id of P.ASSAULT_IDS) writeStorage(PREFIX + ':alive:' + id, null);
+        for (const id of P.ASSAULT_IDS) writeStorage(taggedKey('alive:' + id, tag), null);
         const role = this.bridge.character?.()?.role?.id || this.bridge.cache.floorRole;
         if (role) {
           this.bridge.cache.towerFloors = [];
@@ -6003,16 +6065,14 @@
         this.provisionalResume = !this.roleHint;
         this.enabled = shouldResume(this.prefs, this.roleHint);
         this.reason = '等待游戏角色';
-        const logs = readStorage(PREFIX + ':log', []);
-        this.logs = P.logPrune(Array.isArray(logs) && logs.every((v) => v && ['time', 'level', 'text'].every((k) => typeof v[k] === 'string')) ? logs.slice(0, 60) : [], this.prefs.logs.keepDays);
+        this.logs = quickLogs(this.roleHint, this.prefs.logs.keepDays);
         this.logStore = logStore;
         this.logQueue = [];
         this.logBatches = new Set();
         this.logDatabaseUsage = P.logSummary([]);
         this.logWriteAt = Date.now();
         this.logEpoch = 0;
-        this.lastPause = readStorage(PREFIX + ':lastPause', null);
-        if (!Number.isFinite(this.lastPause?.at) || typeof this.lastPause.reason !== 'string' || typeof this.lastPause.byUser !== 'boolean') this.lastPause = null;
+        this.loadPauseAndReloads(this.roleHint);
         this.busy = false;
         this.action = null;
         this.arenaCloseUntil = 0;
@@ -6028,8 +6088,7 @@
         this.idleSince = 0;
         this.lastSettings = 0;
         this.manualUntil = 0;
-        this.reloads = readStorage(PREFIX + ':reloads', []);
-        this.bridge = new Bridge((text, level) => this.log(text, level));
+        this.bridge = new Bridge((text, level) => this.log(text, level), this.roleHint);
         this.bridge.scoringNow = now;
         this.bridge.onMessage = (type, packet) => this.received(type, packet);
         this.bridge.onTowerEnd = () => this.towerEnded();
@@ -6238,6 +6297,7 @@
       log(text, level = 'info') {
         const at = Date.now(), entry = {
           at,
+          role: roleTag(this),
           time: P.logTime(at),
           level,
           text: String(text).slice(0, 260),
@@ -6253,7 +6313,7 @@
         clearTimeout(this.logTimer);
         this.logTimer = null;
         this.logs = P.logPrune(this.logs, this.prefs.logs.keepDays);
-        writeStorage(PREFIX + ':log', this.logs.slice(0, 60));
+        writeStorage(taggedKey('log', roleTag(this)), this.logs.slice(0, 60));
         this.logWriteAt = Date.now();
         if (!this.logDatabaseOn || !this.prefs.storage.indexedDB || this.logClearing || !this.logQueue.length) return Promise.resolve();
         const batch = P.logPrune(this.logQueue, this.prefs.logs.keepDays);
@@ -6273,21 +6333,28 @@
         this.logQueue = [];
         this.paint();
       }
-      async syncLogStorage() {
-        const epoch = ++this.logEpoch;
+      async syncLogStorage(cached = this.logs) {
+        const epoch = ++this.logEpoch, role = roleTag(this);
         this.logDatabaseOn = false;
         this.logError = '';
-        this.logQueue = [];
-        if (!this.prefs.storage.indexedDB || !this.logStore.supported) return;
-        this.logQueue = this.logs.filter((entry) => !entry.databaseCleared).reverse();
+        if (!this.prefs.storage.indexedDB || !this.logStore.supported) {
+          this.logQueue = [];
+          return;
+        }
         try {
+          if (this.logClearing) {
+            await this.logClearing;
+            cached = this.logs;
+          }
           await this.logStore.open();
           if (epoch !== this.logEpoch || !this.prefs.storage.indexedDB) return;
           await this.logStore.prune(P.logCutoff(this.prefs.logs.keepDays, Date.now()));
-          const saved = await this.logStore.read(500), usage = await this.logStore.summary();
+          await Promise.all(Array.from(this.logBatches, (batch) => batch.write));
+          const saved = await this.logStore.read(500, role), usage = await this.logStore.summary();
           if (epoch !== this.logEpoch || !this.prefs.storage.indexedDB) return;
-          this.logQueue = P.logMissing(this.logQueue, saved);
-          this.logs = [...P.logMissing(this.logs, saved), ...saved].sort((a, b) => b.at - a.at).slice(0, 500);
+          const imported = cached.filter((entry) => !entry.databaseCleared).reverse();
+          this.logQueue = P.logMissing([...P.logMissing(imported, this.logQueue), ...this.logQueue], saved);
+          this.logs = mergedLogs(this.logs, saved);
           this.logDatabaseUsage = usage;
           this.logDatabaseOn = true;
           if (this.logQueue.length && !this.logTimer) this.logTimer = setTimeout(() => { this.logTimer = null; this.flushLogs(); }, Math.max(0, 5000 - (Date.now() - this.logWriteAt)));
@@ -6322,7 +6389,7 @@
       async pruneLogs() {
         this.logs = P.logPrune(this.logs, this.prefs.logs.keepDays);
         this.logQueue = P.logPrune(this.logQueue, this.prefs.logs.keepDays);
-        writeStorage(PREFIX + ':log', this.logs.slice(0, 60));
+        writeStorage(taggedKey('log', roleTag(this)), this.logs.slice(0, 60));
         if (this.logDatabaseOn && this.prefs.storage.indexedDB && !this.logClearing) {
           try {
             await this.logStore.prune(P.logCutoff(this.prefs.logs.keepDays, Date.now()));
@@ -6331,23 +6398,23 @@
         }
         this.paint();
       }
-      async clearLogDatabase() {
-        if (this.logClearing) return this.logClearing;
+      async clearLogDatabase(role = 0) {
+        while (this.logClearing) await this.logClearing;
         ++this.logEpoch;
-        this.logQueue = [];
+        this.logQueue = this.logQueue.filter((entry) => !visibleLog(entry, role));
         this.logClearing = (async () => {
           await this.logReady;
           await Promise.all(Array.from(this.logBatches, (batch) => batch.write));
           if (this.logStore.supported) {
             await this.logStore.open();
-            await this.logStore.clear();
+            await this.logStore.clear(role);
             this.logError = '';
             this.logDatabaseOn = this.prefs.storage.indexedDB;
           }
           // Cleared cache entries remain visible but are not imported into the database again.
-          this.logs = this.logs.map((entry) => this.logQueue.includes(entry) ? entry : { ...entry, databaseCleared: true });
-          writeStorage(PREFIX + ':log', this.logs.slice(0, 60));
-          this.logDatabaseUsage = P.logSummary([]);
+          this.logs = this.logs.map((entry) => !visibleLog(entry, role) || this.logQueue.includes(entry) ? entry : { ...entry, databaseCleared: true });
+          writeStorage(taggedKey('log', roleTag(this)), this.logs.slice(0, 60));
+          this.logDatabaseUsage = role && this.logStore.supported ? await this.logStore.summary() : P.logSummary([]);
           return this.logDatabaseUsage;
         })();
         try { return await this.logClearing; }
@@ -6360,15 +6427,17 @@
       }
       async clearLogs() {
         this.logs = [];
-        writeStorage(PREFIX + ':log', []);
+        writeStorage(taggedKey('log', roleTag(this)), []);
         this.paint();
-        return this.clearLogDatabase();
+        return this.clearLogDatabase(roleTag(this));
       }
       async exportLogs() {
         await this.logReady;
         if (!this.logDatabaseOn) return P.logText(this.logs);
         await Promise.all(Array.from(this.logBatches, (batch) => batch.write));
-        const pending = this.logQueue.slice().reverse(), entries = await this.logStore.read();
+        const role = roleTag(this), pending = this.logQueue.filter((entry) => visibleLog(entry, role)).reverse();
+        const entries = await this.logStore.read(Infinity, role);
+        if (role !== roleTag(this)) return this.exportLogs();
         return P.logText(P.logPrune([...pending, ...entries], this.prefs.logs.keepDays));
       }
       ledgerKey(date = day()) {
@@ -6519,7 +6588,6 @@
         if (this.ledger) writeStorage(this.ledgerKey(), this.ledger);
       }
       setRole(id) {
-        observeRole(this, id);
         this.ensureGearState(id);
         if (this.roleId !== id || this.ledger?.day !== day()) {
           if (this.roleId !== id) {
@@ -6537,6 +6605,7 @@
           this.suppressed.clear();
           this.bridge.cache.activityStatus = {};
         }
+        observeRole(this, id);
       }
       leaseKey() {
         return PREFIX + ':lease:' + this.roleId;
@@ -6573,7 +6642,7 @@
         this.timeoutPause = null;
         this.timeoutResume = null;
         this.lastPause = null;
-        writeStorage(PREFIX + ':lastPause', null);
+        writeStorage(taggedKey('lastPause', roleTag(this)), null);
         saveRunning(this, true);
         this.reason = '正在检查角色与策略';
         // Automatic recovery retains cooldowns so retries do not consume unkeyed late replies.
@@ -6604,7 +6673,7 @@
         this.timeoutPause = null;
         this.timeoutResume = null;
         this.lastPause = { at: Date.now(), reason, byUser };
-        writeStorage(PREFIX + ':lastPause', this.lastPause);
+        writeStorage(taggedKey('lastPause', roleTag(this)), this.lastPause);
         this.enabled = false;
         // Any pause is final for this page load: a later role discovery must not switch the autopilot on again.
         this.provisionalResume = false;
@@ -7719,7 +7788,7 @@
           return;
         }
         this.reloads.push(now);
-        writeStorage(PREFIX + ':reloads', this.reloads);
+        writeStorage(taggedKey('reloads', roleTag(this)), this.reloads);
         saveRunning(this, true);
         location.reload();
       }
@@ -8071,7 +8140,7 @@
     }
     const arraySafe = (v) => (Array.isArray(v) ? v : []);
     return {
-      WarehouseShortcuts, Filler, Stats, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
+      WarehouseShortcuts, Filler, Stats, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
     };
   })();
   if (typeof module !== 'undefined' && module.exports) module.exports.TLRuntime = TLRuntime;
