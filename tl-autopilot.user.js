@@ -328,26 +328,96 @@
       const scope = !transferObject(data.config) ? '' : data.config.roleConfig === 'per-role' ? '每个角色各存一份' : '所有角色共用一份';
       return scope || roles.length ? ['角色设置：' + [scope, roles.length ? '角色 ' + roles.join('、') : ''].filter(Boolean).join('，')] : [];
     }
+    const TRANSFER_KINDS = [
+      [/^stats:/, '统计', '个角色'], [/^mapRates:/, '智能选图测算', '个角色'],
+      [/^(?:targets(?:$|:)|alive:|monsters$)/, '评分数据', '项'],
+      [/^gear(?:Profile|Rejected|Check):/, '换装方案', '项'], [/^ledger:/, '每日额度记录', '项'],
+      [/^towerFloors:/, '爬塔记录', '项'], [/^potions$/, '药品数据', '项'],
+    ];
+    const transferKind = key => TRANSFER_KINDS.find(([pattern]) => pattern.test(key)) || [null, '其他数据', '项'];
+    const settingsKey = key => /^config(?::|$)/.test(key), logCacheKey = key => /^log(?::|$)/.test(key);
     function transferSummary(data, logs) {
-      const kinds = [
-        [/^stats:/, '统计', '个角色'], [/^mapRates:/, '智能选图测算', '个角色'],
-        [/^(?:targets(?:$|:)|alive:|monsters$)/, '评分数据', '项'],
-        [/^gear(?:Profile|Rejected|Check):/, '换装方案', '项'], [/^ledger:/, '每日额度记录', '项'],
-        [/^towerFloors:/, '爬塔记录', '项'], [/^potions$/, '药品数据', '项'],
-      ];
       const counts = new Map(), cached = [];
       for (const [key, value] of Object.entries(data)) {
         if (!transferKey(key) || key === 'config' || transferRoleKey(key)) continue;
-        if (/^log(?:$|:)/.test(key) && Array.isArray(value)) {
+        if (logCacheKey(key) && Array.isArray(value)) {
           for (const entry of value) if (transferObject(entry)) cached.push(entry);
           continue;
         }
-        const [, label, unit] = kinds.find(([pattern]) => pattern.test(key)) || [null, '其他数据', '项'];
+        const [, label, unit] = transferKind(key);
         counts.set(label, [(counts.get(label)?.[0] || 0) + 1, unit]);
       }
       if (logs.length || cached.length || Object.keys(data).some(key => /^log(?:$|:)/.test(key)))
         counts.set('日志', [logs.length + logMissing(cached, logs.filter(transferObject)).length, '条']);
       return [...transferRoles(data), ...Array.from(counts, ([label, [count, unit]]) => label + '：' + count + ' ' + unit)];
+    }
+    // Role a stored key belongs to, 0 for none: `<name>:<role>[:…]`, except `alive:<map>:<role>`.
+    function transferKeyRole(key) {
+      const match = /^alive:[^:]+:(\d+)$/.exec(key) || /^(?!alive:)[A-Za-z]+:(\d+)(?::|$)/.exec(key);
+      return match ? Number(match[1]) : 0;
+    }
+    // The settings a role uses in a storage snapshot, or null when the snapshot holds none.
+    function storedSettings(data, role) {
+      const global = transferObject(data.config) ? data.config : null;
+      const own = global?.roleConfig === 'per-role' && role ? data['config:' + role] : null;
+      return transferObject(own) ? config({ ...own, roleConfig: 'per-role' }) : global && config(global);
+    }
+    const sameJSON = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    // A full import merges into this browser's storage (`local`, keys without the prefix): nothing local is removed and
+    // what only the file holds comes in. Per role on both sides, differing settings and differing records are listed;
+    // each replaces the local copy only when chosen. Data of no role that differs stays local.
+    function transferMerge(local, file, current) {
+      const data = file.data, exporter = num(file.meta?.roleId);
+      const rolesOf = (source, extra) => new Set([...Object.keys(source).filter(transferKey).map(transferKeyRole), extra]
+        .filter(role => Number.isSafeInteger(role) && role > 0));
+      // The current role counts as local once this browser has saved settings.
+      const mine = rolesOf(local, transferObject(local.config) ? num(current) : 0), theirs = rolesOf(data, exporter);
+      // A file without stored settings still carries the exporting role's.
+      const fileSettings = role => storedSettings(data, role) || (role === exporter && transferObject(file.config) ? config(file.config) : null);
+      const differs = key => transferKey(key) && !settingsKey(key) && !logCacheKey(key) &&
+        local[key] !== undefined && !sameJSON(local[key], data[key]);
+      const roles = [...new Set([...mine, ...theirs])].sort((a, b) => a - b).map(role => {
+        const before = mine.has(role) ? storedSettings(local, role) : null, after = theirs.has(role) ? fileSettings(role) : null;
+        const settings = before && after ? configChanges(before, after) : [];
+        const records = Object.keys(data).filter(key => differs(key) && transferKeyRole(key) === role);
+        const status = !mine.has(role) ? 'new' : !theirs.has(role) ? 'local' : settings.length || records.length ? 'conflict' : 'same';
+        return { role, current: role === num(current), status, before, after, settings, records };
+      });
+      return { roles, kept: Object.keys(data).filter(key => differs(key) && !transferKeyRole(key)).length };
+    }
+    // The storage writes of a merge and the resulting role scope. Roles whose settings end up different need one copy
+    // each, so a browser with shared settings switches to per-role copies; its shared settings stay the default.
+    function transferMergeData(local, file, current, choices = {}) {
+      const { roles } = transferMerge(local, file, current);
+      const pick = new Set(array(choices.settings).map(Number)), take = new Set(array(choices.records).map(Number));
+      const out = Object.create(null);
+      for (const [key, value] of Object.entries(file.data)) {
+        if (!transferKey(key) || settingsKey(key)) continue;
+        const mine = local[key], role = transferKeyRole(key);
+        if (logCacheKey(key) && Array.isArray(value) && Array.isArray(mine)) {
+          const missing = logMissing(value.filter(transferObject), mine.filter(transferObject));
+          if (missing.length) out[key] = [...missing, ...mine].sort((a, b) => num(b?.at) - num(a?.at)).slice(0, 60);
+        } else if (mine === undefined || role && take.has(role) && !sameJSON(mine, value)) out[key] = value;
+      }
+      const finals = new Map();
+      for (const { role, status, before, after } of roles) {
+        const chosen = status === 'new' || status !== 'local' && pick.has(role) ? after || before : before || after;
+        if (chosen) finals.set(role, chosen);
+      }
+      const localGlobal = transferObject(local.config) ? local.config : null;
+      const base = config(localGlobal || (transferObject(file.data.config) ? file.data.config : file.config));
+      const list = [...finals.values()];
+      const perRole = base.roleConfig === 'per-role' || list.some(prefs => configChanges(list[0], prefs).length);
+      if (!perRole) out.config = { ...(list[0] || base), roleConfig: 'shared' };
+      else {
+        out.config = { ...base, roleConfig: 'per-role' };
+        for (const [role, prefs] of finals) {
+          const { roleConfig, ...values } = prefs;
+          out['config:' + role] = values;
+        }
+      }
+      const scope = { before: localGlobal?.roleConfig === 'per-role' ? 'per-role' : 'shared', after: perRole ? 'per-role' : 'shared' };
+      return { data: out, scope };
     }
     function config(value) {
       if (value?.budget && Object.hasOwn(value.budget, 'expPerDay')) {
@@ -3760,6 +3830,7 @@
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
       viewedState, isViewedProfile, profileState, profileScoreText, profileScoreValue, tooltipContext,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
+      transferKind, transferKeyRole, transferMerge, transferMergeData,
       CRIT_BASE, CRIT_RATE, CRIT_FLOOR, CRIT_DEF_OFFSET, CRIT_DEF_RATE, CRIT_DEF_DIVISOR, critMultiplier,
       CRIT_CHANCE_CAP, CRIT_MULT_CAP, critChance,
       MAIN_SOFTCAP, ELEMENT_RATE, hitDamage, setEffects, combatContext, combatParts, combatValue, combatWeights, gearWeights, statScore,
@@ -3899,9 +3970,8 @@
     };
     let storageBlocked = false, restoringData = false;
     const writeStorage = (key, value) => {
-      // While a full import runs, in-memory data must not overwrite the imported keys; settings are written by the
-      // import itself.
-      if (storageBlocked || restoringData && P.transferKey(key.slice(PREFIX.length + 1)) && !key.startsWith(CONFIG)) return;
+      // While a full import runs, in-memory data and settings must not overwrite the merged keys.
+      if (storageBlocked || restoringData && P.transferKey(key.slice(PREFIX.length + 1))) return;
       try {
         localStorage.setItem(key, JSON.stringify(value));
       } catch {}
@@ -3947,11 +4017,11 @@
       target[group][field] = value;
       saveConfig(target, id);
     }
-    function clearRoleConfigs(keep = () => false) {
+    function clearRoleConfigs() {
       if (storageBlocked) return;
       for (let index = localStorage.length - 1; index >= 0; index--) {
         const key = localStorage.key(index);
-        if (key?.startsWith(CONFIG + ':') && /^\d+$/.test(key.slice(CONFIG.length + 1)) && !keep(key.slice(PREFIX.length + 1)))
+        if (key?.startsWith(CONFIG + ':') && /^\d+$/.test(key.slice(CONFIG.length + 1)))
           localStorage.removeItem(key);
       }
     }
@@ -6845,6 +6915,11 @@
         await Promise.all(Array.from(this.logBatches, batch => batch.write));
         const queued = this.logQueue.slice().reverse();
         const logs = this.logDatabaseOn ? P.logPrune([...queued, ...await this.logStore.read()], this.prefs.logs.keepDays) : [];
+        return { format: 'tl-autopilot-full', formatVersion: 1, script: this.status().version,
+          exportedAt: Date.now(), host: location.host, roleId: roleTag(this), config, data: this.storageSnapshot(), logs };
+      }
+      // The stored keys a full export carries, without the prefix.
+      storageSnapshot() {
         const data = Object.create(null), prefix = PREFIX + ':';
         for (let index = 0; index < localStorage.length; index++) {
           const key = localStorage.key(index);
@@ -6852,8 +6927,7 @@
           const value = readStorage(key, undefined);
           if (value !== undefined) data[key.slice(prefix.length)] = value;
         }
-        return { format: 'tl-autopilot-full', formatVersion: 1, script: this.status().version,
-          exportedAt: Date.now(), host: location.host, roleId: roleTag(this), config, data, logs };
+        return data;
       }
       async mergeTransferLogs(logs) {
         await this.logReady;
@@ -6865,17 +6939,14 @@
           if (missing.length) await this.logStore.append(missing);
         }
       }
-      async importData(data, logs, saveSettings) {
+      // Writes the keys of a merged full import (P.transferMergeData), adds missing logs and reloads.
+      async importData(data, logs) {
         if (storageBlocked || restoringData) throw new Error('全量配置已在导入');
         restoringData = true;
         try {
           for (const [key, value] of Object.entries(data)) {
             if (P.transferKey(key)) localStorage.setItem(PREFIX + ':' + key, JSON.stringify(value));
           }
-          // The file's settings keys replace the settings of every role; a file without them (none was ever saved
-          // there) gives its settings to the current role only.
-          if (Object.hasOwn(data, 'config')) clearRoleConfigs((key) => Object.hasOwn(data, key));
-          else saveSettings?.();
           await this.mergeTransferLogs(logs);
           this.log('已导入全量配置');
           await this.flushLogs();
@@ -9000,6 +9071,8 @@
 .update-dialog{width:min(480px,100%);max-height:100%;overflow:auto;overscroll-behavior:contain;overflow-wrap:anywhere;padding:20px;border:1px solid var(--stroke);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}
 .update-dialog h2{margin:0 0 12px;color:var(--text-strong)}
 .transfer-changes{max-height:38vh;overflow:auto;overscroll-behavior:contain}
+.transfer-role{margin-top:8px;padding:8px;border:1px solid var(--stroke-strong);border-radius:8px}.transfer-role h4{margin:0 0 4px}
+.transfer-choice{display:flex;gap:8px;align-items:center;margin:4px 0;cursor:pointer}.transfer-scope{margin-top:8px}
 ::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:var(--stroke);border-radius:4px}::-webkit-scrollbar-track{background:transparent}
 @supports not selector(::-webkit-scrollbar){*{scrollbar-width:thin;scrollbar-color:var(--stroke) transparent}}
 button,input,select,textarea{font:inherit;color:inherit}button,summary{cursor:pointer}
@@ -10077,21 +10150,60 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         if (!this.index || this.indexPending !== this.pending || this.indexRole !== status.role?.id)
           this.buildIndex(status, this.controller.bridge.state());
         const role = status.role?.id ?? this.controller.roleId ?? this.controller.roleHint ?? 0;
-        file.config = TLPolicy.transferSettings(file, role, prefs.roleConfig);
         this.transferError('');
         this.hideUpdateDialog();
         this.transfer = file;
-        const changes = TLPolicy.configChanges(prefs, file.config);
-        if (file.config.roleConfig !== prefs.roleConfig)
-          changes.unshift({ path: 'roleConfig', before: prefs.roleConfig, after: file.config.roleConfig });
+        file.role = role;
+        let changes;
+        if (file.kind === 'full') file.local = this.controller.storageSnapshot();
+        else {
+          file.config = TLPolicy.transferSettings(file, role, prefs.roleConfig);
+          changes = TLPolicy.configChanges(prefs, file.config).map(change => this.transferRow(change));
+        }
         const title = file.kind === 'reset' ? '重置配置' : file.kind === 'full' ? '导入全量配置' : '导入配置文件';
-        const rows = changes.map(change => this.transferRow(change));
-        const body = this.transferDetails(file, modified, status.role?.id) +
-          '<h3>设置改动 ' + rows.length + ' 项</h3><div class="transfer-changes">' + (rows.join('') || '设置没有变化') + '</div>' +
+        const body = this.transferDetails(file, modified, status.role?.id) + (changes ?
+          '<h3>设置改动 ' + changes.length + ' 项</h3><div class="transfer-changes">' + (changes.join('') || '设置没有变化') + '</div>' :
+          this.mergeHTML(TLPolicy.transferMerge(file.local, file, role))) +
           (this.dirty ? this.infoBar('面板上未保存的修改会被丢弃', 'warn') : '');
         const html = this.dialogHTML(title, body, ['取消', file.kind === 'reset' ? '重置' : '保存'], 1);
         const close = () => { if (!this.transferSaving) this.hideUpdateDialog(); };
         this.showDialog(html, close, index => index ? this.saveTransfer(file) : close());
+        if (file.kind !== 'full') return;
+        this.paintScope(file);
+        this.updateBackdrop.addEventListener('input', () => this.paintScope(file));
+      }
+      mergeHTML(plan) {
+        const name = entry => '角色 ' + entry.role + (entry.current ? '（当前角色）' : '');
+        const group = (status, text) => {
+          const list = plan.roles.filter(entry => entry.status === status).map(name);
+          return list.length ? '<div>' + esc(text + list.join('、')) + '</div>' : '';
+        };
+        const kinds = keys => [...new Set(keys.map(key => TLPolicy.transferKind(key)[1]))].join('、');
+        const choice = (kind, role, text) => '<label class="transfer-choice"><input type="checkbox" data-overwrite="' + kind +
+          '" value="' + role + '"> ' + esc(text) + '</label>';
+        const conflicts = plan.roles.filter(entry => entry.status === 'conflict').map(entry =>
+          '<div class="transfer-role"><h4>' + esc(name(entry)) + '</h4>' +
+          (entry.settings.length ? choice('settings', entry.role, '设置用文件里的（' + entry.settings.length + ' 项不同，本机 → 文件）') +
+            '<div class="transfer-changes">' + entry.settings.map(change => this.transferRow(change)).join('') + '</div>' : '') +
+          (entry.records.length ? choice('records', entry.role, '记录用文件里的（' + kinds(entry.records) + '，' + entry.records.length + ' 项不同）') : '') +
+          '</div>').join('');
+        return '<h3>合并到本机</h3>' + group('new', '文件新增，直接加入：') + group('local', '只在本机，保留：') + group('same', '两边都有，没有冲突：') +
+          (plan.kept ? '<div>' + esc('其他数据 ' + plan.kept + ' 项两边不同，保留本机') + '</div>' : '') +
+          (conflicts ? '<h3>两边不同：勾选的用文件里的，其余保留本机</h3>' + conflicts : '') +
+          '<div class="transfer-scope" hidden></div>';
+      }
+      transferChoices() {
+        const picked = kind => [...(this.updateBackdrop?.querySelectorAll('input[data-overwrite="' + kind + '"]') || [])]
+          .filter(input => input.checked).map(input => Number(input.value));
+        return { settings: picked('settings'), records: picked('records') };
+      }
+      paintScope(file) {
+        const line = this.updateBackdrop?.querySelector('.transfer-scope');
+        if (!line) return;
+        const { scope } = TLPolicy.transferMergeData(file.local, file, file.role, this.transferChoices());
+        const changed = scope.before !== scope.after;
+        line.hidden = !changed;
+        line.textContent = changed ? '配置保存方式：所有角色共用一份 → 每个角色各存一份（合并后各角色的设置不同，原来共用的设置作为默认）' : '';
       }
       transferDetails(file, modified, role) {
         if (file.kind === 'reset') return '';
@@ -10103,7 +10215,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           lines.push('导出时间：' + date(exportedAt), '导出版本 v' + (script ?? '—'), '站点：' + (host ?? '—'),
             '角色 ' + (roleId ?? '—') + (roleId != null && other ? '（不是当前角色）' : ''),
             ...TLPolicy.transferSummary(file.data, file.logs),
-            (Object.hasOwn(file.data, 'config') ? '本站所有角色的设置换成文件里的，' : '') + '本机同名数据会被覆盖，导入后页面会刷新');
+            '合并导入：本机已有的角色设置和记录都保留，文件里多出的直接加入，日志只补缺的；导入后页面会刷新');
         }
         return lines.map(line => '<div>' + esc(line) + '</div>').join('');
       }
@@ -10124,14 +10236,15 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         if (this.transferSaving || this.transfer !== file) return;
         this.transferSaving = true;
         try {
-          const config = { ...file.config, roleConfig: this.controller.prefs.roleConfig };
-          const saveSettings = () => {
+          if (file.kind === 'full') {
+            // Merged against storage as it is now; the choices made in the dialog apply.
+            const { data } = TLPolicy.transferMergeData(this.controller.storageSnapshot(), file, file.role, this.transferChoices());
+            this.dirty = false;
+            await this.controller.importData(data, file.logs);
+          } else {
+            const config = { ...file.config, roleConfig: this.controller.prefs.roleConfig };
             this.pending = TLPolicy.clone(this.controller.updateConfig(config, { preserveData: file.kind !== 'config' }));
             this.dirty = false;
-          };
-          if (file.kind === 'full') await this.controller.importData(file.data, file.logs, saveSettings);
-          else {
-            saveSettings();
             this.controller.log(file.kind === 'reset' ? '配置已重置为默认' : '已导入配置文件');
           }
           this.hideUpdateDialog();
@@ -10725,7 +10838,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         backdrop.querySelector('button').focus();
       }
       bindUpdateDialog(backdrop, close, choose) {
-        const buttons = [...backdrop.querySelectorAll('button')];
+        const buttons = [...backdrop.querySelectorAll('button')], focusable = [...backdrop.querySelectorAll('input, button')];
         backdrop.addEventListener('click', event => {
           event.stopPropagation();
           const button = event.target.closest('button');
@@ -10737,8 +10850,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           if (event.key !== 'Escape' && event.key !== 'Tab') return;
           event.preventDefault();
           if (event.key === 'Escape') return close();
-          const next = buttons.indexOf(event.target) + (event.shiftKey ? -1 : 1);
-          buttons[(next + buttons.length) % buttons.length].focus();
+          const next = focusable.indexOf(event.target) + (event.shiftKey ? -1 : 1);
+          focusable[(next + focusable.length) % focusable.length].focus();
         });
         backdrop.addEventListener('mousedown', event => {
           event.stopPropagation();
