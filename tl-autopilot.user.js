@@ -430,6 +430,15 @@
       const quality = stats(e?.appraisalStats);
       return num(quality.extScore) > 1500 && num(quality.intScore) > 1500;
     }
+    // Never offered for smelting: an artifact weapon (listed in the game's artifact skills, or red quality),
+    // a set weapon, and a crafted weapon (made by a player, or by the autopilot itself).
+    function smeltProtected(e, s, ledger) {
+      const id = num(e?.tmplId || template(e).id);
+      if (array(s?.artifactSkills).some((a) => num(a.weaponId) === id) || equipQuality(e) >= 5) return '神器';
+      if (setTemplateIds(s || {}).has(id)) return '套装武器';
+      if (e?.crafterName || num(e?.creatorId) > 0 || array(ledger?.keptEquipIds).includes(num(e?.id))) return '打造武器';
+      return '';
+    }
     function warehouseEligible(e, p, setIds) {
       return (
         !e.isEquipped && !e.hiddenWeapon && num(e.equipTmpl?.slotType) !== 12 && e.equipTmpl &&
@@ -1111,8 +1120,11 @@
         (!checkLevel || num(t.reqLevel) <= num(s.role?.level))
       );
     }
+    // The game files workshop items under template type 2 (道具: enhancement essence, repair talisman, bear token)
+    // or 3 / 4 (材料); every caller also filters by item id or by what the item supports.
+    const MATERIAL_TYPES = [2, 3, 4];
     const materialUsable = (s, bag, quantity = 1) =>
-      bagUsable(s, bag, quantity) && num(bag.itemTmpl.type, 3) === 3;
+      bagUsable(s, bag, quantity) && MATERIAL_TYPES.includes(num(bag.itemTmpl.type, 3));
     const charmUsable = (s, bag) => bagUsable(s, bag) && [2, 3].includes(num(bag.itemTmpl.type, 3));
     const materialBag = (s, id) =>
       array(s.bagItems).find((b) => materialId(b) === num(id) && materialUsable(s, b));
@@ -1215,7 +1227,7 @@
             ({ bag, range }) =>
               bagUsable(s, bag) &&
               num(bag.itemTmpl?.functionType) === 2 &&
-              num(bag.itemTmpl.type, 3) === 3 &&
+              MATERIAL_TYPES.includes(num(bag.itemTmpl.type, 3)) &&
               range &&
               level >= range.min &&
               level <= range.max,
@@ -1315,7 +1327,7 @@
           if (!holes.includes(-1)) return fail('装备已经没有可打孔的位置');
           return bagUsable(s, bag) &&
             num(bag.itemTmpl.functionType) === 2 &&
-            num(bag.itemTmpl.type, 3) === 3 &&
+            MATERIAL_TYPES.includes(num(bag.itemTmpl.type, 3)) &&
             range &&
             level >= range.min &&
             level <= range.max
@@ -1407,10 +1419,12 @@
           num(template(eq).reqLevel) >= 50 &&
           eq.isAppraisal &&
           doublePerfect(eq) &&
+          !smeltProtected(eq, s) &&
           (!eq.isEquipped || prefs.smithy.allowSmeltEquipped) &&
           !num(s.role.smeltingItemId)
           ? ok
-          : fail('冶炼武器资质、等级、穿戴保护或冶炼状态不符合条件');
+          : fail(eq && smeltProtected(eq, s) ? smeltProtected(eq, s) + '不用于冶炼'
+            : '冶炼武器资质、等级、穿戴保护或冶炼状态不符合条件');
       }
       if (a.type === 'SMITHY_SMELT_INVEST' || a.type === 'SMITHY_SMELT_COMPLETE') {
         const remaining = num(s.role.smeltingTargetExp) - num(s.role.smeltingExp),
@@ -3211,7 +3225,8 @@
                   num(template(e).slotType) === 1 &&
                   num(template(e).reqLevel) >= 50 &&
                   e.isAppraisal &&
-                  doublePerfect(e),
+                  doublePerfect(e) &&
+                  !smeltProtected(e, s, ledger),
               );
             if (eq)
               add(
@@ -3492,7 +3507,7 @@
       }
       if (mode === 'SMITHY_APPRAISAL') return result([eqs.filter((e) => [1, 12].includes(num(template(e).slotType)) && num(template(e).reqLevel) >= 50 && !e.isAppraisal).sort((a, b) => Number(!!b.isEquipped) - Number(!!a.isEquipped))[0]], '没有未鉴定的50级以上武器');
       if (mode === 'SMITHY_REINFORCE') return result([equipped.filter((e) => num(e.enhanceLevel) < 9 && (num(template(e).reqLevel) < 40 ? find(5050) : find(5051, 5079))).sort((a, b) => num(a.enhanceLevel) - num(b.enhanceLevel))[0]]);
-      if (mode === 'SMITHY_SMELT') return result([eqs.filter((e) => !e.isEquipped && num(template(e).slotType) === 1 && num(template(e).reqLevel) >= 50 && doublePerfect(e)).sort((a, b) => num(template(a).reqLevel) - num(template(b).reqLevel))[0]], '没有可冶炼的完美资质武器（已穿戴的不会自动放入）');
+      if (mode === 'SMITHY_SMELT') return result([eqs.filter((e) => !e.isEquipped && num(template(e).slotType) === 1 && num(template(e).reqLevel) >= 50 && doublePerfect(e) && !smeltProtected(e, s)).sort((a, b) => num(template(a).reqLevel) - num(template(b).reqLevel))[0]], '没有可冶炼的完美资质武器（已穿戴的不会自动放入）');
       if (mode === 'SMITHY_REPAIR') {
         const complete = (b) => num(stats(b.extraData).repairs) >= 5;
         const section = bags.filter((b) => id(b) >= 5032 && id(b) <= 5037 && (complete(b) || find(id(b) + 6))).sort((a, b) => id(b) - id(a))[0];
@@ -3572,7 +3587,7 @@
       stats,
       slots,
       lookup,
-      template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder,
+      template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
       viewedState, isViewedProfile, profileState, profileScoreText, tooltipContext,
@@ -8172,6 +8187,19 @@
       PAGE = 'https://github.com/YatsukiRenka/tl-idle-helper/releases',
       API = 'https://api.github.com/repos/YatsukiRenka/tl-idle-helper/releases/latest',
       INSTALL = 'https://raw.githubusercontent.com/YatsukiRenka/tl-idle-helper/main/tl-autopilot.user.js';
+    // The script's number on Greasy Fork; 0 until it is listed there.
+    const GREASYFORK_ID = 0;
+    const greasyForkPage = (id) => id ? 'https://greasyfork.org/zh-CN/scripts/' + id : '';
+    // Where this copy was installed from, as the userscript manager reports it. A copy from Greasy Fork carries
+    // Greasy Fork's own update address; any other copy counts as installed from GitHub.
+    function installSource(info = typeof GM_info === 'undefined' ? null : GM_info) {
+      const script = info?.script || {};
+      const urls = [script.downloadURL, script.updateURL].filter((u) => typeof u === 'string' && /^https:\/\/\S+$/.test(u))
+        .map((u) => u.replace(/\.meta\.js(?=$|\?)/, '.user.js'));
+      const url = urls.find((u) => /\.user\.js(?:$|\?)/.test(u)) || '';
+      const id = Number((url.match(/^https:\/\/(?:update\.)?greasyfork\.org\/(?:[\w-]+\/)?scripts\/(\d+)/) || [])[1]) || 0;
+      return { url, greasyFork: id > 0, greasyForkId: id };
+    }
     const valid = (v) => typeof v === 'string' && /^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(v);
     function compare(left, right) {
       if (!valid(left) || !valid(right)) throw new Error('版本格式无法识别');
@@ -8211,8 +8239,11 @@
           (cache.applyTries < 5 && now - cache.applyAt >= 6 * 60 * 60 * 1000));
     }
     class Checker {
-      constructor(controller) {
+      constructor(controller, source = installSource()) {
         this.controller = controller;
+        this.source = source;
+        // Greasy Fork allows a script one update check a day; a copy from GitHub checks hourly.
+        this.interval = source.greasyFork ? 24 * HOUR : HOUR;
         this.currentVersion = '1.2.0';
         this.busy = false;
         this.onChange = () => {};
@@ -8228,7 +8259,8 @@
           currentVersion: this.currentVersion,
           latestVersion: cache.version || null,
           checkedAt: cache.checkedAt || null,
-          nextCheckAt: cache.checkedAt ? cache.checkedAt + HOUR : null,
+          nextCheckAt: cache.checkedAt ? cache.checkedAt + this.interval : null,
+          daily: this.source.greasyFork,
           newer: order > 0,
           important,
           dialog: order >= 0 && important && cache.dialogVersion !== cache.version && cache.dismissedVersion !== cache.version,
@@ -8236,7 +8268,8 @@
           error: cache.error || this.localError,
           dismissed: cache.dismissedVersion === cache.version,
           page: PAGE,
-          installUrl: INSTALL,
+          greasyForkPage: greasyForkPage(this.source.greasyForkId || GREASYFORK_ID),
+          installUrl: this.source.url || INSTALL,
           apply: {
             tries: cache.applyVersion === cache.version ? cache.applyTries || 0 : 0,
             lastAt: cache.applyVersion === cache.version ? cache.applyAt || null : null,
@@ -8250,7 +8283,8 @@
         this.timer = setInterval(() => {
           if (this.controller.prefs.updates.checkDaily) this.check().catch(() => {});
         }, 5 * 60 * 1000);
-        if (this.controller.prefs.updates.checkDaily) this.check(true).catch(() => {});
+        // The check at page load is skipped for a copy from Greasy Fork: it would exceed one check a day.
+        if (this.controller.prefs.updates.checkDaily) this.check(!this.source.greasyFork).catch(() => {});
       }
       stop() {
         clearInterval(this.timer);
@@ -8278,7 +8312,7 @@
       }
       async check(force) {
         const prior = TLRuntime.readStorage(KEY, {});
-        if (prior.checkedAt && Date.now() - prior.checkedAt < (force === true ? 60000 : HOUR)) return this.status();
+        if (prior.checkedAt && Date.now() - prior.checkedAt < (force === true ? 60000 : this.interval)) return this.status();
         if (this.busy) return this.status();
         if (!navigator.locks?.request) {
           TLRuntime.writeStorage(KEY, {
@@ -8292,7 +8326,7 @@
         await navigator.locks.request(KEY, { ifAvailable: true }, async (lock) => {
           if (!lock) return;
           const cache = TLRuntime.readStorage(KEY, {});
-          if (cache.checkedAt && Date.now() - cache.checkedAt < (force === true ? 60000 : HOUR)) return;
+          if (cache.checkedAt && Date.now() - cache.checkedAt < (force === true ? 60000 : this.interval)) return;
           this.busy = true;
           const next = { checkedAt: Date.now(), error: '' };
           TLRuntime.writeStorage(KEY, { ...cache, ...next });
@@ -8335,7 +8369,7 @@
         return this.status();
       }
     }
-    return { Checker, compare, parseNotes, importantItems, noteItem, shouldApply, IMPORTANT, HOUR, KEY, PAGE };
+    return { Checker, compare, parseNotes, importantItems, noteItem, shouldApply, installSource, greasyForkPage, IMPORTANT, HOUR, KEY, PAGE, INSTALL, GREASYFORK_ID };
   })();
 
   ('use strict');
@@ -8396,6 +8430,7 @@
       install: "在油猴管理面板打开本脚本的设置，启用“检查更新”。新版本由 Tampermonkey 自动安装；本页的开关控制版本检查和提醒。新版安装后需刷新游戏。",
       intro: "人物升级按目标等级与保留经验执行；技能升级和冶炼各自使用每日额度。",
       updates: "自动检查：打开或刷新页面时一次，之后每小时一次；手动检查间隔至少 60 秒。",
+      updatesDaily: "自动检查：每天一次；手动检查间隔至少 60 秒。",
     };
     const CSS = `:host([data-theme="dark"]){--bg:#202020;--surface:#2b2b2b;--surface-alt:#1c1c1c;--control:#2f2f2f;--stroke:#3d3d3d;--stroke-strong:#9d9d9d;--divider:#353535;--text:#ffffff;--text-strong:#ffffff;--text-2:#c8c8c8;--text-3:#9a9a9a;--accent:#e2bd6b;--accent-hover:#edcd85;--on-accent:#2b2100;--accent-text:#e9c97e;--accent-soft:rgba(226,189,107,.14);--ok:#6ccb5f;--warn:#ffb454;--err:#ff99a4;--hover:rgba(255,255,255,.06);--pressed:rgba(255,255,255,.035);--shadow:0 16px 40px rgba(0,0,0,.42);color-scheme:dark}
 .hud.compact,:host([data-theme="light"]){--bg:#f3f3f3;--surface:#ffffff;--surface-alt:#ebebeb;--control:#ffffff;--stroke:#d6d6d6;--stroke-strong:#868686;--divider:#e6e6e6;--text:#1a1a1a;--text-strong:#000000;--text-2:#5a5a5a;--text-3:#767676;--accent:#c99a1c;--accent-hover:#b98a12;--on-accent:#1f1700;--accent-text:#7d5800;--accent-soft:rgba(201,154,28,.16);--ok:#0f7b0f;--warn:#9a5b00;--err:#c42b1c;--hover:rgba(0,0,0,.045);--pressed:rgba(0,0,0,.025);--shadow:0 16px 40px rgba(0,0,0,.16);color-scheme:light}
@@ -8969,6 +9004,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
               .catch(() => {});
           else if (action === 'openUpdate')
             window.open(this.controller.updates.status().page, '_blank', 'noopener,noreferrer');
+          else if (action === 'openGreasyFork')
+            window.open(this.controller.updates.status().greasyForkPage, '_blank', 'noopener,noreferrer');
           else if (action === 'installUpdate')
             window.open(this.controller.updates.status().installUrl, '_blank', 'noopener,noreferrer');
           else if (action === 'dismissUpdate') {
@@ -9821,7 +9858,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           this.updateKey = JSON.stringify(u);
           html =
             g('版本与更新',
-            f('开启自动更新', 'updates.checkDaily', { help: HELP.updates }) +
+            f('开启自动更新', 'updates.checkDaily', { help: u.daily ? HELP.updatesDaily : HELP.updates }) +
             f('发现新版本时提醒', 'updates.remind') +
             f('新版本自动刷新启用', 'updates.autoApply'), true) +
             this.updateHTML(u);
@@ -10071,7 +10108,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           (u.newer && u.apply?.exhausted ? this.infoBar('已自动刷新 5 次仍是旧版本，请点“安装新版本”。', 'warn') : '') +
           (u.notes ? this.sectionHTML(u.notes.title, this.releaseNotesHTML(u.notes),
             false, { id: 'release-notes' }) : u.newer ? this.infoBar('更新内容暂未读取，可在发布页查看。') : '') +
-          '<div class="actions"><button type="button" class="btn" data-action="checkUpdate">检查更新</button><button type="button" class="btn primary" data-action="openUpdate">打开发布页</button>' +
+          '<div class="actions"><button type="button" class="btn" data-action="checkUpdate">检查更新</button><button type="button" class="btn' + (u.daily ? '' : ' primary') + '" data-action="openUpdate">GitHub 发布页</button>' +
+          (u.greasyForkPage ? '<button type="button" class="btn' + (u.daily ? ' primary' : '') + '" data-action="openGreasyFork">Greasy Fork 页面</button>' : '') +
           (u.newer ? '<button type="button" class="btn" data-action="installUpdate">安装新版本</button><button type="button" class="btn" data-action="dismissUpdate">关闭本版提醒</button>' : '') +
           '</div>' + this.sectionHTML('自动安装', '', false, { help: HELP.install }) + '</div>';
       }
