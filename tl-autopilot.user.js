@@ -722,8 +722,9 @@
       const weapon = items.find((e) => num(template(e).slotType) === 1);
       return num(weapon?.tmplId || template(weapon).id);
     }
-    const SLOT_NAMES = ['', '武器', '衣服', '帽子', '护腕', '鞋子', '项链', '戒指', '护符', '腰带', '护肩', '手套', '暗器'];
-    const SLOT_SHORT = ['', ...'武衣帽腕鞋链戒符带肩手暗'];
+    // Slot 13 is fashion (时装, client of 2026-11-19); the bag's equipment tab lists unworn fashion too.
+    const SLOT_NAMES = ['', '武器', '衣服', '帽子', '护腕', '鞋子', '项链', '戒指', '护符', '腰带', '护肩', '手套', '暗器', '时装'];
+    const SLOT_SHORT = ['', ...'武衣帽腕鞋链戒符带肩手暗时'];
     const equipmentTemplateId = eq => num(eq.tmplId || template(eq).id);
     const knownTemplate = (state, id) => state.allEquipTemplates?.get?.(num(id)) || lookup(state.allEquipTemplates, id);
     function setRules(set, state, candidates = []) {
