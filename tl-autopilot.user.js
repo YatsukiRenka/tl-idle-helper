@@ -171,7 +171,7 @@
       },
       market: { sort: 'off', showScore: true, bagScore: true, tipScore: true, tipBound: true,
         bagFilter: true, setTag: true, tipSet: true, scoreType: 'combat', bagScoreType: 'combat', hideUnbuyable: false },
-      convenience: { sortDeposit: true, ctrlDeposit: true, depositKeys: 'ctrl', sellWarehouse: false, sellKeys: 'alt' },
+      convenience: { sortDeposit: true, ctrlDeposit: true, depositKeys: 'ctrl', sellWarehouse: false, sellKeys: 'alt', petLevelButton: true },
       sell: {
         enabled: true,
         maxQuality: 1,
@@ -1183,6 +1183,60 @@
     }
     const SCORE_ATTRIBUTES = Object.entries({ hp: '气血', extAtk: '外攻', intAtk: '内攻', extDef: '外防', intDef: '内防', critRate: '会心', critDef: '会防', avoidance: '闪避', precision: '命中', iceAtk: '冰攻', fireAtk: '火攻', poisonAtk: '毒攻', holyAtk: '玄攻', iceDef: '冰抗', fireDef: '火抗', poisonDef: '毒抗', holyDef: '玄抗' });
     const SET_EFFECT_NAMES = new Map([...SCORE_ATTRIBUTES, ['allAtk', '全属性攻击'], ['allDef', '全属性抗性']]);
+    const PET_LEVEL_HELP = '珍兽窗口“喂到上限”右边多一个按钮：一级一级喂，直到 30 级（不超过人物等级），消耗人物经验。点一次后再点“确认”才开始，进行中可点“停止”。';
+    const YANHOU_IDS = new Set([10401002, 10403002, 10404002, 10405001, 10410001, 10420004, 10422013, 10423021]);
+    const YANHOU_AFFIXES = {
+      hp: [750, 1500], mp: [500, 850], extAtk: [110, 220], intAtk: [110, 220], extDef: [90, 180], intDef: [90, 180],
+      precision: [110, 220], avoidance: [110, 220], critRate: [4, 8], critDef: [4, 8],
+      iceAtk: [30, 60], fireAtk: [30, 60], poisonAtk: [30, 60], holyAtk: [30, 60],
+      iceDef: [6, 12], fireDef: [6, 12], poisonDef: [6, 12], holyDef: [6, 12],
+    };
+    const affixNames = new Map([...SCORE_ATTRIBUTES, ['mp', '真气']]);
+    function artifactAdvice(state, prefs) {
+      return withScoringPass(state, () => {
+        const ctx = combatContext(state, prefs);
+        if (!ctx || !combatWeights(state, prefs)) return null;
+        const baseline = combatValue({ ...ctx.me, weaponId: 0 }, ctx);
+        const rows = [];
+        for (const skill of array(state.artifactSkills)) {
+          const id = num(skill.weaponId), tmpl = lookup(state.allEquipTemplates, id);
+          if (num(tmpl?.slotType) !== 1) continue;
+          const values = { ...ctx.me, weaponId: id };
+          rows.push({ id, name: tmpl.name, skillName: skill.skillName, description: skill.description,
+            uptime: combatParts(values, ctx).artifact?.uptime ?? 0, current: ctx.me.weaponId === id,
+            percent: (combatValue(values, ctx) / baseline - 1) * 100 });
+        }
+        return rows.sort((a, b) => b.percent - a.percent);
+      });
+    }
+    function pieceAdvice(item, tmpl, pool, percent) {
+      const extra = stats(item.extraStats);
+      const affixes = Object.entries(extra).map(([key, value]) => {
+        const candidates = pool.filter(row => row.key === key || !Object.hasOwn(extra, row.key));
+        const change = row => row.key === key ? { [key]: row.typical - value } : { [key]: -value, [row.key]: row.typical };
+        const reroll = Object.hasOwn(YANHOU_AFFIXES, key)
+          ? candidates.reduce((sum, row) => sum + percent(change(row)), 0) / candidates.length : null;
+        return { key, name: affixNames.get(key) || key, value, contribution: -percent({ [key]: -value }), reroll };
+      });
+      const best = affixes.reduce((best, row) => row.reroll > (best?.reroll ?? 0) ? row : best, null);
+      return { id: item.id, name: tmpl.name, affixes, suggest: best?.key ?? null };
+    }
+    function gearAdvice(state, prefs) {
+      return withScoringPass(state, () => {
+        const artifacts = artifactAdvice(state, prefs);
+        if (!artifacts) return null;
+        const percent = change => Math.expm1(statScore(change, state, prefs) / SCORE_UNIT) * 100;
+        const affixes = Object.entries(YANHOU_AFFIXES).map(([key, [min, max]]) => {
+          const typical = Math.round((min + max) / 2);
+          return { key, name: affixNames.get(key), min, max, typical, average: percent({ [key]: typical }), full: percent({ [key]: max }) };
+        }).sort((a, b) => b.average - a.average);
+        const pieces = array(state.equipments).filter(item => item.isEquipped && YANHOU_IDS.has(equipmentTemplateId(item)))
+          .map(item => ({ item, tmpl: item.equipTmpl || lookup(state.allEquipTemplates, equipmentTemplateId(item)) || template(item) }))
+          .sort((a, b) => num(a.tmpl.slotType) - num(b.tmpl.slotType))
+          .map(({ item, tmpl }) => pieceAdvice(item, tmpl, affixes, percent));
+        return { artifacts, affixes, pieces };
+      });
+    }
     function scoringDetail(state, prefs) {
       return withScoringPass(state, () => scoringDetailFrom(state, prefs));
     }
@@ -3563,6 +3617,9 @@
                 ),
               );
             else {
+              const advice = p.smithy.artifactIds.length ? [] : artifactAdvice(s, p);
+              const gains = new Map((advice || []).map(row => [row.id, row.percent]));
+              const gain = entry => gains.get(num(entry.id)) ?? -Infinity;
               const choices = array(preview)
                 .map((entry) => ({
                   entry,
@@ -3576,6 +3633,7 @@
                 )
                 .sort(
                   (a, b) =>
+                    gain(b.entry) - gain(a.entry) ||
                     scoreStats(stats(b.entry.extraStats || b.t.baseStats), gearWeights(s, p)) -
                     scoreStats(stats(a.entry.extraStats || a.t.baseStats), gearWeights(s, p)),
                 );
@@ -3891,7 +3949,7 @@
       equipmentStats,
       scoreStats,
       equipmentScore, equipmentValues, characterScore, SCORE_UNIT, CRIT_CHANCE_OFFSET, scoringDetail, SCORE_ATTRIBUTES,
-      artifactUptime, artifactEffects,
+      artifactUptime, artifactEffects, artifactAdvice, gearAdvice, PET_LEVEL_HELP,
       projectedGain,
       countItem,
       bagItem,
@@ -5616,6 +5674,110 @@
         });
       }
     }
+    class PetLevelButton {
+      constructor(controller, schedule = (fn, ms) => setTimeout(fn, ms)) {
+        this.controller = controller;
+        this.schedule = schedule;
+        this.rows = new Map();
+      }
+      scan(doc) {
+        const enabled = this.controller.prefs.convenience?.petLevelButton;
+        for (const [row, entry] of this.rows) {
+          if (enabled && doc.contains(entry.button) && row.contains(entry.button)) continue;
+          this.rows.delete(row);
+          entry.run = null;
+          entry.confirm = null;
+        }
+        if (!enabled) {
+          for (const button of doc.querySelectorAll('[data-tl-pet30]')) button.remove();
+          return;
+        }
+        for (const row of doc.querySelectorAll('.pet-care .feeding-row')) {
+          const entry = this.rows.get(row) || this.insert(row);
+          if (entry) this.refresh(entry);
+        }
+      }
+      gameButton(row, label) {
+        return [...row.querySelectorAll('button')].find(b => b.textContent.trim() === label);
+      }
+      insert(row) {
+        const max = this.gameButton(row, '喂到上限');
+        if (!max || row.querySelector('[data-tl-pet30]')) return;
+        const button = max.cloneNode(false), entry = { row, button, confirm: null, run: null };
+        button.type = 'button';
+        button.dataset.tlPet30 = '';
+        button.disabled = false;
+        button.addEventListener('click', () => this.click(entry));
+        max.after(button);
+        this.rows.set(row, entry);
+        return entry;
+      }
+      read(row) {
+        const panel = row.closest('.selected-content');
+        const name = (panel?.querySelector('button.pet-name') || panel?.querySelector('h3'))?.textContent.trim();
+        const level = Number(panel?.querySelector('span')?.textContent.match(/(\d+)级/)?.[1]);
+        const role = Number(storeField(this.controller.bridge.character(), 'role')?.level);
+        const one = this.gameButton(row, '升一级');
+        const reason = !(level > 0 && role > 0 && name && one) ? '未读到珍兽或人物等级' :
+          level >= 30 ? '已到 30 级' : level >= role ? '已到人物等级' : one.disabled ? '正在处理' : '';
+        return { name, level, role, one, reason };
+      }
+      refresh(entry, pet = this.read(entry.row)) {
+        if (entry.confirm && (entry.confirm.name !== pet.name || pet.reason)) entry.confirm = null;
+        if (entry.run && entry.run.name !== pet.name) entry.run = null;
+        const disabled = !entry.run && !!pet.reason;
+        const label = entry.run ? '停止（' + pet.level + '级）' : entry.confirm ? '确认升到30级' : '升到30级';
+        const title = disabled ? pet.reason : P.PET_LEVEL_HELP;
+        if (entry.button.disabled !== disabled) entry.button.disabled = disabled;
+        if (entry.button.title !== title) entry.button.title = title;
+        if (entry.button.textContent !== label) entry.button.textContent = label;
+      }
+      click(entry) {
+        if (entry.run) { entry.run.stop = true; return; }
+        const pet = this.read(entry.row);
+        if (pet.reason || !this.active(entry)) return this.refresh(entry, pet);
+        if (entry.confirm?.name === pet.name) {
+          entry.confirm = null;
+          entry.run = { name: pet.name, stop: false };
+          return this.step(entry, pet);
+        }
+        const confirm = entry.confirm = { name: pet.name };
+        this.refresh(entry, pet);
+        this.schedule(() => {
+          if (entry.confirm !== confirm) return;
+          entry.confirm = null;
+          if (this.active(entry)) this.refresh(entry);
+        }, 3000);
+      }
+      active(entry) {
+        return this.controller.prefs.convenience?.petLevelButton && entry.row.isConnected && entry.row.contains(entry.button);
+      }
+      step(entry, pet) {
+        this.refresh(entry, pet);
+        const run = entry.run;
+        pet.one.click();
+        this.schedule(() => this.poll(entry, run, pet.level, 1), 100);
+      }
+      poll(entry, run, previous, attempt) {
+        if (entry.run !== run) return;
+        if (!this.active(entry)) { entry.run = null; return; }
+        const pet = this.read(entry.row);
+        if (run.name !== pet.name || !pet.one || !(pet.level > 0 && pet.role > 0)) return this.finish(entry, pet);
+        if (pet.one.disabled && pet.level < Math.min(30, pet.role) && attempt < 120) {
+          this.refresh(entry, pet);
+          this.schedule(() => this.poll(entry, run, previous, attempt + 1), 100);
+          return;
+        }
+        if (pet.level >= Math.min(30, pet.role) && pet.level > previous)
+          this.controller.bridge.stores().get('ui')?.showMessage('「' + pet.name + '」已升到 ' + pet.level + ' 级', 'success');
+        if (run.stop || pet.reason || pet.level <= previous) return this.finish(entry, pet);
+        this.step(entry, pet);
+      }
+      finish(entry, pet) {
+        entry.run = null;
+        this.refresh(entry, pet);
+      }
+    }
     class MarketScore {
       static scoreCache = new WeakMap();
       static scorePrefs(prefs, type) {
@@ -5777,6 +5939,7 @@
       }
       constructor(controller) {
         this.controller = controller;
+        this.petLevelButton = new PetLevelButton(controller);
         if (typeof document === 'undefined') return;
         if (!MarketScore.sortInstalled) {
           Array.prototype.sort = MarketScore.sortHook(Array.prototype.sort,
@@ -6084,6 +6247,7 @@
           ? '实战评分等待战斗数据，暂按游戏排序' : '';
       }
       scan() {
+        try { this.petLevelButton.scan(document); } catch { /* Game windows can disappear during a scan. */ }
         this.scanHide();
         this.scanSort();
         const cards = document.querySelectorAll('.consignment-window .market-item-card'),
@@ -8958,7 +9122,7 @@
     const petRootRank = (text) => Number(String(text ?? '').match(/(?:悟性|根骨)\s*\+\s*(\d+)/)?.[1] || 0);
     const arraySafe = (v) => (Array.isArray(v) ? v : []);
     return {
-      petRootRank, WarehouseShortcuts, Filler, Stats, MapRates, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
+      petRootRank, PetLevelButton, WarehouseShortcuts, Filler, Stats, MapRates, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
     };
   })();
   if (typeof module !== 'undefined' && module.exports) module.exports.TLRuntime = TLRuntime;
@@ -9188,6 +9352,7 @@
       cur[ks.at(-1)] = value;
     };
     const HELP = {
+      gearAdvice: '提升指实战评分的变化（输出 × 生存^权重），怪物和生存权重同评分设置。四件神器基础属性相同（外攻、内攻 543），只差技能。燕侯每条词条在数值范围内随机，范围按 54 件实物估计。“洗炼期望”是把这一条洗成其他词条（不会与另外四条重复）后的平均变化，正数才值得洗；只看已穿戴的燕侯装备。',
       budgetStatus: "默认保留强化、镶宝、星级、鉴定装备和套装部件；自动回收品质1的普通装备。宝石默认目标3级，强化默认目标+3。",
       activities: "珍珑需15级，伪宋军与熊林需30级。令牌、每日次数会结合游戏返回的资格数据核对。",
       arena: "比武 30 级开放。挑战和领奖需要回洛阳找比武校尉，会中断挂机。点赞不中断。每天 0 点（东八区）结算前的这段时间，托管回洛阳驻守并连续挑战：榜单每 30 秒刷新一次，不受每日挑战次数上限限制，期间不进副本。",
@@ -9633,6 +9798,12 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
               this.savePanelState();
               this.requestBody();
             }
+            return;
+          }
+          if (action === 'gearAdvice') {
+            const view = TLPolicy.profileView(this.controller.bridge.state(), this.pending, 'farm');
+            this.gearAdviceResult = { at: Date.now(), advice: TLPolicy.gearAdvice(view.state, view.prefs) };
+            this.paintFragment('.gear-advice', this.gearAdviceHTML());
             return;
           }
           if (action === 'showScore') {
@@ -10573,6 +10744,9 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             '<div class="gear-check-status">' + this.gearCheckHTML(status.gear) + '</div>' +
             '<div class="actions"><button class="btn" type="button" data-action="clearGearRejected">清空换回名单</button></div>' +
             '<div class="actions"><button class="btn subtle" type="button" data-action="showScore">打开评分设置</button>' + this.help(HELP.scoreLink) + '</div>') +
+            g('装备推荐', '<div class="gear-advice">' + this.gearAdviceHTML() + '</div>' +
+              '<div class="actions"><button class="btn" type="button" data-action="gearAdvice">计算</button></div>',
+              false, { fieldKeywords: '装备推荐 神器 燕侯 词条 洗炼', help: HELP.gearAdvice }) +
             g('暗器养成',
             f('暗器养成', 'hidden.enabled', { help: '总开关' }) +
             f('自动领取暗器', 'hidden.claim', { help: '50 级，回洛阳找薛飞', dependsOn: 'hidden.enabled' }) +
@@ -10631,7 +10805,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('逛摊隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '指定卖给他人的和自己上架的商品不显示，页数只算能买的。逛摊窗口里“隐藏自己”左边的“隐藏无法购买”是同一个开关' })) +
           g('工坊',
             f('显示“一键放入”按钮', 'fill.enabled', { help: '在游戏窗口显示' }) +
-            f('完成后补回同种符和材料', 'fill.refill', { dependsOn: 'fill.enabled' }), false, { help: HELP.fill });
+            f('完成后补回同种符和材料', 'fill.refill', { dependsOn: 'fill.enabled' }), false, { help: HELP.fill }) +
+          g('珍兽', f('珍兽窗口显示“升到30级”', 'convenience.petLevelButton', { help: TLPolicy.PET_LEVEL_HELP }));
         if (this.section === 'craft')
           html =
             g('宝石策略',
@@ -10656,7 +10831,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('攒够多少经验投入一次', 'smithy.investChunk', { help: '挂机中直接投入，不回城', dependsOn: 'smithy.smelt' }) +
             f('神节与神符匹配修复', 'smithy.repair') +
             f('完整神节打造神器', 'smithy.forge') +
-            f('目标神器ID', 'smithy.artifactIds', { help: '留空自动评分', dependsOn: 'smithy.forge' }) +
+            f('目标神器ID', 'smithy.artifactIds', { help: '留空时按神器技能在当前属性下的提升自动选择', dependsOn: 'smithy.forge' }) +
             f('每日铁匠操作上限', 'smithy.maxPerDay', { unit: '次', help: '0 不限' })) +
             g('裁缝与御赐套装',
             f('启用装备打造', 'craft.enabled') +
@@ -11088,6 +11263,57 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           rate(smart.goal === 'exp' ? row.rate : row.exp, smart.goal === 'exp' ? row.se : row.expSe),
           rate(row.net, row.netSe), Math.floor(row.minutes) + ' 分钟']));
       }
+      advicePercent(value) {
+        const magnitude = Math.abs(value).toFixed(2);
+        return (magnitude === '0.00' ? '' : value < 0 ? '−' : '+') + magnitude + '%';
+      }
+      artifactAdviceHTML(rows) {
+        if (!rows.length) return this.infoBar('未读到神器技能数据');
+        const current = rows.find(row => row.current), best = rows[0];
+        const versus = row => ((1 + row.percent / 100) / (1 + current.percent / 100) - 1) * 100;
+        const table = rows.map(row => [
+          { html: esc(row.name) + (row.current ? this.chip('当前') : '') }, row.skillName,
+          (row.uptime * 100).toFixed(1) + '%', this.advicePercent(row.percent),
+          current && !row.current ? this.advicePercent(versus(row)) : '—',
+        ]);
+        const named = row => '「' + row.name + '」（' + row.skillName + '）';
+        const verdict = current === best ? '结论：现在用的' + named(best) + '已是最好，不用换' :
+          current ? '结论：换成' + named(best) + '最好，比现在强 ' + this.advicePercent(versus(best)) : '结论：' + named(best) + '最好';
+        return this.infoBar(verdict, 'ok') +
+          this.scoreTableHTML(['神器', '技能', '技能生效时间', '比没技能强', '比现在'], table) +
+          this.infoBar('四件神器属性一样，只差技能');
+      }
+      affixAdviceHTML(rows) {
+        const useless = rows.filter(row => this.advicePercent(row.average) === '0.00%').map(row => row.name);
+        const verdict = '结论：最值得要的词条是' + rows.slice(0, 3).map(row => row.name).join('、') +
+          (useless.length ? '；没用的是' + useless.join('、') + '（加了也不涨）' : '');
+        return this.infoBar(verdict, 'ok') + this.scoreTableHTML(['排名', '词条', '数值范围', '洗到平均值', '洗到满值'],
+          rows.map((row, i) => [i + 1, row.name, row.min + '–' + row.max, this.advicePercent(row.average), this.advicePercent(row.full)]));
+      }
+      pieceAdviceHTML(piece) {
+        const suggest = piece.affixes.find(row => row.key === piece.suggest);
+        return '<div class="block-title">' + esc(piece.name) + this.chip(suggest ? '建议洗 ' + suggest.name : '不用洗') + '</div>' +
+          this.scoreTableHTML(['词条', '数值', '现在值多少', '洗了平均变化'], piece.affixes.map(row => [
+            row.name, row.value, this.advicePercent(row.contribution), row.reroll == null ? '—' : this.advicePercent(row.reroll)]));
+      }
+      piecesAdviceHTML(pieces) {
+        if (!pieces.length) return this.infoBar('没有穿戴燕侯装备');
+        const best = pieces.flatMap(piece => piece.affixes.filter(row => row.key === piece.suggest).map(row => ({ piece, row })))
+          .sort((a, b) => b.row.reroll - a.row.reroll)[0];
+        const verdict = best ? '结论：先洗「' + best.piece.name + '」的' + best.row.name + '，洗了平均 ' + this.advicePercent(best.row.reroll) :
+          '结论：身上燕侯装备的词条都比洗了的平均好，不用洗';
+        return this.infoBar(verdict, 'ok') + pieces.map(piece => this.pieceAdviceHTML(piece)).join('');
+      }
+      gearAdviceHTML() {
+        if (!this.gearAdviceResult) return this.infoBar('点“计算”按当前属性和评分参照比较神器技能和燕侯词条');
+        const { at, advice } = this.gearAdviceResult;
+        if (!advice) return this.infoBar(this.pending.gear.scoring === 'linear'
+          ? '装备推荐按实战评分计算，请在评分设置里选择实战评分' : '实战评分等待战斗数据');
+        const time = new Date(at).toTimeString().slice(0, 8);
+        return this.statRow('计算于', time) + '<div class="block-title">神器技能</div>' + this.artifactAdviceHTML(advice.artifacts) +
+          '<div class="block-title">燕侯词条优先级</div>' + this.affixAdviceHTML(advice.affixes) +
+          '<div class="block-title">身上的燕侯装备</div>' + this.piecesAdviceHTML(advice.pieces);
+      }
       scoreTableHTML(headers, rows, mapTable = false) {
         return '<div class="table-scroll"><table class="income-table"><thead><tr>' + headers.map((v) => '<th>' + esc(v) + '</th>').join('') +
           '</tr></thead><tbody>' + rows.map((row) => '<tr>' + row.map((v, i) => (mapTable && i === 0 ? '<td title="' + esc(v) + '">' : '<td>') + (v && typeof v === 'object' && 'html' in v ? v.html : esc(v)) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>';
@@ -11331,6 +11557,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           this.paintFragment('.invasion-status', this.invasionHTML(s.invasion));
         }
         if (this.section === 'growth') {
+          this.paintFragment('.gear-advice', this.gearAdviceHTML());
           this.paintFragment('.gear-profile-status', this.profileStatusHTML(s));
           this.paintFragment('.gear-check-status', this.gearCheckHTML(s.gear));
           this.paintFragment('.hidden-status', this.hiddenHTML(s.hidden));
