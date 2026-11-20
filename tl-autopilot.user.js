@@ -141,7 +141,7 @@
         keepMinAverage: 118, feed: false, feedKeepExp: 0, refreshMinutes: 10 },
       arena: { enabled: true, like: true, claim: true, challenge: true, maxPerDay: 10,
         maxPowerRatio: 1.1, refreshMinutes: 30, rushMinutes: 10 },
-      rings: { enabled: false, roundsPerDay: 2, maxRetries: 2, claimInbox: true, exchange: 'off', refreshMinutes: 10 },
+      rings: { enabled: false, roundsPerDay: 2, maxRetries: 2, prepare: true, claimInbox: true, exchange: 'off', refreshMinutes: 10 },
       invasion: { enabled: false, claim: true, intervalMinutes: 10, waitSeconds: 60, maxRunsPerDay: 0 },
       hidden: { enabled: true, claim: false, claimElement: 'auto', wash: true, washQuality: true, inbox: true, feed: false,
         maxLevel: 100, keepExp: 0, refreshMinutes: 30 },
@@ -1911,7 +1911,39 @@
       return ringsPlan(s, p, daily, now, { ignoreRefresh: true })?.payload.action === 'enter' ? 'rings' : 'farm';
     }
     const gearChange = (a) => a.family === 'gear' && ['EQUIP_ITEM', 'WAREHOUSE_WITHDRAW'].includes(a.type);
-    function ringsPlan(s, p, daily, now, { ignoreRefresh = false, hasGearAction } = {}) {
+    function ringPotion(s, attr, missing, prefix) {
+      if (!(missing > 0)) return null;
+      const choices = array(s.bagItems).filter(b => bagUsable(s, b))
+        .map(bag => ({ bag, heal: potionEffect(bag.itemTmpl, attr) })).filter(c => c.heal > 0);
+      // Prefer covering the deficit, then the closest heal on either side of it.
+      choices.sort((a, b) => Number(b.heal >= missing) - Number(a.heal >= missing) ||
+        Math.abs(a.heal - missing) - Math.abs(b.heal - missing) || b.bag.count - a.bag.count);
+      const bag = choices[0]?.bag;
+      if (!bag) return null;
+      const label = prefix + '吃「' + bag.itemTmpl.name + '」补' + (attr === 'HP' ? '气血' : '真气');
+      return { ...action('USE_ITEM', { bagItemId: bag.id, count: 1 }, label, 'rings', { ringsPotion: true, potionAttr: attr }),
+        key: 'rings:potion:' + attr };
+    }
+    function ringsPrepare(s, p, now) {
+      const state = s.ringsCombatState;
+      if (!p.rings.prepare || !state || !s.rings?.run || now - (s.ringsPrepareSince ?? now) >= 120000) return null;
+      const age = now - s.ringsPotionAt;
+      if (state.at <= s.ringsPotionAt && age < 4000)
+        return { wait: '等待吃药结果', seconds: Math.ceil((4000 - age) / 1000) };
+      const prefix = '新三环：' + ringStage(s.rings.run.stage) + '开打前';
+      // A kind whose last potion raised nothing counts as full: the reported maximum may be out of reach.
+      const open = (attr) => !array(s.ringsPotionFull).includes(attr);
+      const drink = (open('HP') && state.hp != null && state.maxHp > 0 && ringPotion(s, 'HP', state.maxHp - state.hp, prefix)) ||
+        (open('MP') && state.mp != null && state.maxMp > 0 && ringPotion(s, 'MP', state.maxMp - state.mp, prefix));
+      if (drink) return { action: drink };
+      const serverNow = state.serverTime + (now - state.at);
+      const secondsTo = at => Math.max(0, Math.ceil((at - serverNow) / 1000));
+      const skill = secondsTo(Math.max(0, ...array(state.skills).map(sk => sk.readyAt)));
+      const pet = state.pet?.dead && state.pet.reviveAt > 0 ? secondsTo(state.pet.reviveAt) : 0;
+      const parts = [skill && '技能冷却 ' + skill + ' 秒', pet && '珍兽复活 ' + pet + ' 秒'].filter(Boolean);
+      return parts.length ? { wait: prefix + '等待' + parts.join('、'), seconds: Math.max(skill, pet) } : null;
+    }
+    function ringsPlan(s, p, daily, now, { ignoreRefresh = false, hasGearAction, onWait } = {}) {
       if (!p.rings?.enabled || !num(s.role?.id) || num(s.role.level) < 56 || s.activity || s.arenaMatch?.active ||
           s.trial?.run || [20050, 20051, 20052, 20070].includes(num(s.role.mapId))) return null;
       const r = s.rings, status = ringsStatus(s, p, daily, now);
@@ -1923,13 +1955,15 @@
       });
       const query = () => request('status', '查询状态');
       if (!r || !Number.isFinite(r.at)) return query();
-      // With a known run on a ring map the fight starts even when the status stays unconfirmed for 15 s:
-      // the character must never stand idle there.
+      // An unconfirmed status stops blocking a known run on a ring map after 15 s.
       const unconfirmedRun = r.run && RINGS_MAP_IDS.includes(num(s.role?.mapId)) &&
         Number.isFinite(s.ringsDirtyAt) && now - s.ringsDirtyAt > 15000;
       if (!ignoreRefresh && s.ringsDirty && !unconfirmedRun) return query();
       if (r.run) {
         if (s.ringsFighting || !RING_NAMES[r.run.stage] || now - (s.ringsStartAt ?? -Infinity) < 5000) return null;
+        const prep = p.rings.prepare && ringsPrepare(s, p, now);
+        if (prep?.wait) onWait?.(prep.wait);
+        if (prep) return prep.action || null;
         return action('COMBAT_START', {}, '新三环：挑战' + ringStage(r.run.stage), 'rings', { noResponse: true });
       }
       if (!ignoreRefresh && now - r.at > p.rings.refreshMinutes * 60000) return query();
@@ -3979,7 +4013,7 @@
       townFor,
       RINGS_MAP_IDS, ASSAULT_PROFILES, ASSAULT_IDS, PROFILE_IDS, longLabel, mapProfile, keptFloors,
       assaultTargets, assaultWeight, assaultAvailable, profileView, gearProfileTarget,
-      combatSignature, profileLabel, profileLocked, profileWearable, gearChange, RING_NAMES, ringStage, ringsStatus, ringsPlan,
+      combatSignature, profileLabel, profileLocked, profileWearable, gearChange, RING_NAMES, ringStage, ringsStatus, ringsPlan, ringsPrepare,
       invasionPlan, invasionDaily, invasionStatus, petOwnerBuffs,
       farmMap,
       fieldMap,
@@ -4417,10 +4451,10 @@
       }
       return changed;
     }
-    // USE_ITEM is allowed only for pet hatching or double experience; other uses stay with the player.
     function requestAllowed(action) {
       if (action?.type === 'XIAOXIAO_COMMAND') return ['open', 'join', 'create', 'claim', 'report'].includes(action.payload?.action);
-      return ALLOWED.has(action?.type) || (action?.type === 'USE_ITEM' && (action.petHatch === true || action.doubleExp === true));
+      return ALLOWED.has(action?.type) || (action?.type === 'USE_ITEM' &&
+        (action.petHatch === true || action.doubleExp === true || action.ringsPotion === true));
     }
     const responseHasId = (action) => ['ARENA_COMMAND', 'PET_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'ONLINE_LOTTERY_COMMAND', 'WELFARE_LOTTERY_COMMAND'].includes(action.type) || action.petHatch;
     const responseType = (action) => action.responseType || action.type + '_RESPONSE';
@@ -4428,7 +4462,7 @@
       responseHasId(action) ? action.requestId ?? action.payload?.requestId ?? null : null]);
     const parallelQuery = (action) => action.readOnly && !action.requiresTown && action.family !== 'rings';
     function ensureRequestId(action) {
-      if ((responseHasId(action) || action.type === 'TRIAL_COMMAND') && action.payload?.requestId == null)
+      if ((responseHasId(action) || action.ringsPotion || action.type === 'TRIAL_COMMAND') && action.payload?.requestId == null)
         action.payload = { ...action.payload, requestId:
           globalThis.crypto?.randomUUID?.() || 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
             .replace(/[xy]/g, (c) => {
@@ -4957,6 +4991,7 @@
         this.cache.arenaMatch = null;
         this.cache.trial = null;
         this.cache.rings = null;
+        this.ringsCombatState = null;
         this.clearInvasion();
         this.ringsRequests.clear();
         this.ringsRequestAt.clear();
@@ -4969,6 +5004,27 @@
         this.cache.pets = null;
         this.cache.petHall = Object.create(null);
         this.petListRequired = false;
+      }
+      syncRingsCombatRole(roleId) {
+        if (this.ringsCombatRole !== roleId) this.ringsCombatState = null;
+        this.ringsCombatRole = roleId;
+      }
+      recordRingsCombat(data, character) {
+        this.syncRingsCombatRole(character?.role?.id);
+        const old = this.ringsCombatState || {}, player = data.player || {}, pet = data.pet;
+        let companion = old.pet ?? null;
+        if (Object.hasOwn(data, 'pet'))
+          companion = pet ? { name: pet.name, dead: !!pet.isDead, reviveAt: P.num(pet.reviveAt) } : null;
+        this.ringsCombatState = {
+          at: this.lastMessage, serverTime: data.serverTime ?? this.lastMessage, sessionId: data.sessionId, stage: data.stage,
+          hp: player.currentHp ?? old.hp ?? null, mp: player.currentMp ?? old.mp ?? null,
+          maxHp: player.base?.hp ?? old.maxHp ?? character?.finalAttributes?.hp,
+          maxMp: player.base?.mp ?? old.maxMp ?? character?.finalAttributes?.mp,
+          skills: Array.isArray(player.skills) ? player.skills.map(sk => ({
+            id: sk.id, name: sk.name, readyAt: P.num(sk.nextAvailableAt),
+          })) : old.skills || [],
+          pet: companion,
+        };
       }
       syncPetRole(roleId) {
         if (this.petRole != null && this.petRole !== roleId) this.resetPets(roleId);
@@ -5073,6 +5129,7 @@
               P.RINGS_MAP_IDS.includes(P.num(this.character()?.role?.mapId)))) {
             if (this.ringsCombat && packet.data?.stage !== 'running') this.invalidateRings();
             this.ringsCombat = packet.data?.stage === 'running';
+            if (packet.data) this.recordRingsCombat(packet.data, this.character());
           }
           const assaultMap = type === 'COMBAT_STATE' && P.mapProfile(this.character()?.role?.mapId);
           if (type === 'COMBAT_STATE' && packet.data?.stage === 'running' &&
@@ -5186,6 +5243,7 @@
             if (packet.success && data?.rings) {
               this.cache.rings = { rings: copy(data.rings), at: Date.now() };
               if (!data.rings.run) this.ringsCombat = false;
+              if (!data.rings.run) this.ringsCombatState = null;
             }
           }
           const lottery = type === 'ONLINE_LOTTERY_STATE' ? data :
@@ -5470,6 +5528,7 @@
         const c = this.character();
         this.syncPetRole(c?.role?.id);
         this.syncInvasionRole(c?.role?.id);
+        this.syncRingsCombatRole(c?.role?.id);
         if (!c?.role?.id) return null;
         const r = c.role,
           role = {};
@@ -5503,6 +5562,7 @@
           towerFloors: this.towerFloors(r.id),
           trial: this.cache.trial ? { ...this.cache.trial.trial, at: this.cache.trial.at } : null,
           rings: this.cache.rings ? { ...this.cache.rings.rings, at: this.cache.rings.at } : null,
+          ringsCombatState: this.ringsCombatState ?? null,
           invasion: this.cache.invasion && { ...this.cache.invasion, mapId: this.cache.invasionMapId },
           ringsDirty: this.ringsEpoch !== this.ringsConfirmed,
           ringsDirtyAt: this.ringsDirtyAt ?? null,
@@ -7444,7 +7504,7 @@
       }
       ringsRefused(a, r, message) {
         this.log(a.label + '：' + message, 'warning');
-        this.suppress(a, 300000);
+        this.suppress(a, a.ringsPotion ? 5000 : 300000);
         if (a.payload.action !== 'enter' || !r?.day) return;
         const d = this.ringsDaily(r);
         if (++d.refusals === 3) this.log('新三环进入被拒绝：' + message, 'warning');
@@ -7828,6 +7888,24 @@
         this.perf.maxMs = this.perfSamples.reduce((max, sample) => Math.max(max, sample.ms), 0);
         return { ...this.perf };
       }
+      ringsTiming(s, now, fighting = !!s.rings?.run && (this.bridge.ringsCombat || this.bridge.battle().stage === 'running')) {
+        const run = s.rings?.run, key = run ? JSON.stringify([s.role.id, run.id, run.stage]) : null;
+        if (this.ringsPrepareKey !== key) {
+          this.ringsPrepareKey = key;
+          this.ringsPrepareSince = undefined;
+          this.ringsPotionAt = undefined;
+          this.ringsPotionLast = null;
+          this.ringsPotionFull = [];
+        }
+        if (run && !fighting) this.ringsPrepareSince ??= now;
+        const last = this.ringsPotionLast, combat = this.bridge.ringsCombatState;
+        if (last && combat?.at > this.ringsPotionAt) {
+          if (!(combat[last.field] > last.value)) this.ringsPotionFull = [...(this.ringsPotionFull || []), last.attr];
+          this.ringsPotionLast = null;
+        }
+        return { ringsFighting: fighting, ringsStartAt: this.ringsStartAt, ringsPrepareSince: this.ringsPrepareSince,
+          ringsPotionAt: this.ringsPotionAt, ringsPotionFull: this.ringsPotionFull || [] };
+      }
       planningPass(state, prefs, now = Date.now()) {
         const clock = this.planNow || monotonicNow, started = clock();
         try {
@@ -7835,8 +7913,7 @@
           if (!prefs.rings?.enabled && !prefs.invasion?.enabled) return P.plans(s, prefs, this.ledger, now);
           return P.plans({ ...s, invasionVisit: this.invasionVisit, invasionPriorRefused: this.invasionPriorRefused,
             activity: this.activity || this.arenaPending || s.activity,
-            ringsFighting: !!s.rings?.run && (this.bridge.ringsCombat || this.bridge.battle().stage === 'running'),
-            ringsStartAt: this.ringsStartAt }, prefs,
+            ...this.ringsTiming(s, now) }, prefs,
           { ...this.ledger, rings: this.ringsDaily(s.rings) }, now);
         } finally {
           const ended = clock(), ms = Math.max(0, ended - started), at = this.now?.() ?? Date.now();
@@ -7974,20 +8051,20 @@
         const ringsCommand = a.type === 'RINGS_COMMAND', ringsEpoch = this.bridge.ringsEpoch;
         if (a.family === 'rings') {
           const current = P.ringsPlan({ ...before, activity: this.activity || this.arenaPending,
-            gearCheck: this.gearCheck, ringsStartAt: this.ringsStartAt,
-            ringsFighting: !!before.rings?.run && (this.bridge.ringsCombat || this.bridge.battle().stage === 'running') },
+            gearCheck: this.gearCheck, ...this.ringsTiming(before, Date.now()) },
           this.prefs, this.ringsDaily(before.rings), Date.now(), {
             hasGearAction: () => this.planningPass(before, this.prefs).some(P.gearChange) });
           if (!this.enabled || !current || current.key !== a.key ||
               (a.requiresTown && P.num(before.role.mapId) !== P.num(before.rings?.townId))) return;
           if (ringsCommand && !a.readOnly) a.payload.revision = before.rings.revision;
+          if (a.ringsPotion) a = current;
           if (a.type === 'COMBAT_START') this.ringsStartAt = Date.now();
         }
         const check = P.materialCheck(a, before, this.prefs);
         if (!check.ok || !P.allowed(a, before, this.prefs, this.ledger)) {
           this.reason = a.label + '：' + (check.ok ? '当前资源或预算不足' : check.reason);
           this.log(this.reason, 'warning');
-          this.suppress(a, 60000);
+          this.suppress(a, a.ringsPotion ? 5000 : 60000);
           if (!queryBatch) this.lastLocal = Date.now();
           this.paint();
           return;
@@ -8012,6 +8089,11 @@
         if (!queryBatch?.multiple && !a.quiet) this.log(a.label);
         this.paint();
         try {
+          if (a.ringsPotion) {
+            const field = a.potionAttr === 'MP' ? 'mp' : 'hp';
+            this.ringsPotionAt = Date.now();
+            this.ringsPotionLast = { attr: a.potionAttr, field, value: this.bridge.ringsCombatState?.[field] };
+          }
           const result = await this.bridge.request(a, this.responseTimeout());
           if (a.breedSuccess) {
             if (result.success) this.log(a.breedSuccess, 'success');
@@ -8157,7 +8239,7 @@
             if (e.code === 'SERVER_ERROR') this.ringsRefused(a, before.rings, safeMessage(e.serverMessage || e.message));
             else {
               this.log(safeMessage(e.message), 'warning');
-              this.suppress(a, 300000);
+              this.suppress(a, a.ringsPotion ? 5000 : 300000);
             }
             return;
           }
@@ -8400,13 +8482,15 @@
           this.ringsMap = mapId;
           this.ringsUiCombat = (rings || !!s.rings?.run) && active;
           const fighting = active || this.bridge.ringsCombat;
+          const timing = this.ringsTiming(s, now, fighting);
           if (!this.busy && s.rings) this.observeRings(s.rings);
           const otherActivity = s.trial?.run || s.arenaMatch?.active || this.arenaPending ||
             [20050, 20051, 20052, 20070].includes(mapId) || this.activity?.mapId === mapId;
           if (!otherActivity && (s.rings?.run || !s.rings || s.ringsDirty)) {
             const a = P.ringsPlan({ ...s, gearProfile: this.gearProfile, gearCheck: this.gearCheck,
-              ringsFighting: fighting, ringsStartAt: this.ringsStartAt },
+              ...timing },
               this.prefs, this.ringsDaily(s.rings), now, {
+                onWait: reason => { this.reason = reason; },
                 hasGearAction: () => this.planningPass(s, this.prefs, now).some(P.gearChange) });
             if (s.rings?.run && fighting)
               this.reason = '新三环：' + P.ringStage(s.rings.run.stage) + '战斗中';
@@ -10733,6 +10817,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
               help: '每天最多打几轮。每环每天只发 2 次奖励，打满 2 轮即可拿全' }) +
             f('每轮失败后重试次数', 'rings.maxRetries', { unit: '次', min: 0, max: 20, dependsOn: 'rings.enabled',
               help: '一轮里失败后最多再进几次，每轮重新计数；0 表示失败后本轮直接结束' }) +
+            f('每环开打前补满气血真气、等技能和珍兽', 'rings.prepare', { dependsOn: 'rings.enabled',
+              help: '每一环开打前先吃药把气血和真气补满，再等所有技能冷却好、出战珍兽复活后才开打，最多等 2 分钟。三环里血量和真气会带进下一环，两环之间吃的药有效；打到一半停下会算作放弃本轮，所以只在两环之间补。' }) +
             f('自动领取暂存的神兵符', 'rings.claimInbox', { dependsOn: 'rings.enabled' }) +
             f('攒够 300 枚自动兑换', 'rings.exchange', { dependsOn: 'rings.enabled',
               choices: [['off', '不兑换'], ['ring', '只换重楼戒'], ['jade', '只换重楼玉'], ['ringFirst', '先戒后玉'], ['jadeFirst', '先玉后戒']],
