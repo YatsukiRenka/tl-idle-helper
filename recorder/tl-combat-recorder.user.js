@@ -29,6 +29,9 @@
   const solo = s => !s.pet || s.pet.isDead || !(s.pet.currentHp > 0);
   const soloDefaults = () => ({ os: [0, 0, 0, 0, 0], solo: 0 });
   const logDefaults = () => ({ ol: [0, 0, 0, 0], olk: {}, art: {}, artUp: 0, fk: {} });
+  // Pet: casts per skill, its heals on the owner (part of heal), its HP over time (ms × fraction while alive), and
+  // the guard of 肉墙: time active, activations, budget used up.
+  const petDefaults = () => ({ pk: {}, petHeal: 0, petHealN: 0, petHpSum: 0, guardMs: 0, guardN: 0, guardUsed: 0 });
   function hash(value) {
     let h = 2166136261;
     for (const c of JSON.stringify(value)) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
@@ -54,7 +57,7 @@
       this.rivalSessions = new Map();
       try { const d = this.read(this.storageKey()); this.data = valid(d) ? clone(d) : empty(); } catch { this.data = empty(); }
       this.data.rivals ||= {};
-      for (const [k, b] of Object.entries(this.data.hours)) this.data.hours[k] = { ...dangerDefaults, ...eventDefaults(), ...soloDefaults(), ...logDefaults(), ...b };
+      for (const [k, b] of Object.entries(this.data.hours)) this.data.hours[k] = { ...dangerDefaults, ...eventDefaults(), ...soloDefaults(), ...logDefaults(), ...petDefaults(), ...b };
       for (const cfg of Object.values(this.data.configs)) cfg.dots ||= [];
     }
     storageKey() { return 'tl-combat-recorder-v1:' + this.roleId; }
@@ -65,6 +68,7 @@
       this.data.configs[this.sig] ||= { first: s.serverTime, last: s.serverTime, level: c.level, sect: c.sect, attrs, skills, pet, out: [], in: [] };
       this.data.configs[this.sig].last = s.serverTime;
       if (c.weapon != null) this.data.configs[this.sig].weapon = c.weapon;
+      if (s.pet?.skills?.length) this.data.configs[this.sig].petSkills = s.pet.skills.map(x => [x.id, x.name]);
       const dots = this.data.configs[this.sig].dots ||= [];
       for (const m of slots(s).filter(m => !m.isDead && m.currentHp > 0)) this.poison(m, dots);
       this.recordSkills(s.player);
@@ -96,7 +100,7 @@
     }
     bucket(t, c) {
       const k = [Math.floor(t / 3600000), c.mapId, this.sig].join('|');
-      const b = this.data.hours[k] ||= { ...dangerDefaults, ...eventDefaults(), ...soloDefaults(), ...logDefaults(), ...Object.fromEntries(fields.map(f => [f, 0])), o: [0, 0, 0, 0, 0], i: [0, 0, 0, 0, 0], k: {} };
+      const b = this.data.hours[k] ||= { ...dangerDefaults, ...eventDefaults(), ...soloDefaults(), ...logDefaults(), ...petDefaults(), ...Object.fromEntries(fields.map(f => [f, 0])), o: [0, 0, 0, 0, 0], i: [0, 0, 0, 0, 0], k: {} };
       b.pt = c.potionThreshold || 0;
       return b;
     }
@@ -151,9 +155,18 @@
         if (s.player.buffIcons?.some(x => /^artifact-.+-self$/.test(x?.id))) b.artUp += dt;
         if (solo(s)) b.solo += dt;
         b.taken += Math.max(0, prev.player.currentHp - s.player.currentHp);
+        if (!solo(s) && s.pet.base?.hp > 0) b.petHpSum += dt * Math.min(1, s.pet.currentHp / s.pet.base.hp);
+        if (s.pet?.guardUntil > s.serverTime) b.guardMs += dt;
       }
+      this.guard(prev.pet, s.pet, s.serverTime, b);
       if (!prev.player.isDead && s.player.isDead) b.deaths++;
       for (const m of slots(prev)) this.monsterDelta(m, slots(s).find(x => x.id === m.id), b, dt);
+    }
+    // guardUntil moves forward when 肉墙 is cast; guardBudget is taken as what the guard can still absorb.
+    guard(before, now, time, b) {
+      if (!now || !(now.guardUntil > time)) return;
+      if (now.guardUntil !== before?.guardUntil) { b.guardN++; return; }
+      b.guardUsed += Math.max(0, (Number(before.guardBudget) || 0) - (Number(now.guardBudget) || 0));
     }
     monsterDelta(m, next, b, dt) {
       if (dt > 0) b.dealt += next ? Math.max(0, m.currentHp - next.currentHp) : (!m.isDead ? m.currentHp : 0);
@@ -265,9 +278,21 @@
       if (poison) { b.dot += Number(poison[1]); b.dotN++; return true; }
       if (monster && e.text === '蚀毒处决') { b.exec++; return true; }
       if (monster && e.text === '复活') { b.monRevive++; return true; }
-      if (pet && /^【[^】]*】$/.test(e.text)) { b.petCasts++; return true; }
+      if (pet && /^【[^】]*】$/.test(e.text)) {
+        b.petCasts++;
+        const name = e.text.slice(1, -1);
+        if (!Object.hasOwn(b.pk, name) && Object.keys(b.pk).length < 12)
+          Object.defineProperty(b.pk, name, { value: 0, enumerable: true, writable: true, configurable: true });
+        if (Object.hasOwn(b.pk, name)) b.pk[name]++;
+        return true;
+      }
       if (pet && e.text === '复活') { b.petRevive++; return true; }
-      if (incoming && /^\+\d+$/.test(e.text)) { b.heal += Number(e.text); b.healN++; return true; }
+      if (incoming && /^\+\d+$/.test(e.text)) {
+        b.heal += Number(e.text); b.healN++;
+        // The server marks a pet's heal (共生) with the pet's id, as its damage.
+        if (String(e.hitSourceId ?? '').startsWith('pet-')) { b.petHeal += Number(e.text); b.petHealN++; }
+        return true;
+      }
       return false;
     }
     sample(s, incoming, mk, n, crit, skill = this.skill || '', elemental = 0) {
