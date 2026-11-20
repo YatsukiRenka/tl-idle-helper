@@ -294,7 +294,7 @@
     function transferFile(text) {
       let file;
       try { file = JSON.parse(text); }
-      catch (error) { throw new Error('读取配置文件失败：' + error.message); }
+      catch (error) { throw new Error('读取配置文件失败：' + error.message, { cause: error }); }
       if (!transferObject(file)) throw new Error('配置文件格式不对');
       if (file.format !== 'tl-autopilot-full') return { kind: 'config', config: file, data: {}, logs: [], meta: {} };
       if (file.formatVersion > 1) throw new Error('不支持的全量配置版本');
@@ -540,7 +540,7 @@
     }
     function logText(entries, now = Date.now()) {
       const pad = (value) => String(value).padStart(2, '0');
-      return entries.slice().reverse().map((entry) => Number.isFinite(entry.at) ? entry : { ...entry, at: now })
+      return entries.toReversed().map((entry) => Number.isFinite(entry.at) ? entry : { ...entry, at: now })
         .sort((a, b) => a.at - b.at).map((entry) => {
           const date = new Date(entry.at), day = [date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join('-');
           return day + ' ' + logTime(entry.at) + ' [' + ({ info: '信息', success: '成功', warning: '警告' }[entry.level] || '信息') +
@@ -1193,7 +1193,7 @@
       const p = config(prefs);
       if (p.hidden.claimElement !== 'auto') return p.hidden.claimElement;
       const attacks = state?.finalAttributes || {}, weights = gearWeights(state, p);
-      return elements.slice().sort((a, b) =>
+      return elements.toSorted((a, b) =>
         num(attacks[b + 'Atk']) - num(attacks[a + 'Atk']) ||
         num(weights[b + 'Atk']) - num(weights[a + 'Atk']) ||
         elements.indexOf(a) - elements.indexOf(b))[0];
@@ -2280,7 +2280,7 @@
     }
     function potionOrder(list, attr, s, p) {
       const scores = new Map(list.map((t) => [t, potionEffect(t, attr)])), heal = (t) => scores.get(t),
-        strong = [...list].sort((a, b) => heal(b) - heal(a));
+        strong = list.toSorted((a, b) => heal(b) - heal(a));
       if (p.potions.order === 'strong') return strong;
       if (p.potions.order === 'weak') return strong.reverse();
       // fit: smallest potion that refills the gap at the trigger threshold first,
@@ -3774,7 +3774,7 @@
       const level = (b) => num(b.itemTmpl?.gemLevel), id = materialId;
       const bags = array(s.bagItems).filter((b) => materialUsable(s, b)).sort(bound);
       const gems = array(s.bagItems).filter((b) => gemUsable(s, b)).sort(bound);
-      const eqs = array(s.equipments).slice().sort((a, b) => worn(a, b) || num(template(a).slotType) - num(template(b).slotType));
+      const eqs = array(s.equipments).toSorted((a, b) => worn(a, b) || num(template(a).slotType) - num(template(b).slotType));
       const eq = current.selectedEquip;
       if (mode === 'SMITHY_REPAIR') {
         if (kind === 'section') return bags.filter((b) => id(b) >= 5032 && id(b) <= 5037).sort((a, b) => id(b) - id(a));
@@ -4155,9 +4155,10 @@
         set(on) {
           if (on && !held && this.supported) {
             try {
-              navigator.locks.request(name, { mode: 'shared' }, () => new Promise((resolve) => {
-                release = resolve;
-              })).catch(() => {
+              // Released as soon as it is granted if it was turned off before that.
+              const { promise, resolve } = Promise.withResolvers();
+              release = resolve;
+              navigator.locks.request(name, { mode: 'shared' }, () => promise).catch(() => {
                 held = false;
               });
               held = true;
@@ -6928,7 +6929,7 @@
       async exportData(config) {
         await this.logReady;
         await Promise.all(Array.from(this.logBatches, batch => batch.write));
-        const queued = this.logQueue.slice().reverse();
+        const queued = this.logQueue.toReversed();
         const logs = this.logDatabaseOn ? P.logPrune([...queued, ...await this.logStore.read()], this.prefs.logs.keepDays) : [];
         return { format: 'tl-autopilot-full', formatVersion: 1, script: this.status().version,
           exportedAt: Date.now(), host: location.host, roleId: roleTag(this), config, data: this.storageSnapshot(), logs };
@@ -8811,7 +8812,7 @@
         const candidates = bags.filter((b) => b.count > 0 && b.itemId === family);
         const rank = petRootRank(root.textContent);
         const needed = rank % 3 + 1;
-        const best = candidates.slice().sort((a, b) => Number(b.count >= needed) - Number(a.count >= needed) || (a.count >= needed && b.count >= needed ? Number(!!b.isBound) - Number(!!a.isBound) : b.count - a.count))[0];
+        const best = candidates.toSorted((a, b) => Number(b.count >= needed) - Number(a.count >= needed) || (a.count >= needed && b.count >= needed ? Number(!!b.isBound) - Number(!!a.isBound) : b.count - a.count))[0];
         options[candidates.indexOf(best)]?.click();
       }
     }
@@ -9642,7 +9643,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           if (!e.target.matches('.config-file') || !e.target.files?.[0]) return;
           try {
             const file = e.target.files[0];
-            const text = await file.text().catch(error => { throw new Error('读取配置文件失败：' + error.message); });
+            const text = await file.text().catch(error => { throw new Error('读取配置文件失败：' + error.message, { cause: error }); });
             this.previewTransfer(TLPolicy.transferFile(text), file.lastModified);
           } catch (error) {
             this.transferError(error.message);
