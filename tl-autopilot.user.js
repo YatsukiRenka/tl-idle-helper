@@ -137,7 +137,7 @@
       welfare: { enabled: false, currency: 'GOLD', multiplier: 1, betsPerDraw: 1,
         dailyCost: 1000000, pick: 'random', numbers: '' },
       pets: { enabled: true, summon: true, claim: true, hatch: false, hatchMutant: false,
-        breedClaim: true, breed: false, breedMinAverage: 118, breedPublish: true,
+        breedClaim: true, breed: false, breedMinAverage: 118, breedPublish: true, breedRelease: false,
         keepMinAverage: 118, feed: false, feedKeepExp: 0, refreshMinutes: 10 },
       arena: { enabled: true, like: true, claim: true, challenge: true, maxPerDay: 10,
         maxPowerRatio: 1.1, refreshMinutes: 30, rushMinutes: 10 },
@@ -2725,6 +2725,12 @@
         pet.level >= 30 && !pet.breedingUsed && !!pet.appraised && (pet.status === 'WAITING' ||
           (pet.status === 'OWNED' && array(state.pets).length + num(state.reserved) < state.capacity));
     }
+    // A first-generation baby breeds once in its life; after that it only takes a slot.
+    function bredParent(entry, state) {
+      const pet = entry?.pet;
+      return !!pet?.id && pet.status === 'OWNED' && pet.form === 'BABY' && pet.breedingUsed === true &&
+        pet.id !== state?.activePetId;
+    }
     function petServerNow(state, now) {
       return state?.serverTime + (now - state?.at);
     }
@@ -3093,7 +3099,15 @@
           else {
             const breeding = breedingPlans(s, p, now);
             breeding.forEach(add);
-            if (!breeding.length && p.pets.feed && active && active.pet.level < role.level && cost > 0 &&
+            // After claims, hatching and breeding, so a refused release never holds them back. The game
+            // refuses to release a locked pet, so a locked parent is unlocked first.
+            const parent = p.pets.breedRelease && entries.find((entry) => bredParent(entry, state));
+            const name = parent && '已繁殖的一代宝宝「' + parent.pet.name + '」';
+            if (!breeding.length && parent)
+              add(parent.pet.locked
+                ? request('lock', { petId: parent.pet.id, locked: false }, { label: '解锁' + name + '以便放生' })
+                : request('release', { petId: parent.pet.id, confirm: true }, { label: '放生' + name }));
+            else if (!breeding.length && p.pets.feed && active && active.pet.level < role.level && cost > 0 &&
                 num(role.currentExp) - cost >= p.pets.feedKeepExp)
               add(request('feed', { petId: active.pet.id, mode: 'one' }, { expCost: cost }));
           }
@@ -10794,7 +10808,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
               f('对方宝宝的最低平均资质', 'pets.breedMinAverage', { unit: '%', min: 80, max: 120, step: 0.5,
                 dependsOn: 'pets.breed', help: '也是自己发布时的择偶条件' }) +
               f('没有合适对象时发布自己的宝宝', 'pets.breedPublish', { dependsOn: 'pets.breed',
-                help: '发布后满足条件的玩家可直接与它繁殖；脚本不会自动撤回' }), false,
+                help: '发布后满足条件的玩家可直接与它繁殖；脚本不会自动撤回' }) +
+              f('繁殖领回后放生一代珍兽', 'pets.breedRelease', { help: '一代宝宝一生只能繁殖一次。开启后放生所有繁殖过的一代宝宝，锁定的会先解锁，出战中的不放。放生后无法恢复' }), false,
             { help: '繁殖在苏州云飘飘处办理，会中断挂机。' });
         if (this.section === 'bagTools')
           html = g('显示',
