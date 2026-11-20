@@ -142,7 +142,7 @@
       arena: { enabled: true, like: true, claim: true, challenge: true, maxPerDay: 10,
         maxPowerRatio: 1.1, refreshMinutes: 30, rushMinutes: 10 },
       rings: { enabled: false, roundsPerDay: 2, maxRetries: 2, claimInbox: true, exchange: 'off', refreshMinutes: 10 },
-      invasion: { enabled: false, join: true, create: true, claim: true, intervalMinutes: 10, maxRunsPerDay: 0 },
+      invasion: { enabled: false, claim: true, intervalMinutes: 10, waitSeconds: 60, maxRunsPerDay: 0 },
       hidden: { enabled: true, claim: false, claimElement: 'auto', wash: true, washQuality: true, inbox: true, feed: false,
         maxLevel: 100, keepExp: 0, refreshMinutes: 30 },
       potions: {
@@ -475,7 +475,8 @@
       p.rings.roundsPerDay = Math.max(1, Math.min(10, integer(p.rings.roundsPerDay)));
       p.rings.maxRetries = Math.max(0, Math.min(20, integer(p.rings.maxRetries)));
       p.rings.refreshMinutes = Math.max(1, Math.min(120, integer(p.rings.refreshMinutes)));
-      p.invasion.intervalMinutes = Math.max(3, Math.min(120, integer(p.invasion.intervalMinutes)));
+      p.invasion.intervalMinutes = Math.max(1, Math.min(120, integer(p.invasion.intervalMinutes)));
+      p.invasion.waitSeconds = Math.max(0, Math.min(1800, integer(p.invasion.waitSeconds)));
       p.invasion.maxRunsPerDay = Math.max(0, Math.min(200, integer(p.invasion.maxRunsPerDay)));
       if (!['off', 'ring', 'jade', 'ringFirst', 'jadeFirst'].includes(p.rings.exchange)) p.rings.exchange = 'off';
       p.arena.rushMinutes = Math.max(0, Math.min(120, integer(p.arena.rushMinutes)));
@@ -1876,6 +1877,8 @@
       return next;
     }
     const FARM_MAP_EXCLUDED_IDS = [20050, 20051, 20052, 20060, 20061, 20070, ...RINGS_MAP_IDS];
+    // The next round starts when the board's round ends; a visit goes a moment after that.
+    const INVASION_ROUND_DELAY = 3000;
     function invasionDaily(day) {
       return { day, visitAt: 0, visits: 0, joined: 0, created: 0, fights: 0, claimed: 0,
         won: 0, lost: 0, refused: { teams: [], rounds: [], runs: [] }, reports: [] };
@@ -1887,8 +1890,12 @@
       const unclaimed = runs.filter(r => r.status === 'FINISHED' && !r.claimed).length;
       // With no run left a recruiting team cannot start either: the next visit waits for the round change.
       const exhausted = board?.remaining === 0 && !fighting && !(prefs.invasion.claim && unclaimed) &&
-        now >= board.roundId && num(daily?.visitAt) < board.endsAt + 30000;
+        now >= board.roundId && num(daily?.visitAt) < board.endsAt + INVASION_ROUND_DELAY;
       const sect = board?.sect ?? null;
+      const capped = !!prefs.invasion.maxRunsPerDay && num(daily?.fights) >= prefs.invasion.maxRunsPerDay;
+      const regular = daily?.visitAt ? daily.visitAt + prefs.invasion.intervalMinutes * 60000 : now;
+      // A round start comes before the regular interval: teams form in its first minutes.
+      const roundStart = board && !capped && num(daily?.visitAt) < board.endsAt ? board.endsAt + INVASION_ROUND_DELAY : Infinity;
       return { enabled: prefs.invasion.enabled, level20: num(role?.level) >= 20, sect,
         sectName: ['','少林','明教','丐帮','武当','峨眉','星宿','天龙','天山','逍遥'][sect] || null,
         ownSect: sect != null && String(sect) === String(role?.sect), remaining: board?.remaining ?? null,
@@ -1897,7 +1904,7 @@
         fighting: board ? fighting : null, unclaimed: board ? unclaimed : null,
         fragments: board ? array(board.fragments).filter(f => f.count > 0).map(({ name, count }) => ({ name, count })) : null,
         today: Object.fromEntries(['visits','joined','created','fights','claimed','won','lost'].map(k => [k, num(daily?.[k])])),
-        nextVisitAt: exhausted ? board.endsAt + 30000 : daily?.visitAt ? daily.visitAt + prefs.invasion.intervalMinutes * 60000 : now,
+        nextVisitAt: exhausted ? board.endsAt + INVASION_ROUND_DELAY : Math.min(regular, roundStart),
         boardAt: s?.invasion?.at ?? null };
     }
     function invasionPlan(s, p, ledger, now) {
@@ -1908,8 +1915,8 @@
       const daily = !ledger.day || ledger.invasion?.day === ledger.day ? ledger.invasion : null;
       const status = invasionStatus(s, p, daily, now), board = s.invasion?.board;
       if (!s.invasionVisit && now < status.nextVisitAt) return null;
-      const request = (name, extra, label) => action('XIAOXIAO_COMMAND', { action: name, ...extra }, '宵小入侵：' + label,
-        'invasion', { requiresTown: true, townId: 6, readOnly: ['open', 'report'].includes(name), responseType: 'XIAOXIAO_RESPONSE' });
+      const request = (name, extra, label, more = {}) => action('XIAOXIAO_COMMAND', { action: name, ...extra }, '宵小入侵：' + label,
+        'invasion', { requiresTown: true, townId: 6, readOnly: ['open', 'report'].includes(name), responseType: 'XIAOXIAO_RESPONSE', ...more });
       if (!board || num(s.role.mapId) !== 6 || num(s.invasion.mapId ?? s.role.mapId) !== 6 || !Number.isFinite(status.boardAt) ||
           now - status.boardAt > 30000 || (status.boardAt < board.endsAt && now >= board.endsAt) || s.invasionVisit?.travel)
         return request('open', { page: 0 }, '查看面板');
@@ -1917,17 +1924,26 @@
       const run = options.claim && array(board.runs).find(r => r.status === 'FINISHED' && !r.claimed && !refused?.runs.includes(r.id));
       if (run) return daily?.reports.includes(run.id) ? request('claim', { runId: run.id }, '领取奖励') :
         request('report', { runId: run.id }, '读取战报');
-      if (!status.team && !status.fighting && board.remaining > 0 && now < board.endsAt - 10000 &&
-          (!options.maxRunsPerDay || status.today.fights < options.maxRunsPerDay)) {
-        const team = options.join && array(board.teams).find(t => t.status === 'RECRUITING' && !refused?.teams.includes(t.id) &&
+      const finished = { kind: 'visitFinished', family: 'invasion', label: '宵小入侵：查看完毕' };
+      if (status.team || status.fighting || (options.maxRunsPerDay && status.today.fights >= options.maxRunsPerDay)) return finished;
+      // The board still shows a round the server has ended: the next one has not started yet.
+      const roundOver = now >= board.endsAt;
+      if (!roundOver && board.remaining > 0 && now < board.endsAt - 10000) {
+        // Leading comes first; a disciple of another sect, or one refused leading this round, joins a team.
+        if (status.ownSect && !refused?.rounds.includes(board.roundId) && !s.invasionPriorRefused?.rounds.includes(board.roundId))
+          return request('create', {}, '带队（本门派受袭）');
+        const team = array(board.teams).find(t => t.status === 'RECRUITING' && !refused?.teams.includes(t.id) &&
           !s.invasionPriorRefused?.teams.includes(t.id) &&
           t.members.length < 4 && t.members.every(m => Math.abs(m.level - s.role.level) <= 20));
         if (team) return request('join', { teamId: team.id }, '加入「' +
           (team.members.find(m => m.roleId === team.leaderId)?.name || '队长') + '」的队伍（' + team.members.length + '/4）');
-        if (options.create && status.ownSect && !refused?.rounds.includes(board.roundId) && !s.invasionPriorRefused?.rounds.includes(board.roundId))
-          return request('create', {}, '带队（本门派受袭）');
       }
-      return { kind: 'visitFinished', family: 'invasion', label: '宵小入侵：查看完毕' };
+      // Nothing to lead or join yet: stay in 大理 and look again every 5 s, as the game window does.
+      const waitUntil = num(s.invasionVisit?.at) + options.waitSeconds * 1000;
+      if (!s.invasionVisit || now >= waitUntil || (!roundOver && !(board.remaining > 0))) return finished;
+      if (now - status.boardAt >= 5000) return request('open', { page: 0 }, '等待队伍', { quiet: true });
+      return { kind: 'invasionWait', family: 'invasion', key: 'invasion:wait',
+        label: '宵小入侵：等待队伍（还剩 ' + Math.ceil((waitUntil - now) / 1000) + ' 秒）' };
     }
     function farmMap(map) {
       return !!map && num(map.mapType) !== 1 && map.show !== false &&
@@ -7023,7 +7039,7 @@
             if (++visit.refusals >= 3) this.finishInvasion();
           }
         } else {
-          this.log(a.label + '：完成', 'success');
+          if (!a.quiet) this.log(a.label + '：完成', 'success');
           if (action === 'join') {
             daily.joined++;
             const team = data.board?.teams?.find(t => t.id === teamId);
@@ -7675,7 +7691,7 @@
           this.reason = a.label;
         }
         if (a.family === 'invasion') {
-          this.invasionVisit ||= { refusals: 0, travelAttempts: 0 };
+          this.invasionVisit ||= { refusals: 0, travelAttempts: 0, at: Date.now() };
           if (a.payload.action === 'join' || a.payload.action === 'create') {
             this.invasionAwaitPush = false;
             this.invasionVisit.joinPush = false;
@@ -7686,7 +7702,7 @@
           this.ledger.tianlingUsedAt = Date.now();
           this.saveLedger();
         }
-        if (!queryBatch?.multiple) this.log(a.label);
+        if (!queryBatch?.multiple && !a.quiet) this.log(a.label);
         this.paint();
         try {
           const result = await this.bridge.request(a, this.responseTimeout());
@@ -8200,6 +8216,11 @@
         if (candidate) {
           if (candidate.kind === 'visitFinished') {
             this.finishInvasion();
+            return;
+          }
+          if (candidate.kind === 'invasionWait') {
+            this.reason = candidate.label;
+            this.paint();
             return;
           }
           if (candidate.family === 'rings' && candidate.requiresTown &&
@@ -10403,14 +10424,14 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
               help: '56 级开放。在楼兰何悦处从第一环打起，每环 5 枚神兵符，每环每天最多领 2 次；失败后从第一环重开。三环没有经验，双倍经验期间不开新一轮；自动使用天灵丹会等当天的三环打完。' }) +
             g('宵小入侵',
             f('自动参加宵小入侵', 'invasion.enabled') +
-            f('加入招募中的队伍', 'invasion.join', { dependsOn: 'invasion.enabled' }) +
-            f('本门派受袭时带队', 'invasion.create', { dependsOn: 'invasion.enabled' }) +
             f('结算后领取奖励', 'invasion.claim', { dependsOn: 'invasion.enabled' }) +
-            f('回大理间隔', 'invasion.intervalMinutes', { min: 3, max: 120, unit: '分钟', dependsOn: 'invasion.enabled' }) +
+            f('回大理间隔', 'invasion.intervalMinutes', { min: 1, max: 120, unit: '分钟', dependsOn: 'invasion.enabled' }) +
+            f('每次等待队伍', 'invasion.waitSeconds', { min: 0, max: 1800, unit: '秒（0 不等）', dependsOn: 'invasion.enabled',
+              help: '没有能加入的队伍时，留在大理每 5 秒看一次，等这么久还没有就回去挂机' }) +
             f('每日参战上限', 'invasion.maxRunsPerDay', { min: 0, max: 200, unit: '场（0 不限）', dependsOn: 'invasion.enabled' }) +
             '<div class="invasion-status">' + this.invasionHTML(status.invasion) + '</div>', false, {
               fieldKeywords: '宵小入侵',
-              help: '每两小时一轮，全服每轮 10 场。四人满员自动开战。服务器模拟战斗，开战时一次扣除整场药品。参加后可以照常挂机。脚本按间隔回大理，每次打断挂机十几秒。只有受袭门派的弟子能带队。可在此查看残页。' });
+              help: '每两小时一轮，全服每轮 10 场。四人满员自动开战。服务器模拟战斗，开战时一次扣除整场药品。参加后可以照常挂机。脚本按间隔回大理，新一轮开始时立刻回去。本门派受袭时先带队，其他门派（或本轮带队被拒）就加入招募中的队伍。可在此查看残页。' });
         }
         if (this.section === 'growth')
           html =
