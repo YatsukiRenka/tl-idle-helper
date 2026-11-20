@@ -28,7 +28,7 @@
   const slots = s => (s?.monsterSlots || []).filter(Boolean);
   const solo = s => !s.pet || s.pet.isDead || !(s.pet.currentHp > 0);
   const soloDefaults = () => ({ os: [0, 0, 0, 0, 0], solo: 0 });
-  const logDefaults = () => ({ ol: [0, 0, 0, 0], olk: {}, art: {}, artUp: 0 });
+  const logDefaults = () => ({ ol: [0, 0, 0, 0], olk: {}, art: {}, artUp: 0, fk: {} });
   function hash(value) {
     let h = 2166136261;
     for (const c of JSON.stringify(value)) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
@@ -196,14 +196,37 @@
     floating(s, prev, b, hits = new Map()) {
       this.skill = '';
       const before = b.o.slice();
-      const last = new Map(), pending = [], monsters = [...slots(s), ...slots(prev)];
-      for (const e of Array.isArray(s.floating) ? s.floating : []) this.event(e, s, monsters, b, last, pending);
-      // A hit log carries the floating total (main and elemental); labels prefer it, then this packet's announcement.
-      for (const [incoming, mk, n, elemental, crit] of pending)
-        this.sample(s, incoming, mk, n, crit, (!incoming && hits.get(n)) || this.skill, elemental);
+      const last = new Map(), pending = [], monsters = [...slots(s), ...slots(prev)], marks = { hits: new Map(), elemental: new Map() };
+      for (const e of Array.isArray(s.floating) ? s.floating : []) this.event(e, s, monsters, b, last, pending, marks);
+      // The server's skill mark names the skill; else a hit log with the same damage, then this packet's announcement.
+      for (const [incoming, mk, n, elemental, crit, marked] of pending)
+        this.sample(s, incoming, mk, n, crit, marked || (!incoming && hits.get(n)) || this.skill, elemental);
       if (solo(s)) b.os = b.os.map((n, i) => n + b.o[i] - before[i]);
     }
-    event(e, s, monsters, b, last, pending) {
+    // The server marks the first hit of a skill on a target with its source and skill id; the further hits of a
+    // multi-hit skill on that target follow unmarked (seen live on 2026-11-20), so they take over the mark.
+    tag(e, s, tags) {
+      if (e.hitSourceId == null || e.hitSkillId == null) {
+        const t = tags.get(e.ownerId);
+        if (!t || t.left <= 0) { tags.delete(e.ownerId); return null; }
+        t.left--;
+        return t;
+      }
+      const id = String(e.hitSourceId);
+      if (id !== 'player') return id === s.pet?.id || id.startsWith('pet-') ? { key: 'pet:' + e.hitSkillId, source: 'pet', name: '', left: 0 } : null;
+      // Only the player's multi-hit skills leave unmarked hits, so a pet's hit in between keeps the player's mark.
+      const skill = (s.player.skills || []).find(x => x.id === e.hitSkillId);
+      const t = { key: 'player:' + e.hitSkillId, source: 'player', name: skill?.name || '', left: Math.max(0, (Number(skill?.hitCount) || 1) - 1) };
+      tags.set(e.ownerId, t);
+      return t;
+    }
+    // Per source and skill: [hits, crits, main damage, elemental damage].
+    marked(b, key) {
+      if (!Object.hasOwn(b.fk, key) && Object.keys(b.fk).length < 40)
+        Object.defineProperty(b.fk, key, { value: [0, 0, 0, 0], enumerable: true, writable: true, configurable: true });
+      return Object.hasOwn(b.fk, key) ? b.fk[key] : null;
+    }
+    event(e, s, monsters, b, last, pending, marks = { hits: new Map(), elemental: new Map() }) {
       if (!e || typeof e.text !== 'string' || typeof e.ownerId !== 'string') return;
       const incoming = e.ownerId === 'player', m = monsters.find(x => x.id === e.ownerId);
       const pet = e.ownerId === s.pet?.id || e.ownerId.startsWith('pet-player-');
@@ -216,13 +239,25 @@
       if (e.text === 'Miss') { a[1]++; return; }
       if (!/^[0-9]+!?$/.test(e.text)) return;
       const n = parseInt(e.text, 10);
-      if (e.color === '#ff7043') { a[4] += n; if (last.has(e.ownerId)) last.get(e.ownerId)[3] += n; return; }
+      if (e.color === '#ff7043') {
+        a[4] += n;
+        if (last.has(e.ownerId)) last.get(e.ownerId)[3] += n;
+        const t = !incoming && !pet && marks.elemental.get(e.ownerId), k = t && this.marked(b, t.key);
+        if (k) k[3] += n;
+        return;
+      }
       const crit = e.text.endsWith('!') ? 1 : 0;
       a[0]++; a[2] += crit; a[3] += n;
       if (pet) return;
+      const t = incoming ? null : this.tag(e, s, marks.hits);
+      // The elemental part follows its main hit and belongs to the same mark, or to none.
+      if (!incoming) marks.elemental.set(e.ownerId, t);
+      if (t) { const k = this.marked(b, t.key); if (k) { k[0]++; k[1] += crit; k[2] += n; } }
+      // A pet's hit is no sample of the player's damage.
+      if (t?.source === 'pet') { last.delete(e.ownerId); return; }
       // The number does not say which monster hit; the analysis matches it against every living type.
       const mk = incoming ? [...new Set(slots(s).filter(x => !x.isDead).map(keyOf))].sort().join(',') : keyOf(m);
-      const row = [incoming, mk, n, 0, crit];
+      const row = [incoming, mk, n, 0, crit, t?.name || ''];
       last.set(e.ownerId, row); pending.push(row);
     }
     specialEvent(e, incoming, pet, monster, b) {
