@@ -9083,8 +9083,8 @@
 .hud.compact,:host([data-theme="light"]){--bg:#f3f3f3;--surface:#ffffff;--surface-alt:#ebebeb;--control:#ffffff;--stroke:#d6d6d6;--stroke-strong:#868686;--divider:#e6e6e6;--text:#1a1a1a;--text-strong:#000000;--text-2:#5a5a5a;--text-3:#767676;--accent:#c99a1c;--accent-hover:#b98a12;--on-accent:#1f1700;--accent-text:#7d5800;--accent-soft:rgba(201,154,28,.16);--ok:#0f7b0f;--warn:#9a5b00;--err:#c42b1c;--hover:rgba(0,0,0,.045);--pressed:rgba(0,0,0,.025);--shadow:0 16px 40px rgba(0,0,0,.16);color-scheme:light}
 :host{all:initial;font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;color:var(--text);font-size:13px;line-height:1.5;font-variant-numeric:tabular-nums}
 *{box-sizing:border-box}[hidden]{display:none!important}
-.update-backdrop{position:fixed;inset:0;z-index:2;pointer-events:auto;display:grid;place-items:center;padding:16px;background:color-mix(in srgb,var(--on-accent) 55%,transparent)}
-.update-dialog{width:min(480px,100%);max-height:100%;overflow:auto;overscroll-behavior:contain;overflow-wrap:anywhere;padding:20px;border:1px solid var(--stroke);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}
+.update-dialog{pointer-events:auto;box-sizing:border-box;width:min(522px,calc(100% - 32px));max-width:none;max-height:calc(100% - 32px);margin:auto;color:inherit;font:inherit;overflow:auto;overscroll-behavior:contain;overflow-wrap:anywhere;padding:20px;border:1px solid var(--stroke);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}
+.update-dialog::backdrop{background:color-mix(in srgb,var(--on-accent) 55%,transparent)}
 .update-dialog h2{margin:0 0 12px;color:var(--text-strong)}
 .transfer-changes{max-height:38vh;overflow:auto;overscroll-behavior:contain}
 .transfer-role{margin-top:8px;padding:8px;border:1px solid var(--stroke-strong);border-radius:8px}.transfer-role h4{margin:0 0 4px}
@@ -10186,7 +10186,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         this.showDialog(html, close, index => index ? this.saveTransfer(file) : close());
         if (file.kind !== 'full') return;
         this.paintScope(file);
-        this.updateBackdrop.addEventListener('input', () => this.paintScope(file));
+        this.modal.addEventListener('input', () => this.paintScope(file));
       }
       mergeHTML(plan) {
         const name = entry => '角色 ' + entry.role + (entry.current ? '（当前角色）' : '');
@@ -10209,12 +10209,12 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           '<div class="transfer-scope" hidden></div>';
       }
       transferChoices() {
-        const picked = kind => [...(this.updateBackdrop?.querySelectorAll('input[data-overwrite="' + kind + '"]') || [])]
+        const picked = kind => [...(this.modal?.querySelectorAll('input[data-overwrite="' + kind + '"]') || [])]
           .filter(input => input.checked).map(input => Number(input.value));
         return { settings: picked('settings'), records: picked('records') };
       }
       paintScope(file) {
-        const line = this.updateBackdrop?.querySelector('.transfer-scope');
+        const line = this.modal?.querySelector('.transfer-scope');
         if (!line) return;
         const { scope } = TLPolicy.transferMergeData(file.local, file, file.role, this.transferChoices());
         const changed = scope.before !== scope.after;
@@ -10815,14 +10815,13 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       dialogHTML(title, body, buttons, primaryIndex) {
         const button = (label, index) => '<button type="button" class="btn' +
           (index === primaryIndex ? ' primary' : '') + '">' + esc(label) + '</button>';
-        return '<section class="update-dialog" role="alertdialog" aria-modal="true" aria-labelledby="important-update-title">' +
-          '<h2 id="important-update-title">' + esc(title) + '</h2>' + body +
-          '<div class="actions">' + buttons.map(button).join('') + '</div></section>';
+        return '<h2 id="important-update-title">' + esc(title) + '</h2>' + body +
+          '<div class="actions">' + buttons.map(button).join('') + '</div>';
       }
       hideUpdateDialog() {
-        if (!this.updateBackdrop) return;
-        this.updateBackdrop.remove();
-        this.updateBackdrop = null;
+        if (!this.modal) return;
+        this.modal.remove();
+        this.modal = null;
         this.transfer = null;
         this.updateDialogKey = null;
         this.dialogReturnFocus?.focus({ preventScroll: true });
@@ -10846,35 +10845,43 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         this.dialogReturnFocus = this.root.activeElement || document.activeElement;
         while (this.dialogReturnFocus?.shadowRoot?.activeElement)
           this.dialogReturnFocus = this.dialogReturnFocus.shadowRoot.activeElement;
-        const backdrop = document.createElement('div');
-        backdrop.className = 'update-backdrop';
-        backdrop.innerHTML = html;
-        this.updateBackdrop = this.root.appendChild(backdrop);
-        this.bindUpdateDialog(backdrop, close, choose);
-        backdrop.querySelector('button').focus();
+        const dialog = document.createElement('dialog');
+        dialog.className = 'update-dialog';
+        dialog.setAttribute('role', 'alertdialog');
+        dialog.setAttribute('aria-labelledby', 'important-update-title');
+        dialog.innerHTML = html;
+        this.modal = this.root.appendChild(dialog);
+        this.bindUpdateDialog(dialog, close, choose);
+        // The top layer keeps it above the game, and the page behind it is inert, so focus stays inside.
+        dialog.showModal();
+        dialog.querySelector('button').focus();
       }
-      bindUpdateDialog(backdrop, close, choose) {
-        const buttons = [...backdrop.querySelectorAll('button')], focusable = [...backdrop.querySelectorAll('input, button')];
-        backdrop.addEventListener('click', event => {
+      bindUpdateDialog(dialog, close, choose) {
+        const buttons = [...dialog.querySelectorAll('button')];
+        dialog.addEventListener('click', event => {
           event.stopPropagation();
           const button = event.target.closest('button');
           if (!button) return;
           return choose(buttons.indexOf(button));
         });
-        backdrop.addEventListener('keydown', event => {
+        // Events inside the dialog still bubble to the game's listeners on the document.
+        dialog.addEventListener('keydown', event => {
           event.stopPropagation();
-          if (event.key !== 'Escape' && event.key !== 'Tab') return;
+          if (event.key !== 'Escape') return;
           event.preventDefault();
-          if (event.key === 'Escape') return close();
-          const next = focusable.indexOf(event.target) + (event.shiftKey ? -1 : 1);
-          focusable[(next + focusable.length) % focusable.length].focus();
+          close();
         });
-        backdrop.addEventListener('mousedown', event => {
+        // Other close requests, such as the Android back gesture.
+        dialog.addEventListener('cancel', event => {
+          event.preventDefault();
+          close();
+        });
+        dialog.addEventListener('mousedown', event => {
           event.stopPropagation();
           if (!event.target.closest('button')) event.preventDefault();
         });
         for (const type of ['keyup', 'keypress', 'pointerdown', 'pointerup', 'mouseup', 'dblclick', 'wheel'])
-          backdrop.addEventListener(type, event => event.stopPropagation());
+          dialog.addEventListener(type, event => event.stopPropagation());
       }
       updateHTML(u) {
         const date = (value) => value ? new Date(value).toLocaleString() : '—';
