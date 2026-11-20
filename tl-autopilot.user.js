@@ -4195,12 +4195,16 @@
         },
       };
     }
+    // The server answers in well under 0.1 s and takes requests back to back (measured 2026-11-20), so an action
+    // follows the previous answer after a short gap, and a town errand follows the end of a fight shortly.
+    const ACTION_GAP_MS = 300, TOWN_IDLE_MS = 500;
     function createTicker(fn, onFallback) {
       let worker = null, t = 0, ms = 0, mode = 'main';
       if (typeof Worker === 'function')
         try {
           worker = new Worker(URL.createObjectURL(new Blob([
-            'let t=0;onmessage=e=>{clearInterval(t);t=e.data>0?setInterval(()=>postMessage(0),e.data):0;};',
+            'let t=0;onmessage=e=>{if(Array.isArray(e.data)){setTimeout(()=>postMessage(0),e.data[0]);return;}' +
+              'clearInterval(t);t=e.data>0?setInterval(()=>postMessage(0),e.data):0;};',
           ], { type: 'application/javascript' })));
           mode = 'worker';
           worker.onmessage = () => fn();
@@ -4226,6 +4230,12 @@
           ms = 0;
           if (mode === 'worker') worker.postMessage(0);
           else clearInterval(t);
+        },
+        // One extra tick after `delay` ms while the ticker runs.
+        soon(delay) {
+          if (!(ms > 0)) return;
+          if (mode === 'worker') worker.postMessage([delay]);
+          else setTimeout(fn, delay);
         },
         get mode() {
           return mode;
@@ -7947,6 +7957,8 @@
             this.action = null;
             this.busy = false;
             this.lastLocal = Date.now();
+            // The next action need not wait for the next regular tick.
+            this.timer?.soon?.(ACTION_GAP_MS + 20);
           }
           this.resumeAfterLateResponse();
           this.paint();
@@ -8066,7 +8078,7 @@
           this.paint();
           return;
         }
-        const actionBlocked = this.busy || now - this.lastLocal < 1200;
+        const actionBlocked = this.busy || now - this.lastLocal < ACTION_GAP_MS;
         if (this.uncertain) {
           if (actionBlocked) return;
           this.reason = '等待重新读取角色，核对上个动作结果';
@@ -8242,9 +8254,10 @@
           }
           if (!this.idleSince) {
             this.idleSince = now;
+            this.timer?.soon?.(TOWN_IDLE_MS + 20);
             return;
           }
-          if (now - this.idleSince < 1500) return;
+          if (now - this.idleSince < TOWN_IDLE_MS) return;
           if (candidate.requiresTown) {
             const town = errandTown(candidate);
             if (!town) return;
