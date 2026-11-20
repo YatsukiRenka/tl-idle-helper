@@ -967,7 +967,8 @@
         weaponId(array(state.equipments).filter((e) => !!e.isEquipped)),
         array(state.skills).map((s) => [s.currentLevel, s.skillDetail]),
         state.monsters.map((m) => [m.category, m.level, m.base, m.weight]), array(state.artifactSkills),
-        state.aoeTargets, state.survival?.weight, prefs.gear.scoring, prefs.gear.autoDefense, prefs.gear.defenseWeight]);
+        state.aoeTargets, state.survival?.weight, petOwnerBuffs(state), petShareOf(state),
+        prefs.gear.scoring, prefs.gear.autoDefense, prefs.gear.defenseWeight]);
       if (scoringPass?.state === state) scoringPass.contexts.set(gear, key);
       return key;
     }
@@ -1000,6 +1001,22 @@
       }
       return { defenseMult, stun };
     }
+    // The summoned pet's 借力, 凝神 and 强身 add to its owner for 60 s every 60 s, so all the time; finalAttributes
+    // leaves them out. Formula of the client's pet window, matched against live buffs on 2026-11-20.
+    const PET_OWNER_BUFFS = { 借力: ['extAtk', 0.15], 凝神: ['intAtk', 0.15], 强身: ['hp', 0.1] };
+    function petOwnerBuffs(state) {
+      const pets = state?.pets, entry = array(pets?.pets).find((e) => e?.pet?.id != null && e.pet.id === pets.activePetId);
+      const out = {};
+      for (const name of array(entry?.pet?.skills)) {
+        const [attr, rate] = PET_OWNER_BUFFS[name] || [];
+        const value = attr ? Math.round(num(entry.baseStats?.[attr]) * rate * num(entry.percentages?.[attr]) / 100) : 0;
+        if (value > 0) out[attr] = (out[attr] || 0) + value;
+      }
+      return out;
+    }
+    // The pet's own damage does not change with the owner's gear: a measured share of the damage becomes a fixed
+    // part of the output, so attack gear is not valued as if the owner dealt all of it.
+    const petShareOf = (state) => Number.isFinite(state?.petShare) ? Math.max(0, Math.min(0.9, state.petShare)) : 0;
     function combatContext(state, prefs) {
       if (!state || !prefs) return null;
       let cache = combatCache.get(state);
@@ -1070,6 +1087,8 @@
         }
       }
       casts.push(cast(filler, filler ? Math.max(0, 1 - used) : 1));
+      const petBuffs = petOwnerBuffs(state);
+      addStats(buffs, petBuffs);
       const normal = state.scoringProfile ? [] : state.monsters.filter((m) => m.category === 'MONSTER');
       const ctx = { me, ...enemyEffects(skills, state), targets: (normal.length ? normal : state.monsters).map((m) =>
         ({ level: num(m.level), base: copyScoringInput(m.base), weight: m.weight })), casts, buffs, buffMult, elementMult, statMult,
@@ -1078,6 +1097,8 @@
         memos: { equipment: new Map(), gain: new Map(), stat: new Map(), character: new Map() },
         defenseWeight: prefs.gear.autoDefense && Number.isFinite(state.survival?.weight)
           ? state.survival.weight : prefs.gear.defenseWeight };
+      const share = petShareOf(state);
+      ctx.pet = { buffs: petBuffs, share, out: share > 0 ? share / (1 - share) * combatParts(me, ctx).out : 0 };
       cache.set(prefs, { key, ctx });
       combatContexts.set(key, ctx);
       if (combatContexts.size > 8) combatContexts.delete(combatContexts.keys().next().value);
@@ -1158,7 +1179,7 @@
       return combatPartsValue(combatParts(values, ctx), ctx);
     }
     function combatPartsValue(p, ctx) {
-      return p.out * (p.taken > 0 && p.hp > 0 ? (p.hp / p.taken) ** ctx.defenseWeight : 1);
+      return (p.out + (ctx.pet?.out || 0)) * (p.taken > 0 && p.hp > 0 ? (p.hp / p.taken) ** ctx.defenseWeight : 1);
     }
     const SCORE_ATTRIBUTES = Object.entries({ hp: '气血', extAtk: '外攻', intAtk: '内攻', extDef: '外防', intDef: '内防', critRate: '会心', critDef: '会防', avoidance: '闪避', precision: '命中', iceAtk: '冰攻', fireAtk: '火攻', poisonAtk: '毒攻', holyAtk: '玄攻', iceDef: '冰抗', fireDef: '火抗', poisonDef: '毒抗', holyDef: '玄抗' });
     const SET_EFFECT_NAMES = new Map([...SCORE_ATTRIBUTES, ['allAtk', '全属性攻击'], ['allDef', '全属性抗性']]);
@@ -1169,7 +1190,7 @@
       const ctx = combatContext(state, prefs);
       if (!ctx) return null;
       return { value: combatValue(ctx.me, ctx), parts: combatParts(ctx.me, ctx), weight: ctx.defenseWeight,
-        buffMult: ctx.buffMult,
+        buffMult: ctx.buffMult, ...(ctx.pet.share > 0 || Object.keys(ctx.pet.buffs).length ? { pet: ctx.pet } : {}),
         character: characterScore(state.finalAttributes, state, prefs),
         rows: SCORE_ATTRIBUTES.map(([key, name]) => ({ key, name, current: ctx.me[key],
           one: statScore({ [key]: 1 }, state, prefs), hundred: statScore({ [key]: 100 }, state, prefs) })) };
@@ -1226,7 +1247,7 @@
           const percent = (a, b) => a > 0 ? (b - a) / a * 100 : b > 0 ? 100 : 0;
           const survival = (p) => p.taken > 0 ? p.hp / p.taken : 0;
           return { current, after, gain: after - current, percent: percent(current, after),
-            outputPercent: percent(beforeParts.out, afterParts.out),
+            outputPercent: percent(beforeParts.out + ctx.pet.out, afterParts.out + ctx.pet.out),
             survivalPercent: percent(survival(beforeParts), survival(afterParts)),
           };
         }) };
@@ -3881,7 +3902,7 @@
       RINGS_MAP_IDS, ASSAULT_PROFILES, ASSAULT_IDS, PROFILE_IDS, longLabel, mapProfile, keptFloors,
       assaultTargets, assaultWeight, assaultAvailable, profileView, gearProfileTarget,
       combatSignature, profileLabel, profileLocked, profileWearable, gearChange, RING_NAMES, ringStage, ringsStatus, ringsPlan,
-      invasionPlan, invasionDaily, invasionStatus,
+      invasionPlan, invasionDaily, invasionStatus, petOwnerBuffs,
       farmMap,
       fieldMap,
       gearCheckStart, gearCheckAfter, gearCheckVerdict, gearCheckRestored, gearCheckRollback, gearRejected, gearCheckText,
@@ -4276,7 +4297,8 @@
         survival = P.survivalWeight(pressure, heal), held = bridge.scoringHold;
       if (!held || now - held.at >= 60000 || held.mapId !== s.lastMapId ||
           (held.survival === null) !== (survival === null))
-        bridge.scoringHold = { at: now, mapId: s.lastMapId, survival, aoeTargets: s.aoeTargets };
+        bridge.scoringHold = { at: now, mapId: s.lastMapId, survival, aoeTargets: s.aoeTargets,
+          petShare: Number.isFinite(bridge.petShare?.(s.maps)) ? Math.round(bridge.petShare(s.maps) * 100) / 100 : null };
       const profileStats = {};
       if (!untracked && prefs.gear.assault?.enabled && prefs.gear.scoring === 'combat') {
         for (const id of P.ASSAULT_IDS) profileStats[id] = { alive: bridge.cache.profileTargets?.[id]?.alive ?? 1 };
@@ -4293,7 +4315,7 @@
       return { ...(untracked ? {} : { profileStats }), aoeTargets: bridge.scoringHold.aoeTargets, monsters: selected.list, scoreTargets: { source: selected.source, mapIds: selected.mapIds },
         monsterTemplates: s.monsterTemplates, monsterTemplatesAt: bridge.cache.monsterTemplatesAt,
         survivalReason: !heal ? 'potions' : pressure?.battle < 1800000 ? 'data' : undefined,
-        survival: bridge.scoringHold.survival };
+        survival: bridge.scoringHold.survival, petShare: bridge.scoringHold.petShare ?? null };
     }
     function farmTargets(targets, maps) {
       return P.farmMap(P.array(maps).find((map) => P.num(map.id) === P.num(targets?.mapId)))
@@ -4481,7 +4503,9 @@
           this.buckets = Object.fromEntries(Object.entries(saved.buckets).map(([k, b]) => [k, { ...b,
             battle: saved.version === 1 && b.battle > 0 && b.hpLost === 0 && b.kills === 0 ? 0 : b.battle,
             low: saved.version === 1 ? 0 : b.low ?? 0,
-            potionHp: Number.isFinite(b.potionHp) && b.potionHp >= 0 ? b.potionHp : undefined }]));
+            potionHp: Number.isFinite(b.potionHp) && b.potionHp >= 0 ? b.potionHp : undefined,
+            petDmg: Number.isFinite(b.petDmg) && b.petDmg >= 0 ? b.petDmg : undefined,
+            ownDmg: Number.isFinite(b.ownDmg) && b.ownDmg >= 0 ? b.ownDmg : undefined }]));
         const p = saved?.pressureFrom;
         if (p && Number.isFinite(p.at) && p.at >= 0 && p.hour === Math.floor(p.at / 3600000) &&
           p.base && typeof p.base === 'object' && !Array.isArray(p.base) &&
@@ -4618,9 +4642,36 @@
         if (low) b.low += dt;
         b.hpLost += hpLost;
         b.mpUsed += mpUsed;
+        this.damage(d, b);
         this.window.push({ time: d.serverTime, dt, hpLost, mpUsed, currentHp: d.player.currentHp,
           maxHp: d.player.base.hp, maxMp: d.player.base.mp });
         this.trim();
+      }
+      // The server marks a pet's damage numbers with the pet's id (client of 2026-11-20); every other number on a
+      // monster is the owner's, the unmarked further hits of a multi-hit skill included. An elemental number
+      // belongs to the main hit before it.
+      damage(d, b) {
+        const last = new Map();
+        for (const f of P.array(d.floating)) {
+          if (typeof f?.ownerId !== 'string' || !f.ownerId.startsWith('m-') || !/^\d+!?$/.test(f.text)) continue;
+          const pet = f.color === '#ff7043' ? last.get(f.ownerId) === 'pet' : String(f.hitSourceId ?? '').startsWith('pet-');
+          if (f.color !== '#ff7043') last.set(f.ownerId, pet ? 'pet' : 'own');
+          const field = pet ? 'petDmg' : 'ownDmg';
+          b[field] = (b[field] || 0) + parseInt(f.text, 10);
+        }
+      }
+      // The pet's share of the damage over the latest two battle hours that carry the marks, or null below 10 minutes.
+      petShare(isFarmMap) {
+        const byHour = Map.groupBy(Object.entries(this.buckets), ([key]) => Number(key.split(':')[0]));
+        let pet = 0, own = 0, battle = 0;
+        for (const hour of Array.from(byHour.keys()).sort((a, b) => b - a)) {
+          for (const [key, bucket] of byHour.get(hour)) {
+            if (!(bucket.ownDmg > 0 || bucket.petDmg > 0) || !isFarmMap(Number(key.split(':')[1]))) continue;
+            pet += P.num(bucket.petDmg); own += P.num(bucket.ownDmg); battle += bucket.battle;
+          }
+          if (battle >= 7200000) break;
+        }
+        return battle >= 600000 && pet + own > 0 ? pet / (pet + own) : null;
       }
       trim() {
         const end = Math.max(this.now(), this.window.at(-1)?.time || 0);
@@ -6586,6 +6637,7 @@
         this.bridge.scoringPrefs = () => this.prefs;
         this.bridge.profilePressure = (name) => this.stats?.pressure((id) => P.mapProfile(id) === name);
         this.bridge.pressure = (maps) => this.stats?.pressure((id) => P.farmMap(P.array(maps).find((m) => P.num(m.id) === id)));
+        this.bridge.petShare = (maps) => this.stats?.petShare((id) => P.farmMap(P.array(maps).find((m) => P.num(m.id) === id)));
         window.addEventListener('pagehide', () => {
           if (storageBlocked) return;
           this.stats?.flush();
@@ -11031,6 +11083,10 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           if (Object.keys(detail.buffMult || {}).length)
             html += '<div class="block-title">技能倍数增益</div>' + Object.entries(detail.buffMult).map(([key, value]) =>
               this.statRow(names[key] || key, '× ' + value.toFixed(3))).join('');
+          const petBuffs = Object.entries(detail.pet?.buffs || {});
+          html += this.statRow('珍兽加成', petBuffs.length ? petBuffs.map(([key, value]) => (names[key] || key) + ' +' + value).join('、') : '—') +
+            this.statRow('珍兽伤害占比', detail.pet?.share > 0 ? (detail.pet.share * 100).toFixed(0) + '%' : '—', {
+              help: '按服务器标记实测最近两个战斗小时；珍兽的伤害不随换装变化，评分把它当作固定输出' });
           if (detail.parts.artifact)
             html += this.statRow('神器技能', detail.parts.artifact.skillName) +
               this.statRow('覆盖率', (detail.parts.artifact.uptime * 100).toFixed(1) + '%');
