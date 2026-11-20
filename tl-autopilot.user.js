@@ -170,7 +170,7 @@
         fieldCheck: true, fieldMinutes: 20, fieldDropPercent: 5,
       },
       market: { sort: 'off', showScore: true, bagScore: true, tipScore: true, tipBound: true,
-        bagFilter: true, setTag: true, tipSet: true, scoreType: 'combat', bagScoreType: 'combat' },
+        bagFilter: true, setTag: true, tipSet: true, scoreType: 'combat', bagScoreType: 'combat', hideUnbuyable: false },
       convenience: { sortDeposit: true, ctrlDeposit: true, depositKeys: 'ctrl', sellWarehouse: false, sellKeys: 'alt' },
       sell: {
         enabled: true,
@@ -2116,6 +2116,12 @@
       const entry = collectionValues(entries).find((v) => num(v.role.id) === num(props.roleOverride?.id));
       return viewedState({ ...entry, ...props }, own);
     }
+    // The game's rule for its buy button: not the role's own listing, and no buyer named other than the role.
+    function listingBuyable(item, role) {
+      if (!item || !role) return true;
+      if (num(item.sellerRoleId) === num(role.id)) return false;
+      return !item.targetNickname || item.targetNickname === role.nickname;
+    }
     // Since the client of 2026-11-19 the server answers GET_PLAYER_INFO without skills: a cached answer without them.
     function viewedSkillsMissing(props, entries) {
       if (!isViewedProfile(props) || Array.isArray(props.roleOverride?.skills)) return false;
@@ -3875,7 +3881,7 @@
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
-      viewedState, isViewedProfile, viewedSkillsMissing, profileState, profileScoreText, profileScoreValue, tooltipContext,
+      viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileState, profileScoreText, profileScoreValue, tooltipContext,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       transferKind, transferKeyRole, transferMerge, transferMergeData,
       CRIT_BASE, CRIT_RATE, CRIT_FLOOR, CRIT_DEF_OFFSET, CRIT_DEF_RATE, CRIT_DEF_DIVISOR, critMultiplier,
@@ -5706,19 +5712,68 @@
           return Number(y.equipment) - Number(x.equipment) || y.value - x.value || (b.id || 0) - (a.id || 0);
         };
       }
+      static listings(list) {
+        const first = raw(raw(list).find((it) => it != null));
+        return !!first && typeof first === 'object' && 'sellerName' in first && 'price' in first;
+      }
       static sortHook(original, isOpen, market) {
         return function (compare) {
           let selected = compare;
           try {
-            const prefs = market.controller.prefs;
-            if (prefs.market.showScore !== false && prefs.market.sort !== 'off' && isOpen() && this.length) {
-              const first = raw(raw(this).find((it) => it != null));
-              if (first && typeof first === 'object' && 'sellerName' in first && 'price' in first)
-                selected = market.sortListings(this, prefs.market.sort, market.state(), prefs) || compare;
+            const prefs = market.controller.prefs, scoring = prefs.market.showScore !== false && prefs.market.sort !== 'off';
+            if ((scoring || prefs.market.hideUnbuyable) && this.length && isOpen() && MarketScore.listings(this)) {
+              // The game filters into a fresh array, sorts it and pages through it; a reactive array is state and stays whole.
+              if (prefs.market.hideUnbuyable && raw(this) === this) market.dropUnbuyable(this);
+              if (scoring && this.length) selected = market.sortListings(this, prefs.market.sort, market.state(), prefs) || compare;
             }
           } catch { selected = compare; }
           return original.call(this, selected);
         };
+      }
+      dropUnbuyable(list) {
+        const c = this.controller.bridge?.character(), role = c ? storeField(c, 'role') : null;
+        if (!role?.id) return;
+        let kept = 0;
+        for (const it of list) if (it == null || P.listingBuyable(raw(it), role)) list[kept++] = it;
+        list.length = kept;
+      }
+      // The game's list is computed. It reads its 隐藏自己 box on every pass, but its sort select only through its own
+      // comparator (not called while the script sorts or with fewer than two listings): flipping the box twice makes it
+      // filter and sort again; the select is the fallback.
+      refreshListings() {
+        if (typeof document === 'undefined') return;
+        const own = document.querySelectorAll('.consignment-window label.exclude-mine-checkbox:not(.tl-market-unbuyable) input')[0];
+        if (own) { own.click(); own.click(); return; }
+        const game = document.querySelectorAll('.consignment-window .sort-select')[0];
+        if (!game) return;
+        const value = game.value;
+        game.value = Array.from(game.options).find((option) => option.value !== value).value;
+        game.dispatchEvent(new Event('change', { bubbles: true }));
+        game.value = value;
+        game.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      // Left of the game's 隐藏自己: a copy of its label, so it takes the same style.
+      scanHide() {
+        const own = document.querySelectorAll('.consignment-window label.exclude-mine-checkbox:not(.tl-market-unbuyable)')[0];
+        if (!own) return;
+        let label = own.parentNode.querySelector('.tl-market-unbuyable');
+        if (!label) {
+          label = own.cloneNode(true);
+          label.classList.add('tl-market-unbuyable');
+          label.title = '勾选后不显示买不了的商品：指定卖给他人的和自己上架的';
+          label.style.marginRight = '4px';
+          label.querySelector('.exclude-mine-label').textContent = '隐藏无法购买';
+          own.before(label);
+          label.querySelector('input').addEventListener('change', (e) => {
+            const current = this.controller.prefs;
+            this.controller.updateConfig({ ...current, market: { ...current.market, hideUnbuyable: e.target.checked } });
+            this.refreshListings();
+          });
+        }
+        // One line each: the two sort selects give up the width instead.
+        for (const node of [label, own]) if (node.style.whiteSpace !== 'nowrap') node.style.whiteSpace = 'nowrap';
+        const input = label.querySelector('input'), on = !!this.controller.prefs.market.hideUnbuyable;
+        if (input.checked !== on) input.checked = on;
       }
       constructor(controller) {
         this.controller = controller;
@@ -6019,11 +6074,7 @@
           select.addEventListener('change', () => {
             const current = this.controller.prefs;
             this.controller.updateConfig({ ...current, market: { ...current.market, sort: select.value } });
-            const value = game.value;
-            game.value = Array.from(game.options).find((option) => option.value !== value).value;
-            game.dispatchEvent(new Event('change', { bubbles: true }));
-            game.value = value;
-            game.dispatchEvent(new Event('change', { bubbles: true }));
+            this.refreshListings();
             this.scanSort();
           });
         }
@@ -6033,6 +6084,7 @@
           ? '实战评分等待战斗数据，暂按游戏排序' : '';
       }
       scan() {
+        this.scanHide();
         this.scanSort();
         const cards = document.querySelectorAll('.consignment-window .market-item-card'),
           grids = document.querySelectorAll('.inventory-grid, .warehouse-grid'),
@@ -9682,9 +9734,10 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             this.paintDirty();
             return;
           }
-          if (path === 'market.sort') {
-            const current = this.controller.prefs;
-            this.controller.updateConfig({ ...current, market: { ...current.market, sort: value } });
+          if (path === 'market.sort' || path === 'market.hideUnbuyable') {
+            const current = this.controller.prefs, key = path.slice('market.'.length);
+            this.controller.updateConfig({ ...current, market: { ...current.market, [key]: value } });
+            this.controller.market?.refreshListings();
             this.paintDirty();
             return;
           }
@@ -10574,7 +10627,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           g('逛摊淘宝',
             f('逛摊淘宝显示装备评分', 'market.showScore') +
             f('逛摊评分类型', 'market.scoreType', { dependsOn: 'market.showScore', choices: [['combat', '实战评分'], ['power', '游戏内战力']] }) +
-            f('逛摊按脚本排序', 'market.sort', { immediate: true, choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] })) +
+            f('逛摊按脚本排序', 'market.sort', { immediate: true, choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
+            f('逛摊隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '指定卖给他人的和自己上架的商品不显示，页数只算能买的。逛摊窗口里“隐藏自己”左边的“隐藏无法购买”是同一个开关' })) +
           g('工坊',
             f('显示“一键放入”按钮', 'fill.enabled', { help: '在游戏窗口显示' }) +
             f('完成后补回同种符和材料', 'fill.refill', { dependsOn: 'fill.enabled' }), false, { help: HELP.fill });
