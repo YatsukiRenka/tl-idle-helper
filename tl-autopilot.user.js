@@ -229,7 +229,10 @@
       },
       updates: { checkDaily: true, remind: true, autoApply: true },
     };
-    const num = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+    const num = (v, d = 0) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : d;
+    };
     const integer = (v, d = 0) => Math.floor(num(v, d));
     const parse = (v, d) => {
       if (v == null || v === '') return d;
@@ -747,9 +750,10 @@
       const key = scoringKey([items.map((e) => equipmentInputs(e, state)), array(state.equipSets).map((set) =>
         [set.equipTmplIds, set.memberGroups, set.bonusTiers, set.effects,
           array(parse(set.equipTmplIds, [])).map((id) => {
-            const known = lookup(state.allEquipTemplates, id),
-              item = array(state.equipments).find((e) => num(e.tmplId || template(e).id) === num(id));
-            return [id, !!known || !!item, (known || template(item)).slotType];
+            const known = lookup(state.allEquipTemplates, id);
+            if (known) return [id, true, known.slotType];
+            const item = array(state.equipments).find((e) => num(e.tmplId || template(e).id) === num(id));
+            return [id, !!item, template(item).slotType];
           })])]);
       if (scoringPass?.state === state) scoringPass.worn = key;
       return key;
@@ -4474,12 +4478,13 @@
       }
       pressure(isFarmMap) {
         const totals = Object.fromEntries('battle hpLost gold sell potion hpPotions mpPotions deaths low'.split(' ').map((k) => [k, 0]));
-        const hours = [...new Set(Object.keys(this.buckets).map((k) => Number(k.split(':')[0])))].sort((a, b) => b - a);
+        // One pass groups the buckets by hour; the newest hours count first.
+        const byHour = Map.groupBy(Object.entries(this.buckets), ([key]) => Number(key.split(':')[0]));
         let covered = 0;
-        for (const hour of hours) {
+        for (const hour of Array.from(byHour.keys()).sort((a, b) => b - a)) {
           if (this.pressureFrom && hour < this.pressureFrom.hour) continue;
-          const buckets = Object.entries(this.buckets).filter(([k]) => Number(k.split(':')[0]) === hour && isFarmMap(Number(k.split(':')[1])));
-          for (const [key, bucket] of buckets) {
+          for (const [key, bucket] of byHour.get(hour)) {
+            if (!isFarmMap(Number(key.split(':')[1]))) continue;
             const base = this.pressureFrom?.base[key];
             for (const k of Object.keys(totals)) totals[k] += Math.max(0, bucket[k] - (base?.[k] || 0));
             const lost = Math.max(0, bucket.hpLost - (base?.hpLost || 0));
@@ -8304,10 +8309,11 @@
         this.paint();
       }
       maybeApplyUpdate(now) {
+        // The state snapshot is costly, so the tower check comes last: only when an update is due.
         if (P.arenaRush(this.prefs, now) || !this.prefs.updates.autoApply || !this.enabled || !this.prefs.resumeAfterReload ||
-          this.activity || this.arenaPending || P.num(this.bridge.state()?.role.mapId) === 20070 ||
-          !this.updates || !TLUpdates.shouldApply(
-            readStorage(TLUpdates.KEY, {}), this.updates.currentVersion, now)) return false;
+          this.activity || this.arenaPending || !this.updates || !TLUpdates.shouldApply(
+            readStorage(TLUpdates.KEY, {}), this.updates.currentVersion, now) ||
+          P.num(this.bridge.state()?.role.mapId) === 20070) return false;
         // Whether Tampermonkey has installed the new version is not visible from here, so a reload is
         // tried once at once, then every 6 hours, 5 times per version.
         this.updates.markApply(now);
