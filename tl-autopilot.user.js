@@ -1940,11 +1940,20 @@
       if (state.at <= s.ringsPotionAt && age < 4000)
         return { wait: '等待吃药结果', seconds: Math.ceil((4000 - age) / 1000) };
       const prefix = '新三环：' + ringStage(s.rings.run.stage) + '开打前';
-      // A kind whose last potion raised nothing counts as full: the reported maximum may be out of reach.
+      // A kind whose last accepted potion raised nothing counts as full: the reported maximum may be out of reach.
       const open = (attr) => !array(s.ringsPotionFull).includes(attr);
-      const drink = (open('HP') && state.hp != null && state.maxHp > 0 && ringPotion(s, 'HP', state.maxHp - state.hp, prefix)) ||
-        (open('MP') && state.mp != null && state.maxMp > 0 && ringPotion(s, 'MP', state.maxMp - state.mp, prefix));
-      if (drink) return { action: drink };
+      // HP and MP potions have separate cooldowns (3 s); a potion drunk during one is refused.
+      const cooling = (attr) => Math.max(0, ...array(s.potionCooldowns)
+        .filter(c => c.kind === attr.toLowerCase()).map(c => num(c.readyAt) - now));
+      let potionWait = 0;
+      for (const [attr, value, max] of [['HP', state.hp, state.maxHp], ['MP', state.mp, state.maxMp]]) {
+        const drink = open(attr) && value != null && max > 0 && ringPotion(s, attr, max - value, prefix);
+        if (!drink) continue;
+        const wait = cooling(attr);
+        if (!wait) return { action: drink };
+        potionWait = potionWait ? Math.min(potionWait, wait) : wait;
+      }
+      if (potionWait) return { wait: prefix + '等待药品冷却', seconds: Math.ceil(potionWait / 1000) };
       const serverNow = state.serverTime + (now - state.at);
       const secondsTo = at => Math.max(0, Math.ceil((at - serverNow) / 1000));
       const skill = secondsTo(Math.max(0, ...array(state.skills).map(sk => sk.readyAt)));
@@ -5595,6 +5604,8 @@
           trial: this.cache.trial ? { ...this.cache.trial.trial, at: this.cache.trial.at } : null,
           rings: this.cache.rings ? { ...this.cache.rings.rings, at: this.cache.rings.at } : null,
           ringsCombatState: this.ringsCombatState ?? null,
+          // The client keeps the server's potion cooldowns with a local nextAvailableAt.
+          potionCooldowns: P.array(c.potionCooldowns).map(cd => ({ kind: cd.kind, readyAt: P.num(cd.nextAvailableAt) })),
           invasion: this.cache.invasion && { ...this.cache.invasion, mapId: this.cache.invasionMapId },
           ringsDirty: this.ringsEpoch !== this.ringsConfirmed,
           ringsDirtyAt: this.ringsDirtyAt ?? null,
@@ -7535,6 +7546,7 @@
         if (changed) this.saveRingsDaily(d);
       }
       ringsRefused(a, r, message) {
+        if (a.ringsPotion) this.ringsPotionLast = null;
         this.log(a.label + '：' + message, 'warning');
         this.suppress(a, a.ringsPotion ? 5000 : 300000);
         if (a.payload.action !== 'enter' || !r?.day) return;
@@ -7931,7 +7943,8 @@
         }
         if (run && !fighting) this.ringsPrepareSince ??= now;
         const last = this.ringsPotionLast, combat = this.bridge.ringsCombatState;
-        if (last && combat?.at > this.ringsPotionAt) {
+        // Only an accepted potion is judged; a refused one (cooldown) changes nothing.
+        if (last && !last.pending && combat?.at > this.ringsPotionAt) {
           if (!(combat[last.field] > last.value)) this.ringsPotionFull = [...(this.ringsPotionFull || []), last.attr];
           this.ringsPotionLast = null;
         }
@@ -8129,7 +8142,7 @@
           if (a.ringsPotion) {
             const field = a.potionAttr === 'MP' ? 'mp' : 'hp';
             this.ringsPotionAt = Date.now();
-            this.ringsPotionLast = { attr: a.potionAttr, field, value: this.bridge.ringsCombatState?.[field] };
+            this.ringsPotionLast = { attr: a.potionAttr, field, value: this.bridge.ringsCombatState?.[field], pending: true };
           }
           const result = await this.bridge.request(a, this.responseTimeout());
           if (a.breedSuccess) {
@@ -8155,6 +8168,12 @@
           if (a.family === 'rings') {
             if (this.bridge.state()?.role.id !== before.role.id) return;
             if (result.success) {
+              if (a.ringsPotion && this.ringsPotionLast) {
+                // A late reply of an earlier, timed-out potion carries that potion's request id: judge nothing.
+                const other = result.data?.requestId != null && result.data.requestId !== a.payload.requestId;
+                if (other) this.ringsPotionLast = null;
+                else this.ringsPotionLast.pending = false;
+              }
               if (a.readOnly && result.data?.rings) this.bridge.ringsConfirmed = ringsEpoch;
               if (result.data?.rings) this.observeRings(result.data.rings, a.payload.action === 'enter');
             } else this.ringsRefused(a, before.rings, result.message || '操作未成功');
@@ -8279,6 +8298,7 @@
             if (this.bridge.state()?.role.id !== before.role.id) return;
             if (e.code === 'SERVER_ERROR') this.ringsRefused(a, before.rings, safeMessage(e.serverMessage || e.message));
             else {
+              if (a.ringsPotion) this.ringsPotionLast = null;
               this.log(safeMessage(e.message), 'warning');
               this.suppress(a, a.ringsPotion ? 5000 : 300000);
             }
