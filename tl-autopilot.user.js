@@ -5263,7 +5263,6 @@
             (this.cache.activityStamp || (this.cache.activityStamp = {})).wushuang = Date.now();
           }
           const data = packet.data;
-          if (type === 'SYSTEM_MSG' && typeof data?.notificationId === 'string') this.ackNotification(data);
           if (type === 'XIAOXIAO_RESPONSE' && packet.success && data?.board?.page === 0) {
             this.syncInvasionRole(this.character()?.role?.id);
             this.cache.invasion = { board: copy(data.board), at: Date.now() };
@@ -5412,20 +5411,6 @@
         if (!this.connected || !this.sessionReady || this.waiter) return false;
         this.socket.send(JSON.stringify({ type, payload }));
         return true;
-      }
-      // The game client (index-KT78xQF1, 2026-11-20) formats the numeric occurredAt of a breeding notice with a
-      // parser for "HH:MM:SS" strings and throws before its own ackNotification. The server then repeats the
-      // notice every 7–8 s, and an open breeding window jumps to 我的繁殖 on each one. Acknowledge for the client
-      // and show the text once, since the client's chat never gets it.
-      ackNotification(data) {
-        if (!this.connected) return;
-        this.socket.send(JSON.stringify({ type: 'PET_COMMAND',
-          payload: { action: 'ackNotification', notificationId: data.notificationId } }));
-        const seen = this.noticesSeen ||= new Set();
-        if (seen.has(data.notificationId)) return;
-        seen.add(data.notificationId);
-        if (seen.size > 50) seen.delete(seen.values().next().value);
-        if (typeof data.content === 'string' && data.content) this.log(data.content);
       }
       invalidateRings() {
         if (this.ringsEpoch === this.ringsConfirmed || this.ringsDirtyAt == null) this.ringsDirtyAt = Date.now();
