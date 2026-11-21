@@ -137,7 +137,9 @@
       welfare: { enabled: false, currency: 'GOLD', multiplier: 1, betsPerDraw: 1,
         dailyCost: 1000000, pick: 'random', numbers: '' },
       pets: { enabled: true, summon: true, claim: true, hatch: false, hatchMutant: false,
-        breedClaim: true, breed: false, breedMinAverage: 118, breedPublish: true, breedRelease: false,
+        hatchLock: true, appraise: false, release: false, releaseQuality: 'off',
+        releaseKeepMutant: true, releaseKeepLocked: true, breedRelease: true,
+        breedClaim: true, breed: false, breedMinAverage: 118, breedPublish: true,
         keepMinAverage: 118, feed: false, feedKeepExp: 0, refreshMinutes: 10 },
       arena: { enabled: true, like: true, claim: true, challenge: true, maxPerDay: 10,
         maxPowerRatio: 1.1, refreshMinutes: 30, rushMinutes: 10 },
@@ -445,6 +447,8 @@
       p.logs.showCount = Math.max(20, Math.min(500, integer(p.logs.showCount, 100)));
       p.sell.batchMin = Math.max(1, Math.min(20, integer(p.sell.batchMin, 5)));
       p.pets.keepMinAverage = Math.max(0, Math.min(200, num(p.pets.keepMinAverage)));
+      if (!['off', '普通', '优秀', '杰出'].includes(p.pets.releaseQuality))
+        p.pets.releaseQuality = DEFAULTS.pets.releaseQuality;
       p.pets.breedMinAverage = Math.max(80, Math.min(120, p.pets.breedMinAverage));
       p.pets.feedKeepExp = Math.max(0, num(p.pets.feedKeepExp));
       p.pets.refreshMinutes = Math.max(2, Math.min(240, num(p.pets.refreshMinutes)));
@@ -2752,11 +2756,12 @@
         key: type + ':' + JSON.stringify(payload),
       };
     }
-    function petScreenable(entry, state) {
+    function petScreenable(entry, state, prefs = DEFAULTS.pets) {
       const pet = entry?.pet;
       return !!pet && pet.status === 'OWNED' && pet.form === 'BABY' &&
         pet.level === 1 && pet.rootRank === 0 && pet.learned === 0 &&
-        !pet.locked && pet.id !== state.activePetId && Number.isFinite(entry.average);
+        !pet.locked && pet.id !== state.activePetId && Number.isFinite(entry.average) &&
+        (prefs.hatchLock || entry.average < prefs.keepMinAverage);
     }
     function breedable(entry, state) {
       const pet = entry?.pet;
@@ -2769,6 +2774,33 @@
       const pet = entry?.pet;
       return !!pet?.id && pet.status === 'OWNED' && pet.form === 'BABY' && pet.breedingUsed === true &&
         pet.id !== state?.activePetId;
+    }
+    function petReleasePlan(state, prefs, pendingIds, request) {
+      if (!prefs.release) return null;
+      const grades = ['普通', '优秀', '杰出', '完美'];
+      const limit = grades.indexOf(prefs.releaseQuality);
+      for (const entry of array(state.pets)) {
+        const pet = entry.pet;
+        if (!pet.id || pet.status !== 'OWNED' || pet.id === state.activePetId || pendingIds.includes(pet.id) ||
+            (prefs.releaseKeepMutant && pet.form === 'MUTANT') || (prefs.releaseKeepLocked && pet.locked)) continue;
+        const rank = grades.indexOf(entry.quality);
+        let name;
+        if (prefs.breedRelease && bredParent(entry, state)) name = '已繁殖的一代宝宝「' + pet.name + '」';
+        else if (pet.appraised === true && rank >= 0 && rank <= limit)
+          name = '品级为「' + entry.quality + '」的珍兽「' + pet.name + '」';
+        else continue;
+        return pet.locked
+          ? request('lock', { petId: pet.id, locked: false }, { label: '解锁' + name + '以便放生' })
+          : request('release', { petId: pet.id, confirm: true }, { label: '放生' + name });
+      }
+      return null;
+    }
+    function petAppraisalPlan(entries, prefs, pendingIds, request) {
+      if (!prefs.appraise) return null;
+      const target = entries.find(({ pet }) => pet.id && pet.status === 'OWNED' &&
+        pet.appraised === false && !pendingIds.includes(pet.id));
+      return target && request('appraise', { petId: target.pet.id }, {
+        label: '鉴定珍兽「' + target.pet.name + '」的品质', moneyCost: 1000, requiresTown: true, npc: NPC.petKeeper });
     }
     function petServerNow(state, now) {
       return state?.serverTime + (now - state?.at);
@@ -3101,11 +3133,12 @@
       growth.forEach(add);
       if (p.pets.enabled) {
         const state = s.pets, entries = array(state?.pets);
+        const pendingIds = array(ledger.petHatched);
         const request = (name, payload = {}, options = {}) =>
           action('PET_COMMAND', { action: name, petId: '', ...payload },
             '珍兽：' + name, 'pet', { responseType: 'PET_RESPONSE', ...options });
         // Hatching diffs the pet list before and after, so it needs a list read moments ago.
-        const hatchWanted = !!state && p.pets.hatch && !array(ledger.petHatched).length &&
+        const hatchWanted = !!state && p.pets.hatch && !pendingIds.length &&
           entries.length + num(state.reserved) < state.capacity &&
           petEggs(s).some((item) => p.pets.hatchMutant ||
             !String(item.itemTmpl.name).includes('变异'));
@@ -3114,8 +3147,8 @@
           add(request('list', {}, { readOnly: true, inBattle: true }));
         else if (![20050, 20051, 20052, 20070].includes(num(role.mapId)) &&
             !s.trial?.run && !s.arenaMatch?.active) {
-          const pending = entries.find((entry) => array(ledger.petHatched).includes(entry.pet.id) &&
-            petScreenable(entry, state));
+          const pending = entries.find((entry) => pendingIds.includes(entry.pet.id) &&
+            petScreenable(entry, state, p.pets));
           const active = entries.find((entry) => entry.pet.id === state.activePetId);
           const best = entries.filter((entry) => entry.pet.status === 'OWNED')
             .sort((a, b) => num(b.combatPower) - num(a.combatPower))[0];
@@ -3131,22 +3164,17 @@
           } else if (p.pets.claim && state.pendingRewards > 0) add(request('claimRewards'));
           else if (p.pets.summon && !state.activePetId && best)
             add(request('summon', { petId: best.pet.id, active: true }));
-          else if (p.pets.hatch && !array(ledger.petHatched).length && egg &&
+          else if (p.pets.hatch && !pendingIds.length && egg &&
               entries.length + num(state.reserved) < state.capacity)
             add(action('USE_ITEM', { bagItemId: egg.id, count: 1 },
               '孵化「' + egg.itemTmpl.name + '」', 'pet', { petHatch: true }));
           else {
             const breeding = breedingPlans(s, p, now);
-            breeding.forEach(add);
-            // After claims, hatching and breeding, so a refused release never holds them back. The game
-            // refuses to release a locked pet, so a locked parent is unlocked first.
-            const parent = p.pets.breedRelease && entries.find((entry) => bredParent(entry, state));
-            const name = parent && '已繁殖的一代宝宝「' + parent.pet.name + '」';
-            if (!breeding.length && parent)
-              add(parent.pet.locked
-                ? request('lock', { petId: parent.pet.id, locked: false }, { label: '解锁' + name + '以便放生' })
-                : request('release', { petId: parent.pet.id, confirm: true }, { label: '放生' + name }));
-            else if (!breeding.length && p.pets.feed && active && active.pet.level < role.level && cost > 0 &&
+            const next = !breeding.length && (petReleasePlan(state, p.pets, pendingIds, request) ||
+              petAppraisalPlan(entries, p.pets, pendingIds, request));
+            if (breeding.length) breeding.forEach(add);
+            else if (next) add(next);
+            else if (p.pets.feed && active && active.pet.level < role.level && cost > 0 &&
                 num(role.currentExp) - cost >= p.pets.feedKeepExp)
               add(request('feed', { petId: active.pet.id, mode: 'one' }, { expCost: cost }));
           }
@@ -7952,7 +7980,7 @@
       cleanPetLedger(state) {
         if (!state) return;
         const ids = (this.ledger.petHatched || []).filter((id) =>
-          state.pets.some((entry) => entry.pet.id === id && P.petScreenable(entry, state)));
+          state.pets.some((entry) => entry.pet.id === id && P.petScreenable(entry, state, this.prefs?.pets)));
         if (JSON.stringify(ids) !== JSON.stringify(this.ledger.petHatched)) {
           this.ledger.petHatched = ids;
           this.saveLedger();
@@ -9477,7 +9505,7 @@
       gear: "比较同一张图上换装前后的每小时击杀；只有下降超过设定值且统计上可信（约 2 个标准差）才换回，换装后出现阵亡也会换回。核对期间不换其他装备。被换下的装备留在背包，不会自动出售。",
       hiddenClaim: "领取前请确认属攻；领错后转换要 5 砂。",
       hidden: "洗炼和喂养需要回洛阳找薛飞，会中断挂机。无相浮屠（300 万金币/轮）不会自动进入；手动进塔时托管不干预。",
-      pets: "孵蛋、出战、喂养、领取都要先停止战斗（不用回城）。放生不可恢复：只放生脚本自己刚孵出的、1 级、未锁定、未出战、资质均值低于设定值的普通宝宝；达标的自动锁定。变异和二代珍兽不会被放生。",
+      pets: "孵蛋、出战、喂养、领取、放生都要先停止战斗（不用回城）；鉴定要回苏州找云飘飘。孵蛋筛选只放生脚本自己刚孵出的、1 级、未锁定、未出战、资质均值低于设定值的普通宝宝。「自动放生」按所选条件放生，出战中和繁殖中的不放。放生不可恢复。",
       fill: "宝石、铁匠、裁缝窗口和云飘飘珍兽面板的标题栏出现“一键放入”：按当前功能页把最合适的装备、宝石、符和材料放进槽位，执行仍需自己点。镶嵌、打孔、合成、摘除、雕琢成功后，自动从背包补回刚用掉的同种符、打孔材料和宝石（合成、雕琢），直到用完。",
       tailor: "打造按角色已持有材料处理，目标以当前下发的模板与神器预览为准。",
       sellAppraised: "不勾选时，资质不是外攻、内攻双完美（都高于 1500）的已鉴定武器按其余规则出售；品质上限、强化、套装等保护照常生效。",
@@ -10888,8 +10916,17 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('自动出战最强珍兽', 'pets.summon', { help: '没有出战珍兽时使用' }) +
             f('自动领取珍兽掉落', 'pets.claim') +
             f('自动孵蛋并筛选', 'pets.hatch') +
+            f('自动锁定', 'pets.hatchLock', { dependsOn: 'pets.hatch', help: '资质均值达到下面设定值的宝宝自动上锁，防止被误放生；关闭后达标的只保留、不上锁' }) +
             f('保留的最低资质均值', 'pets.keepMinAverage', { step: 0.5, help: '宝宝满值 120', dependsOn: 'pets.hatch' }) +
             f('也孵化变异珍兽蛋', 'pets.hatchMutant', { dependsOn: 'pets.hatch' }) +
+            f('自动鉴定珍兽品质', 'pets.appraise', { help: '回苏州找云飘飘，每只 1,000 金币，只鉴定还没鉴定过的珍兽，不改变资质' }) +
+            f('自动放生', 'pets.release', { help: '放生后无法恢复。出战中、繁殖中、刚孵出等待筛选的珍兽不放' }) +
+            f('自动放生一代珍兽', 'pets.breedRelease', { dependsOn: 'pets.release', help: '一代宝宝一生只能繁殖一次，繁殖过的只占栏位。开启后放生所有繁殖过的一代宝宝' }) +
+            f('自动放生最高品级', 'pets.releaseQuality', { dependsOn: 'pets.release',
+              choices: [['off', '不按品级放生'], ['普通', '普通'], ['优秀', '优秀'], ['杰出', '杰出']],
+              help: '放生鉴定后品级 ≤ 此品级的珍兽（从低到高：普通、优秀、杰出、完美）。没鉴定过的不按品级放生；一代、二代、变异的品级标准不同，以游戏鉴定结果为准' }) +
+            f('排除变异珍兽', 'pets.releaseKeepMutant', { dependsOn: 'pets.release', help: '开启时变异珍兽一律不放生' }) +
+            f('排除已锁定珍兽', 'pets.releaseKeepLocked', { dependsOn: 'pets.release', help: '开启时锁定的珍兽一律不放生，包括自动孵蛋锁定的；关闭时锁定的会先解锁再放生' }) +
             f('用人物经验喂养出战珍兽', 'pets.feed') +
             f('喂养后至少保留经验', 'pets.feedKeepExp', { dependsOn: 'pets.feed' }) +
             f('珍兽状态刷新间隔', 'pets.refreshMinutes', { unit: '分钟' }) +
@@ -10899,8 +10936,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
               f('对方宝宝的最低平均资质', 'pets.breedMinAverage', { unit: '%', min: 80, max: 120, step: 0.5,
                 dependsOn: 'pets.breed', help: '也是自己发布时的择偶条件' }) +
               f('没有合适对象时发布自己的宝宝', 'pets.breedPublish', { dependsOn: 'pets.breed',
-                help: '发布后满足条件的玩家可直接与它繁殖；脚本不会自动撤回' }) +
-              f('繁殖领回后放生一代珍兽', 'pets.breedRelease', { help: '一代宝宝一生只能繁殖一次。开启后放生所有繁殖过的一代宝宝，锁定的会先解锁，出战中的不放。放生后无法恢复' }), false,
+                help: '发布后满足条件的玩家可直接与它繁殖；脚本不会自动撤回' }), false,
             { help: '繁殖在苏州云飘飘处办理，会中断挂机。' });
         if (this.section === 'bagTools')
           html = g('显示',
