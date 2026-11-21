@@ -689,6 +689,10 @@
     function template(eq) {
       return eq?.equipTmpl || eq?.tmpl || eq || {};
     }
+    // Fashion (时装, slot 13): the game refuses to enhance it, and the gem rules here fit no gem type to it.
+    function isFashion(eq) {
+      return num(template(eq).slotType) === 13;
+    }
     function lookup(collection, id) {
       if (collection instanceof Map) return collection.get(num(id)) || collection.get(id);
       return array(collection).find((v) => num(v.id) === num(id));
@@ -1631,6 +1635,7 @@
           next = num(eq?.enhanceLevel) + 1;
         if (!eq || level <= 0 || !Number.isInteger(next) || next < 1 || next > 9)
           return fail('装备等级或强化目标无效');
+        if (isFashion(eq)) return fail('时装不可强化');
         const id = level >= 40 ? 5051 : 5050;
         return array(s.bagItems).some(
           (b) => b.id === payload.materialBagId && materialId(b) === id && materialUsable(s, b) && materialSupports(b, '装备', level),
@@ -3455,7 +3460,7 @@
               : DEFENSE_SLOTS.includes(num(eq.equipTmpl?.slotType))
                 ? GEM_TYPES.defense
                 : [];
-          if (p.gems.drill && all.filter((v) => v >= 0).length < p.gems.maxHoles) {
+          if (p.gems.drill && !isFashion(eq) && all.filter((v) => v >= 0).length < p.gems.maxHoles) {
             const material = drillMaterial(s, eq);
             if (material)
               add(
@@ -3558,7 +3563,7 @@
             );
         }
         if (materials && p.smithy.enhance)
-          for (const eq of equipped) {
+          for (const eq of equipped.filter((e) => !isFashion(e))) {
             const next = num(eq.enhanceLevel) + 1;
             if (next > p.smithy.targetEnhance || ENHANCE_RATE[next] < p.smithy.minEnhanceSuccess)
               continue;
@@ -3866,7 +3871,7 @@
         return { items, message: items.length ? '已放入 ' + items.map((b) => b.itemTmpl?.name || template(b).name || String(b.id)).join('、') : message };
       };
       if (mode === 'GEM_DRILL') {
-        const eq = current.selectedEquip || equipped.filter((e) => slots(e).filter((n) => n >= 0).length < 3)
+        const eq = current.selectedEquip || equipped.filter((e) => !isFashion(e) && slots(e).filter((n) => n >= 0).length < 3)
           .sort((a, b) => slots(a).filter((n) => n >= 0).length - slots(b).filter((n) => n >= 0).length)[0];
         const chosen = eq && drillMaterial({ ...s, bagItems: bags }, eq);
         const material = chosen && bags.find((b) => drillMaterial({ ...s, bagItems: [b] }, eq) && drillRange(b.itemTmpl).max === drillRange(chosen.itemTmpl).max && num(b.itemTmpl.price) === num(chosen.itemTmpl.price));
@@ -3903,7 +3908,7 @@
         return result(gem ? [gem, charms.find((b) => id(b) === 5060 || b.itemTmpl.functionType === 5)] : []);
       }
       if (mode === 'SMITHY_APPRAISAL') return result([eqs.filter((e) => [1, 12].includes(num(template(e).slotType)) && num(template(e).reqLevel) >= 50 && !e.isAppraisal).sort((a, b) => Number(!!b.isEquipped) - Number(!!a.isEquipped))[0]], '没有未鉴定的50级以上武器');
-      if (mode === 'SMITHY_REINFORCE') return result([equipped.filter((e) => num(e.enhanceLevel) < 9 && (num(template(e).reqLevel) < 40 ? find(5050) : find(5051, 5079))).sort((a, b) => num(a.enhanceLevel) - num(b.enhanceLevel))[0]]);
+      if (mode === 'SMITHY_REINFORCE') return result([equipped.filter((e) => !isFashion(e) && num(e.enhanceLevel) < 9 && (num(template(e).reqLevel) < 40 ? find(5050) : find(5051, 5079))).sort((a, b) => num(a.enhanceLevel) - num(b.enhanceLevel))[0]]);
       if (mode === 'SMITHY_SMELT') return result([eqs.filter((e) => !e.isEquipped && num(template(e).slotType) === 1 && num(template(e).reqLevel) >= 50 && doublePerfect(e) && !smeltProtected(e, s)).sort((a, b) => num(template(a).reqLevel) - num(template(b).reqLevel))[0]], '没有可冶炼的完美资质武器（已穿戴的不会自动放入）');
       if (mode === 'SMITHY_REPAIR') {
         const complete = (b) => num(stats(b.extraData).repairs) >= 5;
@@ -3958,7 +3963,7 @@
       }
       if (kind !== 'any') return [];
       if (mode === 'SMITHY_APPRAISAL') return eqs.filter((e) => [1, 12].includes(num(template(e).slotType)) && num(template(e).reqLevel) >= 50).sort((a, b) => Number(!!a.isAppraisal) - Number(!!b.isAppraisal) || worn(a, b));
-      if (mode === 'SMITHY_REINFORCE') return eqs.filter((e) => num(e.enhanceLevel) < 9).sort((a, b) => worn(a, b) || num(a.enhanceLevel) - num(b.enhanceLevel));
+      if (mode === 'SMITHY_REINFORCE') return eqs.filter((e) => !isFashion(e) && num(e.enhanceLevel) < 9).sort((a, b) => worn(a, b) || num(a.enhanceLevel) - num(b.enhanceLevel));
       if (mode === 'SMITHY_SMELT') return eqs.filter((e) => num(template(e).slotType) === 1 && num(template(e).reqLevel) >= 50 && doublePerfect(e)).sort((a, b) => -worn(a, b) || num(template(a).reqLevel) - num(template(b).reqLevel));
       if (mode === 'SMITHY_REPAIR') return bags.filter((b) => id(b) >= 5032 && id(b) <= 5043).sort((a, b) => id(b) - id(a));
       if (mode === 'SMITHY_FORGE') return bags.filter((b) => id(b) >= 5044 && id(b) <= 5049);
@@ -8292,7 +8297,7 @@
             this.saveLedger();
             return;
           }
-          if (['LEVEL_UP', 'UPGRADE_SKILL'].includes(a.type) && e.code === 'SERVER_ERROR') {
+          if (['LEVEL_UP', 'UPGRADE_SKILL', 'SMITHY_ENHANCE'].includes(a.type) && e.code === 'SERVER_ERROR') {
             this.log(safeMessage(e.message), 'warning');
             this.suppress(a, 3600000);
             this.saveLedger();
