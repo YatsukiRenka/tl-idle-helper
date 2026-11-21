@@ -139,7 +139,7 @@
       pets: { enabled: true, summon: true, claim: true, hatch: false, hatchMutant: false,
         hatchLock: true, appraise: false, release: false, releaseQuality: 'off',
         releaseKeepMutant: true, releaseKeepLocked: true, breedRelease: true,
-        breedClaim: true, breed: false, breedMinAverage: 118, breedPublish: true,
+        breedClaim: true, breedUnlock: true, breed: false, breedMinAverage: 118, breedPublish: true,
         keepMinAverage: 118, feed: false, feedKeepExp: 0, refreshMinutes: 10 },
       arena: { enabled: true, like: true, claim: true, challenge: true, maxPerDay: 10,
         maxPowerRatio: 1.1, refreshMinutes: 30, rushMinutes: 10 },
@@ -2517,6 +2517,7 @@
         invasion: invasionDaily(day),
         tianlingUsedAt: 0,
         petHatched: [],
+        petClaimed: [],
         keptEquipIds: [],
       };
     }
@@ -2541,6 +2542,7 @@
         .map(([key, value]) => [key, Math.max(0, integer(value))]));
       out.arena = { attempts: 0, lost: [], ...out.arena };
       out.petHatched = array(out.petHatched);
+      out.petClaimed = array(out.petClaimed);
       out.keptEquipIds = array(out.keptEquipIds);
       return out;
     }
@@ -2774,6 +2776,17 @@
       const pet = entry?.pet;
       return !!pet?.id && pet.status === 'OWNED' && pet.form === 'BABY' && pet.breedingUsed === true &&
         pet.id !== state?.activePetId;
+    }
+    // A first-generation baby the script claimed back from breeding, still locked (the game keeps its lock).
+    function claimedLocked(entry, ledger) {
+      const pet = entry?.pet;
+      return !!pet?.id && array(ledger?.petClaimed).includes(pet.id) && pet.status === 'OWNED' &&
+        pet.form === 'BABY' && pet.breedingUsed === true && pet.locked === true;
+    }
+    function petClaimUnlockPlan(entries, prefs, ledger, request) {
+      const entry = prefs.breedUnlock && entries.find((e) => claimedLocked(e, ledger));
+      return entry ? request('lock', { petId: entry.pet.id, locked: false },
+        { label: '繁殖领取后解锁一代宝宝「' + entry.pet.name + '」' }) : null;
     }
     function petReleasePlan(state, prefs, pendingIds, request) {
       if (!prefs.release) return null;
@@ -3170,7 +3183,8 @@
               '孵化「' + egg.itemTmpl.name + '」', 'pet', { petHatch: true }));
           else {
             const breeding = breedingPlans(s, p, now);
-            const next = !breeding.length && (petReleasePlan(state, p.pets, pendingIds, request) ||
+            const next = !breeding.length && (petClaimUnlockPlan(entries, p.pets, ledger, request) ||
+              petReleasePlan(state, p.pets, pendingIds, request) ||
               petAppraisalPlan(entries, p.pets, pendingIds, request));
             if (breeding.length) breeding.forEach(add);
             else if (next) add(next);
@@ -4065,7 +4079,7 @@
       potionOrder,
       skillCost,
       synthRate,
-      petScreenable,
+      petScreenable, claimedLocked,
       breedable, breedingReady, breedingPick, breedingStatus,
       petEggs,
       freshLedger,
@@ -7981,8 +7995,13 @@
         if (!state) return;
         const ids = (this.ledger.petHatched || []).filter((id) =>
           state.pets.some((entry) => entry.pet.id === id && P.petScreenable(entry, state, this.prefs?.pets)));
-        if (JSON.stringify(ids) !== JSON.stringify(this.ledger.petHatched)) {
+        // A claimed baby leaves the unlock list once it is unlocked, gone or changed.
+        const claimed = (this.ledger.petClaimed || []).filter((id) =>
+          state.pets.some((entry) => entry.pet.id === id && P.claimedLocked(entry, this.ledger)));
+        if (JSON.stringify(ids) !== JSON.stringify(this.ledger.petHatched) ||
+            JSON.stringify(claimed) !== JSON.stringify(this.ledger.petClaimed || [])) {
           this.ledger.petHatched = ids;
+          this.ledger.petClaimed = claimed;
           this.saveLedger();
         }
       }
@@ -8130,7 +8149,11 @@
           const result = await this.bridge.request(a, this.responseTimeout());
           if (a.breedSuccess) {
             if (result.success) this.log(a.breedSuccess, 'success');
-            else {
+            if (result.success && a.payload.action === 'claim') {
+              this.ledger.petClaimed = [...new Set([...(this.ledger.petClaimed || []), a.payload.petId])];
+              this.saveLedger();
+            }
+            if (!result.success) {
               this.log(result.data?.message || result.message || '繁殖操作未成功', 'warning');
               this.suppress(a, 300000);
             }
@@ -10921,7 +10944,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('也孵化变异珍兽蛋', 'pets.hatchMutant', { dependsOn: 'pets.hatch' }) +
             f('自动鉴定珍兽品质', 'pets.appraise', { help: '回苏州找云飘飘，每只 1,000 金币，只鉴定还没鉴定过的珍兽，不改变资质' }) +
             f('自动放生', 'pets.release', { help: '放生后无法恢复。出战中、繁殖中、刚孵出等待筛选的珍兽不放' }) +
-            f('自动放生一代珍兽', 'pets.breedRelease', { dependsOn: 'pets.release', help: '一代宝宝一生只能繁殖一次，繁殖过的只占栏位。开启后放生所有繁殖过的一代宝宝' }) +
+            f('自动放生已繁殖的一代珍兽', 'pets.breedRelease', { dependsOn: 'pets.release', help: '一代宝宝一生只能繁殖一次，繁殖过的只占栏位。开启后放生所有繁殖过的一代宝宝' }) +
             f('自动放生最高品级', 'pets.releaseQuality', { dependsOn: 'pets.release',
               choices: [['off', '不按品级放生'], ['普通', '普通'], ['优秀', '优秀'], ['杰出', '杰出']],
               help: '放生鉴定后品级 ≤ 此品级的珍兽（从低到高：普通、优秀、杰出、完美）。没鉴定过的不按品级放生；一代、二代、变异的品级标准不同，以游戏鉴定结果为准' }) +
@@ -10932,6 +10955,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('珍兽状态刷新间隔', 'pets.refreshMinutes', { unit: '分钟' }) +
             '<div class="pets-status">' + this.petsHTML(status.pets) + '</div>', true, { help: HELP.pets }) +
             g('繁殖', f('繁殖完成后自动领取', 'pets.breedClaim', { help: '需回苏州找云飘飘' }) +
+              f('繁殖领取后自动解锁一代珍兽', 'pets.breedUnlock', { dependsOn: 'pets.breedClaim', help: '脚本领回繁殖完成的宝宝后，给领回的一代宝宝解锁（一代宝宝一生只能繁殖一次）。解锁后「排除已锁定珍兽」不再挡住它，「自动放生已繁殖的一代珍兽」才能放生它。只解锁一次，之后你再手动锁上不会被解开' }) +
               f('自动到繁殖大厅找对象', 'pets.breed', { help: '宝宝须是 30 级以上、已鉴定、从未繁殖且未出战，并留有一个空栏位。每只宝宝一生只能繁殖一次，开始后不可取消' }) +
               f('对方宝宝的最低平均资质', 'pets.breedMinAverage', { unit: '%', min: 80, max: 120, step: 0.5,
                 dependsOn: 'pets.breed', help: '也是自己发布时的择偶条件' }) +
