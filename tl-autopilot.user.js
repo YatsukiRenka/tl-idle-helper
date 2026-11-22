@@ -339,6 +339,7 @@
       [/^(?:targets(?:$|:)|alive:|monsters$)/, '评分数据', '项'],
       [/^gear(?:Profile|Rejected|Check):/, '换装方案', '项'], [/^ledger:/, '每日额度记录', '项'],
       [/^towerFloors:/, '爬塔记录', '项'], [/^potions$/, '药品数据', '项'],
+      [/^arenaLosses:/, '比武败绩', '项'],
     ];
     const transferKind = key => TRANSFER_KINDS.find(([pattern]) => pattern.test(key)) || [null, '其他数据', '项'];
     const settingsKey = key => /^config(?::|$)/.test(key), logCacheKey = key => /^log(?::|$)/.test(key);
@@ -2907,6 +2908,12 @@
     }
     // The game day ends at 00:00 UTC+8: ranks settle and the daily counts restart.
     const dayLeft = (now) => 86400000 - (now + 28800000) % 86400000;
+    // An opponent gets a new snapshot each time it wins, so losses are kept per player and across days.
+    const ARENA_RETRY_GAIN = 1.03;
+    function arenaLostTo(s, row) {
+      const loss = s?.arenaLosses?.[row.roleId];
+      return !!loss && num(s.combatPower) < num(loss.power) * ARENA_RETRY_GAIN;
+    }
     function arenaRush(prefs, now = Date.now()) {
       const left = dayLeft(now);
       const arena = prefs?.arena;
@@ -3239,7 +3246,8 @@
             }
             const target = array(board.rows).filter((r) => r.canChallenge && !r.busy &&
               num(r.combatPower) <= num(s.combatPower) * p.arena.maxPowerRatio &&
-              !daily.lost.includes(r.snapshotId)).sort((a, b) => a.rank - b.rank)[0];
+              !daily.lost.includes(r.snapshotId) && !arenaLostTo(s, r) &&
+              !(num(daily.refused?.[r.roleId]) > now)).sort((a, b) => a.rank - b.rank)[0];
             if (townSafe && board.eligible !== false && p.arena.challenge &&
                 !s.arenaMatch?.active && target &&
                 (rush || !p.arena.maxPerDay || daily.attempts < p.arena.maxPerDay)) {
@@ -4105,7 +4113,7 @@
       skillProgress,
       allowed,
       plans,
-      arenaRush,
+      arenaRush, arenaLostTo,
       welfareNumbers, randomNumbers, welfareStatus,
       signature,
       conflictNotice,
@@ -5571,6 +5579,22 @@
         }
         return this.cache.towerFloors;
       }
+      arenaLosses(role) {
+        if (this.cache.lossRole !== role) {
+          this.cache.lossRole = role;
+          const stored = readStorage(PREFIX + ':arenaLosses:' + role, {});
+          this.cache.arenaLosses = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+        }
+        return this.cache.arenaLosses;
+      }
+      // power: own combat power at the loss; null clears the record after a win.
+      recordArenaLoss(role, opponent, power) {
+        const losses = { ...this.arenaLosses(role) };
+        if (power === null) delete losses[opponent];
+        else losses[opponent] = { power, at: Date.now() };
+        this.cache.arenaLosses = losses;
+        writeStorage(PREFIX + ':arenaLosses:' + role, losses);
+      }
       state() {
         const c = this.character();
         this.syncPetRole(c?.role?.id);
@@ -5607,6 +5631,7 @@
           combat: this.statsRates?.() || null,
           arenaMatch: this.cache.arenaMatch || null,
           towerFloors: this.towerFloors(r.id),
+          arenaLosses: this.arenaLosses(r.id),
           trial: this.cache.trial ? { ...this.cache.trial.trial, at: this.cache.trial.at } : null,
           rings: this.cache.rings ? { ...this.cache.rings.rings, at: this.cache.rings.at } : null,
           ringsCombatState: this.ringsCombatState ?? null,
@@ -8272,8 +8297,8 @@
             if (success && result.data?.battle) {
               this.ledger.arena.attempts++;
               this.arenaPending = { matchId: result.data.battle.matchId,
-                target: a.arenaTarget, started: Date.now() };
-            }
+                target: a.arenaTarget, started: Date.now(), power: P.num(before.combatPower) };
+            } else this.arenaRefused(a);
           }
           if (success && a.stockItemId) {
             if (P.countItem(after, a.stockItemId) <= P.countItem(before, a.stockItemId))
@@ -8328,6 +8353,7 @@
             this.pause('金币已低于保留额度，请核对当前资源');
           this.saveLedger();
         } catch (e) {
+          if (a.type === 'ARENA_COMMAND' && a.payload.action === 'challenge') this.arenaRefused(a);
           if (a.breedSuccess || a.payload?.action === 'breedingList') {
             this.log(safeMessage(e.serverMessage || e.message), 'warning');
             this.suppress(a, 300000);
@@ -8466,6 +8492,13 @@
           this.log('已关闭比武结果窗口', 'info');
         }
       }
+      // The action key holds the one-time token, so a refused challenge is held back by the opponent instead.
+      arenaRefused(a, now = Date.now()) {
+        const id = a.arenaTarget?.roleId;
+        if (id != null) this.ledger.arena.refused = { ...this.ledger.arena.refused, [id]: now + 300000 };
+        if (this.bridge.cache.arena) this.bridge.cache.arena.board = null;
+        this.saveLedger();
+      }
       handleArenaMatch(now = Date.now()) {
         const pending = this.arenaPending, match = this.bridge.cache.arenaMatch;
         if (!pending) {
@@ -8477,13 +8510,16 @@
           return !!match?.active;
         }
         if (match?.matchId === pending.matchId && match.active === false) {
-          if (match.result?.win)
+          const win = !!match.result?.win, role = this.roleId;
+          if (win)
             this.log('比武胜利：第 ' + match.result.oldRank + ' 名 → 第 ' +
               match.result.newRank + ' 名', 'success');
           else {
-            this.log('比武失败：对手 ' + pending.target.nickname, 'warning');
+            this.log('比武失败：对手 ' + pending.target.nickname + '，自身战力提升 3% 前不再挑战', 'warning');
             this.ledger.arena.lost.push(pending.target.snapshotId);
           }
+          if (role && pending.target.roleId != null && P.num(pending.power) > 0)
+            this.bridge.recordArenaLoss(role, pending.target.roleId, win ? null : P.num(pending.power));
           this.saveLedger();
         } else if (now - pending.started < 130000) return true;
         else this.log('比武等待结果超时，继续托管', 'warning');
@@ -9578,7 +9614,7 @@
       gearAdvice: '提升指实战评分的变化（输出 × 生存^权重），怪物和生存权重同评分设置。四件神器基础属性相同（外攻、内攻 543），只差技能。燕侯每条词条在数值范围内随机，范围按 54 件实物估计。“洗炼期望”是把这一条洗成其他词条（不会与另外四条重复）后的平均变化，正数才值得洗；只看已穿戴的燕侯装备。',
       budgetStatus: "默认保留强化、镶宝、星级、鉴定装备和套装部件；自动回收品质1的普通装备。宝石默认目标3级，强化默认目标+3。",
       activities: "珍珑需15级，伪宋军与熊林需30级。令牌、每日次数会结合游戏返回的资格数据核对。",
-      arena: "比武 30 级开放。挑战和领奖需要回洛阳找比武校尉，会中断挂机。点赞不中断。每天 0 点（东八区）结算前的这段时间，托管回洛阳驻守并连续挑战：榜单每 30 秒刷新一次，不受每日挑战次数上限限制，期间不进副本。",
+      arena: "比武 30 级开放。挑战和领奖需要回洛阳找比武校尉，会中断挂机。点赞不中断。每天 0 点（东八区）结算前的这段时间，托管回洛阳驻守并连续挑战：榜单每 30 秒刷新一次，不受每日挑战次数上限限制，期间不进副本。输给某位玩家后，自身战力比当时高 3% 之前不再挑战他，跨天有效。",
       gear: "比较同一张图上换装前后的每小时击杀；只有下降超过设定值且统计上可信（约 2 个标准差）才换回，换装后出现阵亡也会换回。核对期间不换其他装备。被换下的装备留在背包，不会自动出售。",
       hiddenClaim: "领取前请确认属攻；领错后转换要 5 砂。",
       hidden: "洗炼和喂养需要回洛阳找薛飞，会中断挂机。无相浮屠（300 万金币/轮）不会自动进入；手动进塔时托管不干预。",
