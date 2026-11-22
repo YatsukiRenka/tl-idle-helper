@@ -1962,7 +1962,9 @@
       return parts.length ? { wait: prefix + '等待' + parts.join('、'), seconds: Math.max(skill, pet) } : null;
     }
     function ringsPlan(s, p, daily, now, { ignoreRefresh = false, hasGearAction, onWait } = {}) {
-      if (!p.rings?.enabled || !num(s.role?.id) || num(s.role.level) < 56 || s.activity || s.arenaMatch?.active ||
+      // Without the automation a ring map is only watched: status queries tell whether a run is still on.
+      const watchOnly = !p.rings?.enabled && RINGS_MAP_IDS.includes(num(s.role?.mapId));
+      if (!p.rings?.enabled && !watchOnly || !num(s.role?.id) || num(s.role.level) < 56 || s.activity || s.arenaMatch?.active ||
           s.trial?.run || [20050, 20051, 20052, 20070].includes(num(s.role.mapId))) return null;
       const r = s.rings, status = ringsStatus(s, p, daily, now);
       const request = (name, label, itemId = 0) => ({
@@ -1977,6 +1979,7 @@
       const unconfirmedRun = r.run && RINGS_MAP_IDS.includes(num(s.role?.mapId)) &&
         Number.isFinite(s.ringsDirtyAt) && now - s.ringsDirtyAt > 15000;
       if (!ignoreRefresh && s.ringsDirty && !unconfirmedRun) return query();
+      if (watchOnly) return null;
       if (r.run) {
         if (s.ringsFighting || !RING_NAMES[r.run.stage] || now - (s.ringsStartAt ?? -Infinity) < 5000) return null;
         const prep = p.rings.prepare && ringsPrepare(s, p, now);
@@ -8566,12 +8569,22 @@
               return;
             }
           }
-        } else this.ringsMap = null;
+        } else {
+          this.ringsMap = null;
+          // Arriving on a ring map asks for a fresh status: only a confirmed end of the run lets farming resume.
+          if (rings && this.watchedRingsMap !== P.num(s.role.mapId)) {
+            this.bridge.invalidateRings();
+            s.ringsDirty = true;
+          }
+        }
+        this.watchedRingsMap = rings && !autoRings ? P.num(s.role.mapId) : null;
         if (!actionBlocked) {
           this.updateGearCheck(s, now);
           if (!rings && this.maybeApplyUpdate(now)) return;
         }
-        if ((rings && !autoRings) || P.num(s.role.mapId) === 20070 || s.trial?.run) {
+        // A manual run is left alone; a ring map without a run (all rewards taken, run over) is not.
+        const manualRings = rings && !autoRings && !(s.rings && !s.rings.run && !s.ringsDirty);
+        if (manualRings || P.num(s.role.mapId) === 20070 || s.trial?.run) {
           if (actionBlocked) return;
           if ((this.planNow || monotonicNow)() < (this.nextPlanAt ?? -Infinity)) {
             this.paint();
@@ -8579,9 +8592,9 @@
           }
           const prefs = s.trial?.run ? { ...this.prefs,
             hidden: { ...this.prefs.hidden, enabled: true } } : this.prefs;
+          const first = (a) => Number(a.type === 'TRIAL_COMMAND' || a.type === 'RINGS_COMMAND');
           const a = this.planningPass(s, prefs, now)
-            .sort((a, b) => Number(b.type === 'TRIAL_COMMAND') -
-              Number(a.type === 'TRIAL_COMMAND')).find((a) =>
+            .sort((a, b) => first(b) - first(a)).find((a) =>
             (a.readOnly || a.type === 'UPDATE_SETTINGS') &&
             (this.suppressed.get(a.key) || 0) < now &&
             (a.type !== 'UPDATE_SETTINGS' || now - this.lastSettings > 15000));
