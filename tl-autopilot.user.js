@@ -6830,11 +6830,11 @@
           });
         }
       }
-      // 九州商会 · 寄售上架: a right click in the bag puts an item on sale, so the items it accepts are lit.
+      // 九州商会 · 寄售上架: a right click in the bag puts an item on sale; the items it refuses (bound) are dimmed.
       scanConsign(grids, state, prefs) {
         const sellTab = document.querySelectorAll('.consignment-window .game-tab-button.is-active')[0];
         const selling = prefs.market.consignHighlight !== false && !!state && !!sellTab?.textContent.includes('寄售上架');
-        const lit = new Set();
+        const dimmed = new Set();
         for (const grid of selling ? grids : []) {
           if (!grid.classList.contains('inventory-grid')) continue;
           const slots = Array.from(grid.children).filter((n) => n.classList?.contains('grid-slot'));
@@ -6844,21 +6844,18 @@
           // Props and materials carry no quality, so the game marks their slots `empty-slot` too: count the icons.
           const filled = slots.filter((n) => !!n.querySelector('.v-img, img')).length;
           if (filled !== Math.min(items.length, slots.length)) continue;
-          slots.forEach((slot, i) => { if (P.consignable(items[i])) lit.add(slot); });
+          slots.forEach((slot, i) => { if (items[i] && !P.consignable(items[i])) dimmed.add(slot); });
         }
-        // The icon covers the slot, so the frame is an outline (painted above it) plus a glow outside.
-        const look = (slot, on) => Object.assign(slot.style, on
-          ? { outline: '2px solid #69f0ae', outlineOffset: '-2px', boxShadow: '0 0 8px 2px #69f0aecc' }
-          : { outline: '', outlineOffset: '', boxShadow: '' });
+        // The same dimming as the bag filter, as a filter: the bag filter owns the slot's inline opacity.
         for (const slot of document.querySelectorAll('[data-tl-consign]'))
-          if (!lit.has(slot)) {
+          if (!dimmed.has(slot)) {
             delete slot.dataset.tlConsign;
-            look(slot, false);
+            slot.style.filter = '';
           }
-        for (const slot of lit)
+        for (const slot of dimmed)
           if (!slot.dataset.tlConsign) {
             slot.dataset.tlConsign = '1';
-            look(slot, true);
+            slot.style.filter = 'opacity(0.22)';
           }
       }
       scanMarket(cards, state, prefs) {
@@ -11042,7 +11039,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('逛摊按脚本排序', 'market.sort', { immediate: true, choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
             f('逛摊隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '指定卖给他人的和自己上架的商品不显示，页数只算能买的。逛摊窗口里“隐藏自己”左边的“隐藏无法购买”是同一个开关' })) +
           g('寄售上架',
-            f('高亮背包里能寄售的物品', 'market.consignHighlight', { help: '九州商会切到“寄售上架”时，背包装备、道具、材料三页里未绑定的物品加绿框，右键即可放入寄售槽' })) +
+            f('调暗背包里不能寄售的物品', 'market.consignHighlight', { help: '九州商会切到“寄售上架”时，背包装备、道具、材料三页里已绑定的物品调暗，未绑定的不变，右键即可放入寄售槽' })) +
           g('工坊',
             f('显示“一键放入”按钮', 'fill.enabled', { help: '在游戏窗口显示' }) +
             f('完成后补回同种符和材料', 'fill.refill', { dependsOn: 'fill.enabled' }), false, { help: HELP.fill }) +
