@@ -187,9 +187,9 @@
         materialIds: [],
         maxPerDay: 100,
       },
-      warehouse: { enabled: false, minQuality: 3, sets: true, perfect: false },
+      warehouse: { enabled: false, items: false, minQuality: 3, sets: true, perfect: false },
       shop: { enabled: true, minimumStock: 8, targetStock: 30, maxBatch: 20 },
-      trade: { enabled: false, scanSeconds: 60, yuanbaoReserve: 0, sell: [], buy: [] },
+      trade: { enabled: false, fromWarehouse: false, scanSeconds: 60, yuanbaoReserve: 0, sell: [], buy: [] },
       gems: {
         enabled: true,
         drill: true,
@@ -430,6 +430,7 @@
       gem: '宝石', cotton: '棉布', mithril: '秘银', fragment: '残页', book: '技能书',
     };
     const TRADE_CURRENCIES = [[1, '金币'], [2, '元宝']];
+    const TRADE_MAX_PRICE = 2000000000;
     const tradeCategoryKey = item => typeof item === 'string' && Object.hasOwn(TRADE_CATEGORIES, item);
     const tradeNumber = (value, fallback) =>
       typeof value === 'number' || typeof value === 'string' && value.trim() ? num(value, fallback) : fallback;
@@ -451,8 +452,11 @@
       }
       const item = tradeCategoryKey(rule.item) ? rule.item :
         tradePositiveId(rule.item) && Number.isSafeInteger(Number(rule.item)) ? Number(rule.item) : 0;
+      const unit = tradeNumber(rule.unitPrice, 1);
       return { ...base, on: base.on && !!item, item, count: tradeInt(rule.count, 1, 9999999),
-        price: tradeInt(rule.price, 1, 2000000000),
+        maxMode: tradeSwitch(rule.maxMode), priceMode: rule.priceMode === 'unit' ? 'unit' : 'lot',
+        price: tradeInt(rule.price, 1, TRADE_MAX_PRICE),
+        unitPrice: unit <= 0 ? 1 : Math.max(0.01, Number(unit.toFixed(2))),
         targetId: tradePositiveId(rule.targetId) ? String(rule.targetId).trim().replace(/^0+/, '') : '',
         keep: tradeInt(rule.keep, 0), maxListings: tradeInt(rule.maxListings, 1, 10) };
     }
@@ -470,7 +474,7 @@
       });
     }
     function tradeConfig(value) {
-      return { enabled: tradeSwitch(value?.enabled),
+      return { enabled: tradeSwitch(value?.enabled), fromWarehouse: tradeSwitch(value?.fromWarehouse),
         scanSeconds: tradeInt(value?.scanSeconds, 20, 600, 60), yuanbaoReserve: tradeInt(value?.yuanbaoReserve, 0),
         sell: tradeRuleList(value?.sell, 'sell'), buy: tradeRuleList(value?.buy, 'buy') };
     }
@@ -1470,6 +1474,16 @@
         String(bag?.itemTmpl?.descTpl || ''),
       );
     }
+    function gemCharmKind(s, bag) {
+      if (!charmUsable(s, bag)) return '';
+      const id = materialId(bag), fn = num(bag.itemTmpl.functionType);
+      if (id === 5053 && fn === 1) return 'inlay';
+      if (id === 5058 || id === 5059) return 'synth';
+      if (id === 5069) return 'remove';
+      if (id === 5060) return 'polish';
+      if ([5052, 5053].includes(id) || !itemRange(bag.itemTmpl, '宝石')) return '';
+      return fn === 4 ? 'remove' : fn === 5 ? 'polish' : '';
+    }
     function charmCompatible(s, bag, kind, gem) {
       const embedded =
         kind === 'remove' &&
@@ -1478,27 +1492,12 @@
         num(gem.itemTmpl.gemLevel) <= 6 &&
         !!GEM_ATTR[num(gem.itemTmpl.subType)];
       if (
-        !charmUsable(s, bag) ||
+        gemCharmKind(s, bag) !== kind ||
         !(embedded || gemUsable(s, gem)) ||
         !materialSupports(bag, '宝石', num(gem.itemTmpl.gemLevel))
       )
         return false;
-      const id = materialId(bag),
-        fn = num(bag.itemTmpl.functionType);
-      const nativeKinds = {
-        5052: 'inlay',
-        5053: 'inlay',
-        5058: 'synth',
-        5059: 'synth',
-        5069: 'remove',
-        5060: 'polish',
-      };
-      if (nativeKinds[id] && nativeKinds[id] !== kind) return false;
-      if (kind === 'inlay') return id === 5053 && fn === 1;
-      if (kind === 'synth') return id === (num(gem.itemTmpl.gemLevel) <= 4 ? 5058 : 5059);
-      const expected = kind === 'remove' ? 4 : kind === 'polish' ? 5 : 0,
-        known = kind === 'remove' ? 5069 : 5060;
-      return !!expected && (id === known || (fn === expected && !!itemRange(bag.itemTmpl, '宝石')));
+      return kind !== 'synth' || materialId(bag) === (num(gem.itemTmpl.gemLevel) <= 4 ? 5058 : 5059);
     }
     function gemCharm(s, kind, gem) {
       return (
@@ -1528,14 +1527,12 @@
         return null;
       return raw.length ? raw.map(Number) : [-1, -1, -1];
     }
-    function tailorMaterialIds(targetId) {
-      const min = TAILOR_DEFENSE.includes(num(targetId))
-        ? 5008
-        : TAILOR_JEWELRY.includes(num(targetId))
-          ? 5017
-          : 0;
-      return min ? Array.from({ length: 8 }, (_, i) => min + i) : [];
-    }
+    const TAILOR_CLOTH = Array.from({ length: 8 }, (_, i) => 5008 + i);
+    const TAILOR_MITHRIL = Array.from({ length: 8 }, (_, i) => 5017 + i);
+    const tailorMaterialIds = targetId => TAILOR_DEFENSE.includes(num(targetId)) ? TAILOR_CLOTH
+      : TAILOR_JEWELRY.includes(num(targetId)) ? TAILOR_MITHRIL : [];
+    const drillBag = (s, b, range = drillRange(b.itemTmpl)) =>
+      materialUsable(s, b) && num(b.itemTmpl.functionType) === 2 && !!range;
     function drillMaterial(s, eq) {
       const level = num(template(eq).reqLevel);
       return (
@@ -1543,10 +1540,7 @@
           .map((b) => ({ bag: b, range: drillRange(b.itemTmpl) }))
           .filter(
             ({ bag, range }) =>
-              bagUsable(s, bag) &&
-              num(bag.itemTmpl?.functionType) === 2 &&
-              MATERIAL_TYPES.includes(num(bag.itemTmpl.type, 3)) &&
-              range &&
+              drillBag(s, bag, range) &&
               level >= range.min &&
               level <= range.max,
           )
@@ -1959,6 +1953,7 @@
       return view;
     }
     const RING_NAMES = ['黄金之链', '玄佛珠', '熔岩之地'];
+    const RINGS_EXCHANGE_IDS = { ring: [98011], jade: [98012], ringFirst: [98011, 98012], jadeFirst: [98012, 98011] };
     const ringStage = (stage) => '第' + (stage + 1) + '环「' + RING_NAMES[stage] + '」';
     const expMemo = { text: '', until: 0 };
     function doubleExpUntil(role) {
@@ -2070,11 +2065,11 @@
       let next;
       if (p.rings.claimInbox && status.pending > 0) next = request('inbox', '领取暂存奖励');
       else {
-        const order = { ring: [98011], jade: [98012], ringFirst: [98011, 98012], jadeFirst: [98012, 98011] };
-        if (status.bound + status.unbound >= 300 && order[p.rings.exchange]) {
+        const order = RINGS_EXCHANGE_IDS[p.rings.exchange];
+        if (status.bound + status.unbound >= 300 && order) {
           const owned = new Set([...array(s.equipments), ...array(s.warehouseEquips), ...array(s.bagItems)]
             .map((e) => num(e.equipTmpl?.id ?? e.tmpl?.id ?? e.tmplId ?? e.itemId)));
-          const id = order[p.rings.exchange].find((id) => !owned.has(id));
+          const id = order.find((id) => !owned.has(id));
           if (id) next = request('exchange', id === 98011 ? '兑换重楼戒' : '兑换重楼玉', id);
         }
         if (!next && status.open && !status.doubleExp) next = request('enter', '从第一环开始');
@@ -2330,10 +2325,15 @@
     const tradeBuyMatches = (rule, entry) => !rule.item || (tradeCategoryKey(rule.item)
       ? rule.item === tradeCategory(entry.template) : tradeNameMatches(rule.item, entry));
     const tradeNeedsTarget = item => !item || tradeCategoryKey(item);
+    const tradePriceError = '每单价格不能超过 20 亿';
+    // Integer hundredths avoid rounding an exact whole-lot price up by one.
+    const tradeLotPrice = (rule, count) => rule.priceMode === 'unit'
+      ? Math.max(1, Math.ceil(Math.round(rule.unitPrice * 100) * count / 100)) : rule.price;
     function tradeSellReason(rule, role) {
       if (!rule.item) return '请选择可上架的物品';
       if (tradeCategoryKey(rule.item) && !rule.targetId) return '大类仅用于指定角色ID的转移';
       if (rule.targetId && num(rule.targetId) === num(role?.id)) return '不能指定自己的角色ID';
+      if (tradeLotPrice(rule, rule.maxMode ? 1 : rule.count) > TRADE_MAX_PRICE) return tradePriceError;
       return '';
     }
     function tradeBuyReason(rule, sells, items) {
@@ -2353,7 +2353,13 @@
     }
     function tradeRules(s, prefs) {
       const sells = prefs.sell.filter(rule => rule.on), items = sells.length && prefs.buy.length ? tradeItems(s) : [];
-      return { sell: prefs.sell.map(rule => ({ rule, reason: tradeSellReason(rule, s?.role) })),
+      const checkPrice = prefs.sell.some(rule => rule.maxMode && tradeLotPrice(rule, rule.count) > TRADE_MAX_PRICE);
+      const bag = checkPrice ? tradeStacks(s?.bagItems) : null;
+      const warehouse = checkPrice && prefs.fromWarehouse ? tradeStacks(s?.warehouseItems) : null;
+      const inventory = checkPrice && s?.trade?.inventory ? tradeInventoryStacks(s.trade.inventory) : bag;
+      return { sell: prefs.sell.map(rule => ({
+        rule, reason: tradeSellReason(rule, s?.role) || tradeMaxPriceReason(rule, inventory, warehouse, bag),
+      })),
         buy: prefs.buy.map(rule => ({ rule, reason: tradeBuyReason(rule, sells, items) })) };
     }
     function tradeSafe(s, p, now) {
@@ -2558,11 +2564,12 @@
     }
     // A bound and an unbound stack of one item are different kinds: an unbound stack stays tradeable in the bag.
     const stackKind = item => item.itemId + ':' + (item.isBound ? 1 : 0);
-    function sortDepositPlan(bagItems, warehouseItems) {
+    function sortDepositPlan(bagItems, warehouseItems, keep = () => false) {
       const known = new Set(array(warehouseItems).filter(item => item?.count >= 1 && item.itemId != null)
         .map(stackKind));
       return array(bagItems).filter(item => item?.id != null && item.count >= 1 && known.has(stackKind(item)) &&
-        [2, 3, 4].includes(item.itemTmpl?.type) && !['HP', 'MP', 'hp', 'mp'].some(attr => potionEffect(item.itemTmpl, attr) > 0))
+        MATERIAL_TYPES.includes(item.itemTmpl?.type) && !['HP', 'MP', 'hp', 'mp'].some(attr => potionEffect(item.itemTmpl, attr) > 0) &&
+        !keep(item))
         .map(({ id, itemId, count, itemTmpl }) => ({ bagItemId: id, itemId, count, name: itemTmpl.name }));
     }
     // Bag and warehouse tabs file stacks alike: 道具 is template type 2, 材料 types 3 and 4.
@@ -2985,45 +2992,102 @@
       return array(mine.claims).filter(claim => claim?.id != null).map(claim =>
         tradeRequest('claim', { claimId: claim.id }, '领取' + tradeClaimText(claim), { tradeClaim: claim }));
     }
-    const tradeSales = mine => array(mine.listings).filter(row => row?.mode === 'SALE');
+    const tradeSales = mine => array(mine?.listings).filter(row => row?.mode === 'SALE');
     function tradeCancels(mine, now) {
       return tradeSales(mine).filter(row => row.id != null && tradeExpiry(row.expires_at) < now).map(row =>
         tradeRequest(row.source === 'LEGACY' ? 'legacyCancel' : 'cancel', { listingId: row.id, legacyId: row.id },
           '下架过期的「' + row.title + '」'));
     }
-    function tradeStacks(inventory) {
+    function tradeStacks(rows) {
       const stacks = new Map();
-      for (const asset of array(inventory?.assets)) {
-        if (asset?.kind !== 'BAG' || asset.bag?.id == null || asset.bag.isBound || num(asset.bag.count) <= 0) continue;
-        const item = tradeAsset(asset);
+      for (const bag of array(rows)) {
+        if (bag?.id == null || bag.isBound || num(bag.count) <= 0) continue;
+        const item = tradeBagItem(bag);
         if (!item.id) continue;
-        const group = stacks.get(item.id) || { ...item, units: 0, largest: asset.bag };
-        group.units += num(asset.bag.count);
-        if (num(asset.bag.count) > num(group.largest.count)) group.largest = asset.bag;
+        const group = stacks.get(item.id) || { ...item, name: bag.name || item.name, units: 0, largest: bag };
+        group.units += num(bag.count);
+        if (num(bag.count) > num(group.largest.count)) group.largest = bag;
         stacks.set(item.id, group);
       }
       return stacks;
     }
-    function tradeSellPlan(rule, item, listings) {
-      const { count, keep, price, currency, targetId, maxListings } = rule;
-      if (!tradeSellMatches(rule, item) || num(item.largest.count) < count || item.units - keep < count) return null;
+    function tradeInventoryStacks(inventory) {
+      return tradeStacks(array(inventory?.assets).filter(asset => asset?.kind === 'BAG').map(asset => {
+        const { id, name, template } = tradeAsset(asset);
+        return { ...asset.bag, itemId: id, itemTmpl: template, name };
+      }));
+    }
+    function tradeLotCount(rule, item, stored) {
+      const q = Math.min(rule.count, num(item.largest.count), item.units + num(stored?.units) - rule.keep);
+      return q >= 1 && (rule.maxMode || q === rule.count) ? q : 0;
+    }
+    function tradeMaxPriceReason(rule, inventory, warehouse, bag) {
+      if (!inventory || !rule.maxMode || tradeLotPrice(rule, rule.count) <= TRADE_MAX_PRICE) return '';
+      const over = (item, q) => tradeSellMatches(rule, item) && q > 0 && tradeLotPrice(rule, q) > TRADE_MAX_PRICE;
+      for (const item of inventory.values())
+        if (over(item, tradeLotCount(rule, item, warehouse?.get(item.id)))) return tradePriceError;
+      for (const item of warehouse?.values() || [])
+        if (over(item, tradeWithdrawLot(rule, item, bag.get(item.id)).q)) return tradePriceError;
+      return '';
+    }
+    function tradeSellFull(rule, item, listings) {
       // A missing target cannot verify spare capacity. An explicit null is a public listing.
-      const listed = listings.filter(row => row.assets?.length === 1 && tradeAsset(row.assets[0]).id === item.id &&
-        num(row.price) === price && num(row.currency) === currency &&
-        (row.target_id === undefined || String(row.target_id ?? '') === targetId)).length;
-      if (listed >= maxListings) return null;
+      return listings.filter(row => (row.state == null || row.state === 'OPEN') &&
+        row.assets?.length === 1 && row.assets[0]?.kind === 'BAG' && tradeAsset(row.assets[0]).id === item.id &&
+        (rule.priceMode === 'lot' || num(row.quantity) > 0) &&
+        num(row.price) === tradeLotPrice(rule, num(row.quantity)) && num(row.currency) === rule.currency &&
+        (row.target_id === undefined || String(row.target_id ?? '') === rule.targetId)).length >= rule.maxListings;
+    }
+    function tradeSellPlan(rule, item, listings, stored) {
+      if (!tradeSellMatches(rule, item)) return null;
+      const count = tradeLotCount(rule, item, stored), price = tradeLotPrice(rule, count);
+      if (!count || price > TRADE_MAX_PRICE || tradeSellFull(rule, item, listings)) return null;
+      const { currency, targetId } = rule;
       const label = '上架「' + (item.name || item.id) + '」×' + count + '（' + price + ' ' + tradeCurrency(currency) +
         '，单价 ' + tradeUnitText(price, count) + '）' + (targetId ? '，指定 ' + targetId : '');
       const a = tradeRequest('create', { mode: 'SALE', assets: [{ kind: 'BAG', id: String(item.largest.id), count }],
         price, currency, targetId: targetId || null, note: '' }, label);
-      a.key = 'MARKET_COMMAND:create:' + JSON.stringify([item.id, count, price, currency, targetId]);
+      a.key = 'MARKET_COMMAND:create:' + JSON.stringify([rule.id, item.id]);
       return a;
     }
-    function tradeSells(s, rules) {
-      const active = rules.sell.filter(({ rule, reason }) => rule.on && !reason);
-      if (!active.length || !s.trade?.inventory) return [];
-      const items = [...tradeStacks(s.trade.inventory).values()], listings = tradeSales(s.trade.mine);
-      return active.flatMap(({ rule }) => items.map(item => tradeSellPlan(rule, item, listings)).filter(Boolean));
+    const tradeActiveSells = (s, prefs) => prefs.sell.filter(rule => rule.on && !tradeSellReason(rule, s.role));
+    function tradeSells(s, prefs) {
+      if (!s.trade?.mine || !s.trade.inventory) return [];
+      const active = tradeActiveSells(s, prefs);
+      if (!active.length) return [];
+      const items = [...tradeInventoryStacks(s.trade.inventory).values()], listings = tradeSales(s.trade.mine);
+      const warehouse = prefs.fromWarehouse ? tradeStacks(s.warehouseItems) : null;
+      return active.flatMap(rule => items.map(item => tradeSellPlan(rule, item, listings, warehouse?.get(item.id))).filter(Boolean));
+    }
+    function tradeWithdrawLot(rule, item, bag) {
+      const largest = num(bag?.largest.count);
+      const count = Math.max(0, Math.min(num(item.largest.count), item.units - rule.keep));
+      const q = rule.maxMode ? Math.min(rule.count, count)
+        : largest < rule.count && largest + count >= rule.count ? rule.count : 0;
+      return { count, q };
+    }
+    function tradeWithdrawItem(rule, item, bag, listings) {
+      if (!tradeSellMatches(rule, item)) return null;
+      const { count, q } = tradeWithdrawLot(rule, item, bag);
+      if (!count || !q || tradeLotPrice(rule, q) > TRADE_MAX_PRICE || tradeSellFull(rule, item, listings)) return null;
+      const a = action('WAREHOUSE_WITHDRAW', { warehouseItemId: item.largest.id, count },
+        '取出仓库「' + (item.name || item.id) + '」×' + count + '准备上架', 'warehouse', { inBattle: true, warehouseMove: true });
+      a.key = 'WAREHOUSE_WITHDRAW:trade:' + item.id;
+      return a;
+    }
+    function tradeWarehousePlan(s, prefs, now) {
+      if (!prefs?.enabled || !prefs.fromWarehouse || !array(s.warehouseItems).length) return null;
+      const active = tradeActiveSells(s, prefs);
+      if (!active.length) return null;
+      const warehouse = tradeStacks(s.warehouseItems), bag = tradeStacks(s.bagItems);
+      const listings = tradeSales(s.trade?.mine);
+      for (const rule of active) {
+        for (const item of warehouse.values()) {
+          const a = tradeWithdrawItem(rule, item, bag.get(item.id), listings);
+          if (a && !(s.warehouseSuppressed?.get(a.key) > now)) return a;
+        }
+      }
+      return null;
     }
     const tradeBalance = (role, currency) => num(currency === 2 ? role.yuanbao : role.money);
     const tradeFunds = (s, currency) => Math.min(tradeBalance(s.role, currency), s.trade?.wallet?.[currency] ?? Infinity);
@@ -3075,7 +3139,7 @@
       const buy = rules.buy.filter(({ rule, reason }) => rule.on && !reason)
         .map(({ rule }) => tradeBuyOption(s, p, now, rule, sells)).filter(Boolean)
         .sort((a, b) => a.tradeBuy.unit - b.tradeBuy.unit)[0];
-      return [...reads, ...tradeClaims(mine), ...tradeCancels(mine, now), ...(buy ? [buy] : []), ...tradeSells(s, rules)];
+      return [...reads, ...tradeClaims(mine), ...tradeCancels(mine, now), ...(buy ? [buy] : []), ...tradeSells(s, p.trade)];
     }
     function petScreenable(entry, state, prefs = DEFAULTS.pets) {
       const pet = entry?.pet;
@@ -3217,9 +3281,41 @@
       const write = claim || start || publish;
       return write ? [...reads, write] : reads;
     }
-    function petEggs(s) {
-      return array(s.bagItems).filter((item) => num(item.count) > 0 &&
-        String(item.itemTmpl?.useEffect || '').includes('HATCH_PET'));
+    const petEgg = item => num(item.count) > 0 && String(item.itemTmpl?.useEffect || '').includes('HATCH_PET');
+    const petEggs = s => array(s.bagItems).filter(petEgg);
+    const WAREHOUSE_ITEM_DEPOSIT_KEY = 'WAREHOUSE_DEPOSIT:items';
+    function workshopKeepsItem(s, p, bag, id) {
+      if (p.gems.enabled && (gemUsable(s, bag) || gemCharmKind(s, bag) || drillBag(s, bag))) return true;
+      if (p.smithy.enabled && ((p.smithy.enhance && [5050, 5051].includes(id)) ||
+          (p.smithy.repair && id >= 5032 && id <= 5043) ||
+          (p.smithy.forge && id >= 5044 && id <= 5049))) return true;
+      return p.craft.enabled && ((p.craft.exchange && id >= 5273 && id <= 5277) ||
+        (p.craft.tailor && (TAILOR_CLOTH.includes(id) || TAILOR_MITHRIL.includes(id))));
+    }
+    function warehouseKeepsItem(s, p, sellRules, bag) {
+      const id = materialId(bag);
+      if (sellRules.some(rule => tradeSellMatches(rule, tradeBagItem(bag)))) return true;
+      if (p.pets.enabled && p.pets.hatch && petEgg(bag)) return true;
+      if (p.activities.enabled && ((p.activities.bear && id === 51002) ||
+          (p.activities.tianlingUse && p.battle.enabled && id === 51003))) return true;
+      if (p.sell.enabled && p.sell.materialIds.map(num).includes(id) && num(bag.itemTmpl.price) > 0) return true;
+      if (p.rings.enabled && RINGS_EXCHANGE_IDS[p.rings.exchange]?.includes(id)) return true;
+      return workshopKeepsItem(s, p, bag, id);
+    }
+    function warehouseDepositPlan(s, p, now) {
+      if (!p.warehouse?.items || s.warehouseSuppressed?.get(WAREHOUSE_ITEM_DEPOSIT_KEY) > now) return null;
+      const rules = p.trade?.enabled ? p.trade.sell.filter(rule => rule.on) : [];
+      const [item] = sortDepositPlan(s.bagItems, s.warehouseItems, bag => warehouseKeepsItem(s, p, rules, bag));
+      if (!item) return null;
+      const { bagItemId, count, name } = item;
+      const a = action('WAREHOUSE_DEPOSIT', { bagItemId, count }, '存入仓库「' + name + '」×' + count,
+        'warehouse', { inBattle: true, warehouseMove: true });
+      a.key = WAREHOUSE_ITEM_DEPOSIT_KEY;
+      return a;
+    }
+    function warehouseItemPlans(s, p, now) {
+      if (!num(s.role?.id)) return [];
+      return [tradeWarehousePlan(s, p.trade, now), warehouseDepositPlan(s, p, now)].filter(Boolean);
     }
     // The game day ends at 00:00 UTC+8: ranks settle and the daily counts restart.
     const dayLeft = (now) => 86400000 - (now + 28800000) % 86400000;
@@ -3283,8 +3379,8 @@
       return withScoringPass(view.state, () => plansFrom(view.state, view.prefs, ledger, now, s, p));
     }
     function plansFrom(s, p, ledger, now, farmState, farmPrefs) {
-      const out = [], materials = !ASSAULT_IDS.includes(s?.gearProfile?.worn);
-      if (!s?.role || !num(s.role.id)) return out;
+      if (!s?.role || !num(s.role.id)) return [];
+      const out = warehouseItemPlans(s, p, now), materials = !ASSAULT_IDS.includes(s?.gearProfile?.worn);
       const add = (a) => {
         if (allowed(a, s, p, ledger) && materialCheck(a, s, p).ok) {
           out.push(a);
@@ -3296,7 +3392,7 @@
         equipped = array(s.equipments).filter((e) => !!e.isEquipped);
       const ringsDaily = ledger.rings?.day === s.rings?.day ? ledger.rings : null;
       const ring = ringsPlan(s, p, ringsDaily, now);
-      if (p.rings?.enabled && num(role.level) >= 56 && s.rings?.run) return ring ? [ring] : [];
+      if (p.rings?.enabled && num(role.level) >= 56 && s.rings?.run) return ring ? [ring, ...out] : out;
       const protection = loadoutProtection(s), pending = array(s.gearProfile?.pending);
       const rejected = new Set(materials ? gearRejected(s.gearRejected, now).map((e) => e.id) : []),
         protectedGear = new Set([...rejected, s.gearCheck?.oldItemId, ...protection.keys()]);
@@ -4379,7 +4475,7 @@
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
       tradeRules, tradeNeedsTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText,
-      tradeOwnReads, tradeReads, tradePlans, tradeBalance, tradeFunds, tradeProgress, tradeBought, tradeDone,
+      tradeOwnReads, tradeReads, tradePlans, tradeSells, tradeLotPrice, tradeBalance, tradeFunds, tradeProgress, tradeBought, tradeDone,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       transferKind, transferKeyRole, transferMerge, transferMergeData,
       CRIT_BASE, CRIT_RATE, CRIT_FLOOR, CRIT_DEF_OFFSET, CRIT_DEF_RATE, CRIT_DEF_DIVISOR, critMultiplier,
@@ -4416,7 +4512,7 @@
       statsNumber,
       doubleExpUntil,
       potionEffect,
-      sortDepositPlan, bagCellItem, bagTabItems, warehouseTabItems, warehouseKeys, keysMatch, shortcutConflicts, loadoutProtection,
+      sortDepositPlan, warehouseItemPlans, bagCellItem, bagTabItems, warehouseTabItems, warehouseKeys, keysMatch, shortcutConflicts, loadoutProtection,
       potionChoices,
       potionSettings,
       potionPick,
@@ -6124,6 +6220,11 @@
         const cache = this.cache.trade;
         if (cache) this.cache.trade = { role: cache.role, lists: new Map(), used: cache.used, buyAt: cache.buyAt,
           wallet: cache.wallet, revision: cache.revision + 1 };
+      }
+      invalidateTradeInventory(cache) {
+        if (!cache || this.cache.trade !== cache) return;
+        cache.revision++;
+        delete cache.inventory;
       }
       cacheTradeRead(action, packet, cache, revision) {
         const data = packet.data, name = action.payload.action, at = Date.now(), key = action.tradeQuery;
@@ -8624,7 +8725,8 @@
       }
       tradeContext(s) {
         return { ...s, tradeProgress: this.tradeData(P.num(s.role?.id)).progress,
-          tradeSuppressed: this.suppressed, activity: this.activity || this.arenaPending || s.activity,
+          tradeSuppressed: this.suppressed, warehouseSuppressed: this.suppressed,
+          activity: this.activity || this.arenaPending || s.activity,
           invasionVisit: this.invasionVisit || s.invasionVisit };
       }
       recordTrade(a, role) {
@@ -8656,16 +8758,25 @@
         const after = this.bridge.state();
         if (!cache || after?.trade !== cache) return;
         // Reads sent before the trade answer cannot confirm the post-trade state.
-        cache.revision++;
+        this.bridge.invalidateTradeInventory(cache);
         delete cache.mine;
-        delete cache.inventory;
         if (this.enabled && this.prefs.trade.enabled)
           await this.executeQueries(P.tradeOwnReads(cache, this.prefs.trade.scanSeconds * 1000, Date.now()));
+      }
+      warehouseMoveResult(a, before, success, message) {
+        if (success) {
+          this.bridge.invalidateTradeInventory(before.trade);
+          this.log(a.label + '：完成', 'success');
+          return;
+        }
+        this.log(a.label + '：' + (message || '操作未成功'), 'warning');
+        this.suppress(a, 1800000);
       }
       planningPass(state, prefs, now = Date.now()) {
         const clock = this.planNow || monotonicNow, started = clock();
         try {
-          const s = this.gearState(prefs.trade?.enabled ? this.tradeContext(state) : state, now);
+          const context = prefs.trade?.enabled ? this.tradeContext(state) : { ...state, warehouseSuppressed: this.suppressed };
+          const s = this.gearState(context, now);
           if (!prefs.rings?.enabled && !prefs.invasion?.enabled) return P.plans(s, prefs, this.ledger, now);
           return P.plans({ ...s, invasionVisit: this.invasionVisit, invasionPriorRefused: this.invasionPriorRefused,
             activity: this.activity || this.arenaPending || s.activity,
@@ -8813,6 +8924,16 @@
         if (market && (!this.enabled || !this.prefs.trade?.enabled)) return;
         if (trade && (!P.tradeSafe(this.tradeContext(before), this.prefs, Date.now()) ||
             this.bridge.battle().stage !== 'idle')) return;
+        if (trade && a.payload.action === 'create') {
+          a = P.tradeSells(before, this.prefs.trade).find(current => current.key === a.key);
+          if (!a || (this.suppressed.get(a.key) ?? -Infinity) > Date.now()) return;
+        }
+        if (a.warehouseMove) {
+          if (!this.enabled) return;
+          const current = P.warehouseItemPlans({ ...before, warehouseSuppressed: this.suppressed }, this.prefs, Date.now());
+          a = current.find(move => move.key === a.key);
+          if (!a) return;
+        }
         const buyFunds = a.tradeBuy ? P.tradeFunds(before, a.payload.currency) : null;
         if (a.breedSuccess) {
           const town = P.townFor(before, P.NPC.petKeeper);
@@ -8875,6 +8996,10 @@
           }
           const result = await this.bridge.request(a, this.responseTimeout());
           if (trade) { await this.tradeResult(a, before, result, buyFunds); return; }
+          if (a.warehouseMove) {
+            this.warehouseMoveResult(a, before, result.success ?? result.code === 200, result.message);
+            return;
+          }
           if (a.breedSuccess) {
             if (result.success) this.log(a.breedSuccess, 'success');
             if (result.success && a.payload.action === 'claim') {
@@ -9022,6 +9147,11 @@
             this.pause('金币已低于保留额度，请核对当前资源');
           this.saveLedger();
         } catch (e) {
+          if (a.warehouseMove && e.code === 'SERVER_ERROR') {
+            this.warehouseMoveResult(a, before, false, safeMessage(e.serverMessage || e.message));
+            return;
+          }
+          if (a.warehouseMove) this.bridge.invalidateTradeInventory(before.trade);
           if (a.type === 'ARENA_COMMAND' && a.payload.action === 'challenge') this.arenaRefused(a);
           if (this.petRoomRefused(a, e.serverMessage || e.message, before)) return;
           if (a.breedSuccess || a.payload?.action === 'breedingList') {
@@ -9274,6 +9404,11 @@
         if (this.prefs.trade?.enabled) {
           const reads = P.tradeReads(this.tradeContext(s), this.prefs.trade, now);
           if (reads.length) this.executeQueries(reads).catch(e => this.pause(e.message));
+        }
+        if (!actionBlocked) {
+          const move = P.warehouseItemPlans({ ...s, warehouseSuppressed: this.suppressed }, this.prefs, now)
+            .find(a => !this.bridge.responsePending?.(a));
+          if (move) { await this.execute(move); return; }
         }
         const rings = P.RINGS_MAP_IDS.includes(P.num(s.role.mapId));
         if (!actionBlocked) this.updateProfile(s, now);
@@ -10302,9 +10437,11 @@
       sellAppraised: "不勾选时，资质不是外攻、内攻双完美（都高于 1500）的已鉴定武器按其余规则出售；品质上限、强化、套装等保护照常生效。",
       sell: "穿戴、强化、镶宝和星级装备始终保留。材料仅按填写的模板ID处理。",
       trade: '查询商会（搜索商品、看自己的交易和可上架物品）不用停止战斗，也不用打开商会窗口。上架、购买、领取、下架要先停止战斗：只在城里或普通野外挂机图上短暂停一下，办完继续打；珍珑棋局、熊林、伪宋军领地、无相浮屠、新三环、宵小入侵和比武时不交易，结束后再办。只在托管运行时工作。卖出的钱和买到的物品自动领取。',
-      tradeSell: '只卖未绑定的物品，不卖装备和珍兽。背包里未绑定的数量（减去保留）够一单才上架，攒够再卖。大类（宝石、棉布、秘银、残页、技能书）只能指定角色ID出售，用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
+      tradeSell: '只上架未绑定的道具和材料，每单只用背包里的一组。关闭最大个数时，攒够一单才上架；开启后，扣掉保留数量，有多少卖多少，最多卖到填写的个数。按物品单价时，整单价向上取整。大类（宝石、棉布、秘银、残页、技能书）只能指定角色ID，用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
+      tradeWarehouse: '商会只能上架背包里的物品；开启后，仓库里符合上架规则的未绑定物品会自动取出到背包再上架（战斗中取出，不用停战）',
       tradeBuy: '只买一口价的道具和材料（不买装备、珍兽、以物易物）。按物品名完全一致匹配，单价 = 整单价 ÷ 数量。买的人只能买下整单。物品留空或选大类时，只买别人指定卖给你的商品。为防止高频扫货，采购最快 5 分钟查一次商会（查询间隔更长时按查询间隔）。',
-      warehouse: "只处理背包中未穿戴的装备；可穿戴的更优装备会先穿戴。仓库装备格满 200 时暂停存仓。符合存仓条件的装备不会被自动出售。",
+      warehouse: "装备存仓只处理未穿戴的装备；可穿戴的更优装备会先穿戴。仓库装备格满 200 时暂停存装备。符合存仓条件的装备不会被自动出售。",
+      warehouseItems: '只存仓库里已有同种（绑定状态也相同）的道具和材料，整组存入，战斗中进行；回血回蓝药和托管要用的物品不存',
       potions: "回血量长期等于掉血量，阈值高低不改变吃药数量，只决定安全余量。智能顺序按实测的每秒掉血和耗蓝，选回复速度够用、每金币回复最多的药，并改买这种药；血量低于 35% 或阵亡后一段时间内改用最强的药。",
       potionOrder: "游戏自动回复每次只用一颗药且有冷却。智能选择会按“最大值×(100%−阈值)”算出触发时的缺口，优先用刚好补满缺口的最小药，补不满的低级药排在后面兜底。填写指定模板ID时按填写顺序。",
       budget: "按本机日期统计。人物升级按目标等级和保留经验执行。技能升级、冶炼各有每日额度。",
@@ -10845,6 +10982,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           pathSet(this.pending, path, value);
           this.syncFields();
           this.validateInput(e.target);
+          if (path === 'trade.fromWarehouse') this.paintTrade(this.controller.bridge.state());
           if (path === 'logs.level') {
             TLRuntime.saveConfigField(this.controller, 'logs', 'level', TLPolicy.config(this.pending).logs.level);
             this.paintLogs();
@@ -11827,6 +11965,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             }) +
             f('套装装备一律存仓', 'warehouse.sets', { help: '无视品质', dependsOn: 'warehouse.enabled' }) +
             f('自动存入双完美资质装备', 'warehouse.perfect', { dependsOn: 'warehouse.enabled' }) +
+            f('自动存入仓库已有的道具和材料', 'warehouse.items', { help: HELP.warehouseItems }) +
             '', false, { help: HELP.warehouse }) +
             g('金币补药',
             f('金币购买等级适用药品', 'shop.enabled') +
@@ -11854,6 +11993,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         if (this.section === 'trade')
           html = g('商会自动交易',
             f('启用商会自动交易', 'trade.enabled') +
+            f('上架时从仓库取出', 'trade.fromWarehouse', { help: HELP.tradeWarehouse }) +
             f('查询间隔', 'trade.scanSeconds', { unit: '秒', min: 20, max: 600, help: '查自己的交易和可上架物品的间隔；采购查商品最快 5 分钟一次' }) +
             f('元宝保留', 'trade.yuanbaoReserve', { unit: '元宝', help: '采购后元宝不少于此数' }),
           true, { help: HELP.trade }) +
@@ -12031,7 +12171,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       }
       tradeSellItems(s) {
         const items = new Map();
-        for (const bag of TLPolicy.array(s?.bagItems)) {
+        const warehouse = this.pending.trade.fromWarehouse ? TLPolicy.array(s?.warehouseItems) : [];
+        for (const bag of [...TLPolicy.array(s?.bagItems), ...warehouse]) {
           const id = TLPolicy.num(bag.itemId ?? bag.itemTmpl?.id), count = TLPolicy.num(bag.count);
           if (bag.isBound || !id || count <= 0) continue;
           const item = items.get(id) || { name: bag.itemTmpl?.name || '物品 #' + id, units: 0 };
@@ -12051,17 +12192,32 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         return choices;
       }
       tradeSellPreview(rule) {
-        return '单价 ' + TLPolicy.tradeUnitText(rule.price, rule.count) + ' · 税后到账 ' +
-          TLPolicy.tradeNet(rule.price, rule.currency);
+        const price = TLPolicy.tradeLotPrice(rule, rule.count);
+        if (rule.priceMode === 'unit') {
+          const prefix = rule.maxMode ? '每单最多 ' : '每单 ';
+          return prefix + (Number.isFinite(price) ? price : '超过 20 亿');
+        }
+        const unit = rule.maxMode ? '单价随个数变化' : '单价 ' + TLPolicy.tradeUnitText(price, rule.count);
+        return unit + ' · 税后到账 ' + TLPolicy.tradeNet(price, rule.currency);
+      }
+      tradeSellPriceHTML(rule) {
+        return rule.priceMode === 'unit'
+          ? this.tradeField('物品单价', 'unitPrice', rule.unitPrice, { min: 0.01, step: 0.01, currency: rule.currency })
+          : this.tradeField('每单价格', 'price', rule.price, { min: 1, max: 2000000000, currency: rule.currency });
+      }
+      tradeKeepLabel() {
+        return this.pending.trade.fromWarehouse ? '背包和仓库保留' : '背包保留';
       }
       tradeSellHTML(rule, s, items) {
         const field = (label, key, opts) => this.tradeField(label, key, rule[key], opts);
         return field('物品', 'item', { choices: this.tradeSellChoices(s, rule.item, items) }) +
-          field('每单个数', 'count', { min: 1, max: 9999999 }) +
-          field('每单价格', 'price', { min: 1, max: 2000000000, currency: rule.currency }) +
+          field('最大个数', 'maxMode') +
+          field(rule.maxMode ? '每单最大个数' : '每单个数', 'count', { min: 1, max: 9999999 }) +
+          field('计价方式', 'priceMode', { choices: [['lot', '每单价格'], ['unit', '物品单价']] }) +
+          '<div class="trade-price">' + this.tradeSellPriceHTML(rule) + '</div>' +
           '<div class="trade-preview">' + this.tradeSellPreview(rule) + '</div>' +
           field('指定角色ID', 'targetId', { text: true, placeholder: '可空；大类必填' }) +
-          field('背包保留', 'keep', { min: 0 }) + field('同时在售', 'maxListings', { min: 1, max: 10 });
+          field(this.tradeKeepLabel(), 'keep', { min: 0 }) + field('同时在售', 'maxListings', { min: 1, max: 10 });
       }
       tradeBuyHTML(rule) {
         const field = (label, key, opts) => this.tradeField(label, key, rule[key], opts);
@@ -12140,8 +12296,19 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           select.value = String(rule.item);
           select.setAttribute('data-trade-options', key);
         }
+        this.paintTradeLabel(row, 'count', rule.maxMode ? '每单最大个数' : '每单个数');
+        this.paintTradeLabel(row, 'keep', this.tradeKeepLabel());
+        const price = row.querySelector('.trade-price');
+        if (!price.querySelector('[data-trade-field="' + (rule.priceMode === 'unit' ? 'unitPrice' : 'price') + '"]'))
+          price.innerHTML = this.tradeSellPriceHTML(rule);
         const preview = row.querySelector('.trade-preview'), text = this.tradeSellPreview(rule);
         if (preview.textContent !== text) preview.textContent = text;
+      }
+      paintTradeLabel(row, field, text) {
+        const input = row.querySelector('[data-trade-field="' + field + '"]');
+        const label = input.closest('.field').querySelector('.field-label').children[0];
+        if (label.textContent !== text) label.textContent = text;
+        if (input.getAttribute('aria-label') !== text) input.setAttribute('aria-label', text);
       }
       paintTradeBuy(row, rule, progress) {
         const onlyMine = row.querySelector('[data-trade-field="onlyMine"]'), forced = TLPolicy.tradeNeedsTarget(rule.item);
