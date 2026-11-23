@@ -2940,22 +2940,24 @@
         suitable: false, species: '', form: '', pet_sex: '', minRoot: '', minSkills: '', minExt: '', minInt: '',
         minHp: '', minDef: '', skill: '', breedable: false, slot: '', minLevel: '', maxLevel: '',
         minPrice: '', maxPrice: '', minQuality: '', page },
-      keyword ? '查询「' + keyword + '」' : '查询最新商品', { readOnly: true, inBattle: true, tradeQuery });
+      keyword ? '查询「' + keyword + '」' : '查询最新商品', { readOnly: true, inBattle: true, quiet: true, tradeQuery });
     }
     const tradeDue = (entry, interval, now) => !entry || now - entry.at >= interval;
     function tradeOwnReads(cache, interval, now) {
       const reads = [];
       if (tradeDue(cache?.mine, interval, now))
-        reads.push(tradeRequest('mine', { page: 1 }, '查询我的交易', { readOnly: true, inBattle: true }));
+        reads.push(tradeRequest('mine', { page: 1 }, '查询我的交易', { readOnly: true, inBattle: true, quiet: true }));
       if (tradeDue(cache?.inventory, interval, now))
-        reads.push(tradeRequest('inventory', {}, '查询可上架物品', { readOnly: true, inBattle: true }));
+        reads.push(tradeRequest('inventory', {}, '查询可上架物品', { readOnly: true, inBattle: true, quiet: true }));
       for (const read of reads) read.key += ':' + num(cache?.revision);
       return reads;
     }
     function tradeReads(s, prefs, now, rules = tradeRules(s, prefs)) {
       if (!prefs.enabled) return [];
       const cache = s.trade, interval = prefs.scanSeconds * 1000, reads = tradeOwnReads(cache, interval, now);
-      const buy = rules.buy.filter(({ rule, reason }) => rule.on && !reason).map(({ rule }) => rule);
+      // A buy rule that reached its count needs no more market reads.
+      const buy = rules.buy.filter(({ rule, reason }) => rule.on && !reason && !tradeDone(rule, s.tradeProgress))
+        .map(({ rule }) => rule);
       if (buy.some(rule => rule.onlyMine) && (cache?.feedScan || tradeDue(cache?.feed, interval, now)))
         reads.push(tradeListRequest('', 0, 'newest', cache?.feedScan?.nextPage || 1, TRADE_FEED));
       const seen = new Set();
@@ -3070,6 +3072,17 @@
         !pet.locked && pet.id !== state.activePetId && Number.isFinite(entry.average) &&
         (prefs.hatchLock || entry.average < prefs.keepMinAverage);
     }
+    // The server refuses a hatch or a breeding claim with this text when the pet bar, counted with the slots kept
+    // for offspring, is full.
+    const PET_FULL_TEXT = '珍兽栏已满';
+    const PET_FULL_RETRY_MS = 3600000;
+    // After such a refusal, hatching and breeding claims wait until the bar has room again (fewer pets and
+    // reserved slots or a larger bar than at the refusal) or an hour has passed.
+    function petRoomBlocked(state, ledger, now) {
+      const full = ledger?.petFull;
+      if (!state || !full || !(now - Number(full.at) < PET_FULL_RETRY_MS)) return false;
+      return array(state.pets).length + num(state.reserved) >= num(full.used) && num(state.capacity) <= num(full.capacity);
+    }
     function breedable(entry, state) {
       const pet = entry?.pet;
       return !!pet?.id && !!state && pet.id !== state.activePetId && pet.form === 'BABY' &&
@@ -3168,11 +3181,12 @@
         sex: pet.sex === 'MALE' ? 'FEMALE' : 'MALE', minQuality: '不限', onlyCompatible: true },
       '珍兽：查询「' + pet.name + '」的繁殖对象', 'pet', { readOnly: true, inBattle: true, responseType: 'PET_RESPONSE' });
     }
-    function breedingPlans(s, prefs, now) {
+    function breedingPlans(s, prefs, now, ledger) {
       const p = prefs.pets, state = s.pets, reads = [];
       if ((!p.breedClaim && !p.breed) || arenaRush(prefs, now) || s.rings?.run ||
           FARM_MAP_EXCLUDED_IDS.includes(num(s.role.mapId))) return reads;
-      const entries = array(state.pets), ready = p.breedClaim && entries.find((e) => breedingReady(e, state, now));
+      const entries = array(state.pets), ready = p.breedClaim && !petRoomBlocked(state, ledger, now) &&
+        entries.find((e) => breedingReady(e, state, now));
       const claim = ready && breedingWrite('claim', ready.pet, {}, '领取「' + ready.pet.name + '」和二代宝宝',
         '已领取「' + ready.pet.name + '」和二代宝宝');
       if (!p.breed) return claim ? [claim] : [];
@@ -3462,7 +3476,8 @@
           action('PET_COMMAND', { action: name, petId: '', ...payload },
             '珍兽：' + name, 'pet', { responseType: 'PET_RESPONSE', ...options });
         // Hatching diffs the pet list before and after, so it needs a list read moments ago.
-        const hatchWanted = !!state && p.pets.hatch && !pendingIds.length &&
+        const roomBlocked = petRoomBlocked(state, ledger, now);
+        const hatchWanted = !!state && p.pets.hatch && !pendingIds.length && !roomBlocked &&
           entries.length + num(state.reserved) < state.capacity &&
           petEggs(s).some((item) => p.pets.hatchMutant ||
             !String(item.itemTmpl.name).includes('变异'));
@@ -3488,12 +3503,12 @@
           } else if (p.pets.claim && state.pendingRewards > 0) add(request('claimRewards'));
           else if (p.pets.summon && !state.activePetId && best)
             add(request('summon', { petId: best.pet.id, active: true }));
-          else if (p.pets.hatch && !pendingIds.length && egg &&
+          else if (p.pets.hatch && !pendingIds.length && egg && !roomBlocked &&
               entries.length + num(state.reserved) < state.capacity)
             add(action('USE_ITEM', { bagItemId: egg.id, count: 1 },
               '孵化「' + egg.itemTmpl.name + '」', 'pet', { petHatch: true }));
           else {
-            const breeding = breedingPlans(s, p, now);
+            const breeding = breedingPlans(s, p, now, ledger);
             const next = !breeding.length && (petClaimUnlockPlan(entries, p.pets, ledger, request) ||
               petReleasePlan(state, p.pets, pendingIds, request) ||
               petAppraisalPlan(entries, p.pets, pendingIds, request));
@@ -4397,7 +4412,7 @@
       potionOrder,
       skillCost,
       synthRate,
-      petScreenable, claimedLocked,
+      petScreenable, claimedLocked, petRoomBlocked, PET_FULL_TEXT,
       breedable, breedingReady, breedingPick, breedingStatus,
       petEggs,
       freshLedger,
@@ -8658,6 +8673,17 @@
       suppress(a, ms = 300000) {
         this.suppressed.set(a.key, Date.now() + ms);
       }
+      // A full pet bar must not pause the autopilot: hatching and breeding claims wait (P.petRoomBlocked).
+      petRoomRefused(a, message, before) {
+        const claim = !!a.breedSuccess && a.payload?.action === 'claim';
+        if (!(a.petHatch || claim) || !String(message || '').includes(P.PET_FULL_TEXT)) return false;
+        const pets = before?.pets;
+        this.ledger.petFull = { at: Date.now(), used: (pets?.pets || []).length + P.num(pets?.reserved),
+          capacity: P.num(pets?.capacity) };
+        this.log(a.label + '：珍兽栏已满（含繁殖预留位），先跳过自动孵化和繁殖领取，珍兽栏有空位后再继续', 'warning');
+        this.saveLedger();
+        return true;
+      }
       charge(a) {
         if (a.readOnly || a.noResponse) return;
         this.ledger.money += a.moneyCost || 0;
@@ -8733,7 +8759,9 @@
         });
         if (!queries.length) return;
         const batch = { multiple: queries.length > 1, completed: new Set(), unattributed: 0 };
-        if (batch.multiple) this.log('查询：' + queries.map((a) => a.label).join('、'));
+        // Quiet queries (frequent background reads) log only their failures.
+        const loud = queries.filter((a) => !a.quiet);
+        if (batch.multiple && loud.length) this.log('查询：' + loud.map((a) => a.label).join('、'));
         await Promise.all(queries.map(async (a) => {
           const key = responseKey(a);
           (this.pendingQueries ||= new Map()).set(key, a);
@@ -8742,7 +8770,7 @@
         }));
         if (batch.unattributed)
           this.log('服务器返回错误，' + batch.unattributed + ' 个查询稍后重试', 'warning');
-        const completed = queries.filter((a) => batch.completed.has(a));
+        const completed = loud.filter((a) => batch.completed.has(a));
         if (batch.multiple && completed.length)
           this.log('查询完成：' + completed.map((a) => a.label).join('、'), 'success');
       }
@@ -8837,7 +8865,7 @@
               this.ledger.petClaimed = [...new Set([...(this.ledger.petClaimed || []), a.payload.petId])];
               this.saveLedger();
             }
-            if (!result.success) {
+            if (!result.success && !this.petRoomRefused(a, result.data?.message || result.message, before)) {
               this.log(result.data?.message || result.message || '繁殖操作未成功', 'warning');
               this.suppress(a, 300000);
             }
@@ -8949,6 +8977,8 @@
           if (a.noResponse) {
             this.lastSettings = Date.now();
             this.log('自动回复策略已应用');
+          } else if (!success && this.petRoomRefused(a, result.message, before)) {
+            // Logged and remembered; hatching waits for room.
           } else if (!success) {
             this.log(a.label + '：' + (result.message || '操作未成功'), 'warning');
             // A full bag must not cause a town trip every five minutes.
@@ -8956,7 +8986,7 @@
               lotteryDraw || a.type === 'GET_MONSTER_TMPL' ? 1800000 : 300000);
           } else {
             if (queryBatch?.multiple) queryBatch.completed.add(a);
-            else this.log(a.label + '：完成', 'success');
+            else if (!a.quiet) this.log(a.label + '：完成', 'success');
             const reward = lotteryDraw && result.data?.receipt?.reward;
             if (reward) this.log('抽奖获得：' + (['GOLD', 'GIFT'].includes(reward.kind)
               ? P.num(reward.amount).toLocaleString() + ' ' + reward.name
@@ -8977,6 +9007,7 @@
           this.saveLedger();
         } catch (e) {
           if (a.type === 'ARENA_COMMAND' && a.payload.action === 'challenge') this.arenaRefused(a);
+          if (this.petRoomRefused(a, e.serverMessage || e.message, before)) return;
           if (a.breedSuccess || a.payload?.action === 'breedingList') {
             this.log(safeMessage(e.serverMessage || e.message), 'warning');
             this.suppress(a, 300000);
@@ -9225,7 +9256,7 @@
           return;
         }
         if (this.prefs.trade?.enabled) {
-          const reads = P.tradeReads(s, this.prefs.trade, now);
+          const reads = P.tradeReads(this.tradeContext(s), this.prefs.trade, now);
           if (reads.length) this.executeQueries(reads).catch(e => this.pause(e.message));
         }
         const rings = P.RINGS_MAP_IDS.includes(P.num(s.role.mapId));
@@ -10247,7 +10278,7 @@
       gear: "比较同一张图上换装前后的每小时击杀；只有下降超过设定值且统计上可信（约 2 个标准差）才换回，换装后出现阵亡也会换回。核对期间不换其他装备。被换下的装备留在背包，不会自动出售。",
       hiddenClaim: "领取前请确认属攻；领错后转换要 5 砂。",
       hidden: "洗炼和喂养需要回洛阳找薛飞，会中断挂机。无相浮屠（300 万金币/轮）不会自动进入；手动进塔时托管不干预。",
-      pets: "孵蛋、出战、喂养、领取、放生都要先停止战斗（不用回城）；鉴定要回苏州找云飘飘。孵蛋筛选只放生脚本自己刚孵出的、1 级、未锁定、未出战、资质均值低于设定值的普通宝宝。「自动放生」按所选条件放生，出战中和繁殖中的不放。放生不可恢复。",
+      pets: "孵蛋、出战、喂养、领取、放生都要先停止战斗（不用回城）；鉴定要回苏州找云飘飘。孵蛋筛选只放生脚本自己刚孵出的、1 级、未锁定、未出战、资质均值低于设定值的普通宝宝。珍兽栏满了（含繁殖预留位）时跳过孵蛋和繁殖领取，其他照常托管；栏位空出或过 1 小时后再试。「自动放生」按所选条件放生，出战中和繁殖中的不放。放生不可恢复。",
       fill: "宝石、铁匠、裁缝窗口和云飘飘珍兽面板的标题栏出现“一键放入”：按当前功能页把最合适的装备、宝石、符和材料放进槽位，执行仍需自己点。镶嵌、打孔、合成、摘除、雕琢成功后，自动从背包补回刚用掉的同种符、打孔材料和宝石（合成、雕琢），直到用完。",
       tailor: "打造按角色已持有材料处理，目标以当前下发的模板与神器预览为准。",
       sellAppraised: "不勾选时，资质不是外攻、内攻双完美（都高于 1500）的已鉴定武器按其余规则出售；品质上限、强化、套装等保护照常生效。",
