@@ -2556,10 +2556,12 @@
         .filter((e) => e.type === 'HEAL' && e.attr === attr)
         .reduce((n, e) => n + num(e.value), 0);
     }
+    // A bound and an unbound stack of one item are different kinds: an unbound stack stays tradeable in the bag.
+    const stackKind = item => item.itemId + ':' + (item.isBound ? 1 : 0);
     function sortDepositPlan(bagItems, warehouseItems) {
       const known = new Set(array(warehouseItems).filter(item => item?.count >= 1 && item.itemId != null)
-        .map(item => item.itemId));
-      return array(bagItems).filter(item => item?.id != null && item.count >= 1 && known.has(item.itemId) &&
+        .map(stackKind));
+      return array(bagItems).filter(item => item?.id != null && item.count >= 1 && known.has(stackKind(item)) &&
         [2, 3, 4].includes(item.itemTmpl?.type) && !['HP', 'MP', 'hp', 'mp'].some(attr => potionEffect(item.itemTmpl, attr) > 0))
         .map(({ id, itemId, count, itemTmpl }) => ({ bagItemId: id, itemId, count, name: itemTmpl.name }));
     }
@@ -11738,7 +11740,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('背包和仓库显示部位筛选条', 'market.bagFilter', { help: '筛选条在背包和仓库窗口左侧，只调暗不匹配的装备，不会移动或隐藏；角标是套装名的第一个字，集齐为金色；套装列表里绿点是已穿戴，金点是在背包或仓库，空心是还缺。' }) +
             f('套装装备显示角标', 'market.setTag'), true) +
           g('存取',
-            f('打开仓库时，背包“整理”顺便存入仓库已有的物品', 'convenience.sortDeposit', { help: '只存道具和材料里仓库已经有的种类，整组存入；回复气血和内力的药品不存' }) +
+            f('打开仓库时，背包“整理”顺便存入仓库已有的物品', 'convenience.sortDeposit', { help: '只存道具和材料里仓库已经有的种类，整组存入；绑定和未绑定算不同种类；回复气血和内力的药品不存' }) +
             f('右键整组存取道具或材料', 'convenience.ctrlDeposit', { help: '仓库打开时，按住下面的快捷键右键背包里的道具或材料整组存入，右键仓库里的道具或材料整组取出，不弹数量窗口' }) +
             f('整组存取快捷键', 'convenience.depositKeys', { dependsOn: 'convenience.ctrlDeposit', choices: warehouseKeyChoices }) +
             f('快捷出售仓库装备', 'convenience.sellWarehouse', { help: '仓库打开并在“装备”页时，按住快捷键右键装备：取出到背包并卖给商店，不可撤销。带宝石、强化、神器或换装方案里的装备先确认。默认关闭' }) +
