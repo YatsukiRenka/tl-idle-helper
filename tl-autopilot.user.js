@@ -2943,6 +2943,12 @@
       keyword ? '查询「' + keyword + '」' : '查询最新商品', { readOnly: true, inBattle: true, quiet: true, tradeQuery });
     }
     const tradeDue = (entry, interval, now) => !entry || now - entry.at >= interval;
+    // Buying reads the market at most every 5 minutes whatever the query interval, so the script never sweeps
+    // new listings at high frequency. The last buy read of each query survives restarts of the autopilot.
+    const TRADE_BUY_MIN_MS = 300000;
+    const tradeBuyInterval = prefs => Math.max(prefs.scanSeconds * 1000, TRADE_BUY_MIN_MS);
+    const tradeBuyDue = (cache, key, entry, interval, now) =>
+      tradeDue(entry, interval, now) && now - num(cache?.buyAt?.get(key)) >= interval;
     function tradeOwnReads(cache, interval, now) {
       const reads = [];
       if (tradeDue(cache?.mine, interval, now))
@@ -2954,16 +2960,16 @@
     }
     function tradeReads(s, prefs, now, rules = tradeRules(s, prefs)) {
       if (!prefs.enabled) return [];
-      const cache = s.trade, interval = prefs.scanSeconds * 1000, reads = tradeOwnReads(cache, interval, now);
+      const cache = s.trade, reads = tradeOwnReads(cache, prefs.scanSeconds * 1000, now), interval = tradeBuyInterval(prefs);
       // A buy rule that reached its count needs no more market reads.
       const buy = rules.buy.filter(({ rule, reason }) => rule.on && !reason && !tradeDone(rule, s.tradeProgress))
         .map(({ rule }) => rule);
-      if (buy.some(rule => rule.onlyMine) && (cache?.feedScan || tradeDue(cache?.feed, interval, now)))
+      if (buy.some(rule => rule.onlyMine) && (cache?.feedScan || tradeBuyDue(cache, TRADE_FEED, cache?.feed, interval, now)))
         reads.push(tradeListRequest('', 0, 'newest', cache?.feedScan?.nextPage || 1, TRADE_FEED));
       const seen = new Set();
       for (const rule of buy) {
         const key = tradeListKey(rule);
-        if (rule.onlyMine || seen.has(key) || !tradeDue(cache?.lists?.get(key), interval, now)) continue;
+        if (rule.onlyMine || seen.has(key) || !tradeBuyDue(cache, key, cache?.lists?.get(key), interval, now)) continue;
         reads.push(tradeListRequest(rule.item, rule.currency, 'unit_asc', 1, key));
         seen.add(key);
       }
@@ -3037,7 +3043,7 @@
         { tradeBuy: { id: rule.id, quantity, unit: price / quantity } });
     }
     function tradeBuyOption(s, p, now, rule, sells) {
-      const cache = s.trade, progress = s.tradeProgress, interval = p.trade.scanSeconds * 1000;
+      const cache = s.trade, progress = s.tradeProgress, interval = tradeBuyInterval(p.trade);
       const list = rule.onlyMine ? cache.feed : cache.lists?.get(tradeListKey(rule));
       if (!list || tradeDone(rule, progress)) return null;
       const spent = num(tradeProgress(progress, rule.id).spent?.[rule.currency]);
@@ -6097,8 +6103,11 @@
         if (!id) { this.cache.trade = null; return null; }
         if (this.cache.trade?.role !== id) {
           this.tradeUsed ||= new Map();
+          this.tradeBuyAt ||= new Map();
           if (!this.tradeUsed.has(id)) this.tradeUsed.set(id, new Set());
-          this.cache.trade = { role: id, lists: new Map(), used: this.tradeUsed.get(id), wallet: {}, revision: 0 };
+          if (!this.tradeBuyAt.has(id)) this.tradeBuyAt.set(id, new Map());
+          this.cache.trade = { role: id, lists: new Map(), used: this.tradeUsed.get(id), buyAt: this.tradeBuyAt.get(id),
+            wallet: {}, revision: 0 };
         }
         const cache = this.cache.trade;
         for (const currency of [1, 2])
@@ -6107,7 +6116,7 @@
       }
       resetTradeScans() {
         const cache = this.cache.trade;
-        if (cache) this.cache.trade = { role: cache.role, lists: new Map(), used: cache.used,
+        if (cache) this.cache.trade = { role: cache.role, lists: new Map(), used: cache.used, buyAt: cache.buyAt,
           wallet: cache.wallet, revision: cache.revision + 1 };
       }
       cacheTradeRead(action, packet, cache, revision) {
@@ -6119,6 +6128,7 @@
           return;
         }
         if (name !== 'list' || !key || !Array.isArray(data.items)) return;
+        cache.buyAt?.set(key, at);
         if (key === P.TRADE_FEED) this.cacheTradeFeed(cache, data, action.payload.page, at);
         else {
           cache.lists.delete(key);
@@ -10285,7 +10295,7 @@
       sell: "穿戴、强化、镶宝和星级装备始终保留。材料仅按填写的模板ID处理。",
       trade: '查询商会（搜索商品、看自己的交易和可上架物品）不用停止战斗，也不用打开商会窗口。上架、购买、领取、下架要先停止战斗：只在城里或普通野外挂机图上短暂停一下，办完继续打；珍珑棋局、熊林、伪宋军领地、无相浮屠、新三环、宵小入侵和比武时不交易，结束后再办。只在托管运行时工作。卖出的钱和买到的物品自动领取。',
       tradeSell: '只卖未绑定的物品，不卖装备和珍兽。背包里未绑定的数量（减去保留）够一单才上架，攒够再卖。大类（宝石、棉布、秘银、残页、技能书）只能指定角色ID出售，用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
-      tradeBuy: '只买一口价的道具和材料（不买装备、珍兽、以物易物）。按物品名完全一致匹配，单价 = 整单价 ÷ 数量。买的人只能买下整单。物品留空或选大类时，只买别人指定卖给你的商品。',
+      tradeBuy: '只买一口价的道具和材料（不买装备、珍兽、以物易物）。按物品名完全一致匹配，单价 = 整单价 ÷ 数量。买的人只能买下整单。物品留空或选大类时，只买别人指定卖给你的商品。为防止高频扫货，采购最快 5 分钟查一次商会（查询间隔更长时按查询间隔）。',
       warehouse: "只处理背包中未穿戴的装备；可穿戴的更优装备会先穿戴。仓库装备格满 200 时暂停存仓。符合存仓条件的装备不会被自动出售。",
       potions: "回血量长期等于掉血量，阈值高低不改变吃药数量，只决定安全余量。智能顺序按实测的每秒掉血和耗蓝，选回复速度够用、每金币回复最多的药，并改买这种药；血量低于 35% 或阵亡后一段时间内改用最强的药。",
       potionOrder: "游戏自动回复每次只用一颗药且有冷却。智能选择会按“最大值×(100%−阈值)”算出触发时的缺口，优先用刚好补满缺口的最小药，补不满的低级药排在后面兜底。填写指定模板ID时按填写顺序。",
@@ -11836,7 +11846,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         if (this.section === 'trade')
           html = g('商会自动交易',
             f('启用商会自动交易', 'trade.enabled') +
-            f('查询间隔', 'trade.scanSeconds', { unit: '秒', min: 20, max: 600 }) +
+            f('查询间隔', 'trade.scanSeconds', { unit: '秒', min: 20, max: 600, help: '查自己的交易和可上架物品的间隔；采购查商品最快 5 分钟一次' }) +
             f('元宝保留', 'trade.yuanbaoReserve', { unit: '元宝', help: '采购后元宝不少于此数' }),
           true, { help: HELP.trade }) +
           g('自动上架', this.tradeRulesHTML('sell', s), false, { help: HELP.tradeSell }) +
