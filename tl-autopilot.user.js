@@ -2259,6 +2259,13 @@
       if (num(item.owner_id) === num(role.id)) return false;
       return item.target_id == null || item.target_id === '' || num(item.target_id) === num(role.id);
     }
+    // The role id shown on a character window: the own role, or a viewed player the server answered GET_PLAYER_INFO
+    // for. Arena mirrors carry snapshot ids instead of role ids, so a viewed window without such an answer shows none.
+    function profileRoleId(viewed, props, role, entries) {
+      const id = viewed ? num(props?.roleOverride?.id) : num(role?.id);
+      if (!(id > 0)) return null;
+      return !viewed || collectionValues(entries).some((v) => num(v.role?.id) === id) ? id : null;
+    }
     // Since the client of 2026-11-19 the server answers GET_PLAYER_INFO without skills: a cached answer without them.
     function viewedSkillsMissing(props, entries) {
       if (!isViewedProfile(props) || Array.isArray(props.roleOverride?.skills)) return false;
@@ -4083,7 +4090,7 @@
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
-      viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileState, profileScoreText, profileScoreValue, tooltipContext,
+      viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       transferKind, transferKeyRole, transferMerge, transferMergeData,
       CRIT_BASE, CRIT_RATE, CRIT_FLOOR, CRIT_DEF_OFFSET, CRIT_DEF_RATE, CRIT_DEF_DIVISOR, critMultiplier,
@@ -6405,6 +6412,7 @@
       }
       scan() {
         try { this.petLevelButton.scan(document); } catch { /* Game windows can disappear during a scan. */ }
+        try { this.drawRoleIds(); } catch { /* Same. */ }
         this.scanControls();
         const cards = document.querySelectorAll('.market-window .product-list > .product-row'),
           grids = document.querySelectorAll('.inventory-grid, .warehouse-grid'),
@@ -6456,6 +6464,34 @@
         if (scoreProfiles) for (const el of profiles) this.drawProfile(el, profileInstances, state, entries, prefs);
         if (cards.length) this.scanMarket(Array.from(cards), prefs.market?.showScore !== false ? state : null, prefs);
         if (grids.length) this.scanBag(grids, state, prefs, getCollection);
+      }
+      // White "ID:<id>" in the bottom right corner of a character window, because 商会 trades name buyers by role id
+      // and the game shows none. A viewed window (class character-window-center) takes the id of its own component.
+      drawRoleIds() {
+        const windows = document.querySelectorAll('.original-profile');
+        if (!windows.length) return;
+        const bridge = this.controller.bridge, viewed = (win) => /\bcharacter-window-center\b/.test(win.className);
+        const instances = Array.from(windows).some(viewed) ?
+          Array.from(bridge.components()).filter((vm) => vm.type?.__name === 'CharacterProfile' && vm.props?.modelValue) : [];
+        for (const win of windows) {
+          const shell = win.querySelector('.game-window-shell');
+          if (!shell) continue;
+          const isViewed = viewed(win), vm = isViewed ? instances.find((v) => Bridge.renders(v, win)) : null;
+          const id = P.profileRoleId(isViewed, vm?.props, storeField(bridge.character(), 'role'), bridge.cache?.viewedPlayers);
+          let label = shell.querySelector('.tl-role-id');
+          if (id == null) {
+            label?.remove();
+            continue;
+          }
+          if (!label) {
+            label = document.createElement('span');
+            label.className = 'tl-role-id';
+            label.style.cssText = 'position:absolute;right:16px;bottom:6px;z-index:2;color:#fff;font-size:12px;line-height:16px;user-select:text;';
+            shell.appendChild(label);
+          }
+          const text = 'ID:' + id;
+          if (label.textContent !== text) label.textContent = text;
+        }
       }
       drawProfile(el, profileInstances, state, entries, prefs) {
         const vm = profileInstances.find(v => Bridge.renders(v, el));
