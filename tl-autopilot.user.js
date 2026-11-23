@@ -2381,11 +2381,14 @@
       const n = Number(value);
       return Number.isFinite(n) ? (n < 1e12 ? n * 1000 : n) : Date.parse(value);
     }
-    function tradeClaimText(claim) {
-      const names = array(claim.assets).map(asset => {
+    function tradeAssetNames(assets) {
+      return array(assets).map(asset => {
         const name = tradeAsset(asset).name || asset?.equip?.equipTmpl?.name || asset?.pet?.name || '物品';
         return name + '×' + Math.max(1, integer(asset?.bag?.count, 1));
       });
+    }
+    function tradeClaimText(claim) {
+      const names = tradeAssetNames(claim.assets);
       if (num(claim.gold) > 0) names.push(num(claim.gold) + ' 金币');
       const yuanbao = num(claim.recharge) + num(claim.gift);
       if (yuanbao > 0) names.push(yuanbao + ' 元宝');
@@ -4470,7 +4473,7 @@
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
-      tradeRules, tradeNeedsTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText,
+      tradeRules, tradeNeedsTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText, tradeAssetNames,
       tradeOwnReads, tradeReads, tradePlans, tradeSells, tradeLotPrice, tradeBalance, tradeFunds, tradeProgress, tradeBought, tradeDone,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       transferKind, transferKeyRole, transferMerge, transferMergeData,
@@ -10534,6 +10537,7 @@ input[role=switch]{appearance:none;position:relative;width:40px;height:20px;marg
 textarea{width:100%;background:var(--control);border:1px solid var(--stroke);border-bottom-color:var(--stroke-strong);border-radius:4px;padding:8px;min-height:232px;resize:vertical}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .error{color:var(--err);font-size:12px;min-height:20px}.field-error{color:var(--err);font-size:12px}[aria-invalid=true],[aria-invalid=true]:focus{border-color:var(--err)}
 .income-table{color:var(--text);width:100%;border-collapse:collapse;font-size:12px}.income-table th{color:var(--text-2)}.income-table th,.income-table td{white-space:nowrap;padding:4px;text-align:right;border-bottom:1px solid var(--divider)}.income-table th:first-child,.income-table td:first-child{text-align:left}.income-table td[title]:first-child{max-width:12em;overflow:hidden;text-overflow:ellipsis}.table-scroll{max-width:100%;overflow-x:auto}.update-summary ul{padding-left:16px;margin:8px 0}.update-summary li{margin:4px 0}
+.trade-status .income-table td[title]{max-width:12em;overflow:hidden;text-overflow:ellipsis}
 .help{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;margin-left:4px;flex:none;border:1px solid var(--stroke-strong);border-radius:50%;background:transparent;color:var(--text-3);font-size:11px;line-height:1;vertical-align:middle}
 .tooltip{position:fixed;z-index:1;max-width:280px;overflow:auto;padding:8px 12px;border:1px solid var(--stroke);border-radius:6px;background:var(--surface);box-shadow:var(--shadow);color:var(--text);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none}
 .stat-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--divider);font-size:12px}.stat-row:last-child{border-bottom:0}.stat-label{color:var(--text-2);flex:none}.stat-value{display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:4px;text-align:right;min-width:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
@@ -12376,16 +12380,62 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           '<div class="trade-reason" aria-live="polite">' + esc(reason) + '</div></div>';
       }
       tradeStatusHTML(s) {
-        const mine = s?.trade?.mine, daily = this.controller.tradeData?.(s?.role?.id)?.daily;
+        const mine = s?.trade?.mine;
+        if (!mine) return '<div class="empty-state">商会数据：等待查询</div>';
+        const daily = this.controller.tradeData?.(s.role?.id)?.daily;
         const total = amounts => TLPolicy.num(amounts?.[1]) + ' 金币 · ' + TLPolicy.num(amounts?.[2]) + ' 元宝';
-        const listings = TLPolicy.array(mine?.listings).filter(row => row.mode === 'SALE').map(row => {
-          const at = TLPolicy.tradeExpiry(row.expires_at);
-          const expiry = Number.isFinite(at) ? '到期 ' + new Date(at).toLocaleString('zh-CN') : '到期时间未知';
-          return this.statRow(row.title, row.price + ' ' + TLPolicy.tradeCurrency(row.currency) + ' · ' + expiry);
-        }).join('');
-        const claims = TLPolicy.array(mine?.claims).map(claim => this.statRow('待领取', TLPolicy.tradeClaimText(claim))).join('');
-        return this.statRow('今日卖出已领取', total(daily?.income)) + this.statRow('今日采购花费', total(daily?.spent)) +
-          (mine ? (listings || this.statRow('我的在售', '暂无')) + (claims || this.statRow('待领取', '暂无')) : this.statRow('商会数据', '等待查询'));
+        return this.tradeStatusTable('今日', ['卖出已领取', '采购花费'], [[total(daily?.income), total(daily?.spent)]]) +
+          this.tradeStatusTable('在售', ['物品', '数量', '价格', '单价', '指定', '剩余'], this.tradeListingRows(mine)) +
+          this.tradeStatusTable('待领取', ['内容', '金币', '元宝'], TLPolicy.array(mine.claims).map(claim => {
+            const text = TLPolicy.tradeAssetNames(claim.assets).join('、');
+            return [text ? { text, title: text } : '—', TLPolicy.num(claim.gold), TLPolicy.num(claim.recharge) + TLPolicy.num(claim.gift)];
+          })) + this.tradeRecordsHTML(mine, s.role?.id);
+      }
+      tradeStatusTable(heading, headers, rows) {
+        return '<h3 class="block-title">' + esc(heading) + '</h3>' + this.scoreTableHTML(headers, rows) +
+          (rows.length ? '' : '<div class="empty-state">暂无</div>');
+      }
+      tradeListingRows(mine) {
+        const now = Date.now();
+        return TLPolicy.array(mine.listings).filter(row => row?.mode === 'SALE' && (row.state == null || row.state === 'OPEN')).map(row => {
+          const text = row.title || TLPolicy.tradeAssetNames(row.assets).join('、') || '物品';
+          const quantity = TLPolicy.num(row.quantity);
+          return [{ text, title: text }, quantity > 0 ? quantity : '—', this.tradePrice(row),
+            quantity > 0 && row.price != null ? TLPolicy.tradeUnitText(row.price, quantity) : '—',
+            TLPolicy.num(row.target_id) > 0 ? row.target_id : '公开', this.tradeRemaining(row.expires_at, now)];
+        });
+      }
+      tradePrice(row) {
+        return row.price == null ? '—' : row.price + ' ' + TLPolicy.tradeCurrency(row.currency);
+      }
+      tradeRemaining(value, now) {
+        const at = new Date(TLPolicy.tradeExpiry(value)), remaining = at.getTime() - now;
+        if (!Number.isFinite(remaining)) return '未知';
+        const minutes = Math.max(1, Math.floor(remaining / 60000)), hours = Math.floor(minutes / 60);
+        const parts = hours >= 24 ? [[Math.floor(hours / 24), '天'], [hours % 24, '小时']] :
+          [[hours, '小时'], [minutes % 60, '分钟']];
+        const text = remaining <= 0 ? '已到期' : parts.filter(([count]) => count).map(([count, unit]) => count + unit).join('');
+        return { text, title: at.toLocaleString('zh-CN') };
+      }
+      tradeRecordsHTML(mine, roleId) {
+        const limit = 20, records = TLPolicy.array(mine.records), total = Math.max(records.length, TLPolicy.num(mine.recordTotal));
+        const rows = records.slice(0, limit).map(row => this.tradeRecordRow(row, roleId));
+        return this.tradeStatusTable('成交记录', ['时间', '买卖', '物品', '价格', '对方', '税'], rows) +
+          (total > limit ? '<div class="empty-state">共 ' + total + ' 条，只显示最近 ' + limit + ' 条</div>' : '');
+      }
+      tradeRecordRow(row, roleId) {
+        const { owner_a: seller, owner_b: buyer, details = {} } = row;
+        const sale = roleId != null && String(seller) === String(roleId);
+        const purchase = roleId != null && String(buyer) === String(roleId);
+        const text = TLPolicy.tradeAssetNames(details.give).join('、');
+        const other = sale ? buyer : purchase ? seller : null;
+        return [this.tradeRecordTime(row.created_at), sale ? '卖出' : purchase ? '买入' : '—',
+          text ? { text, title: text } : '—', this.tradePrice(details), other ?? '—', sale ? (details.tax ?? '—') : '—'];
+      }
+      tradeRecordTime(value) {
+        const date = new Date(TLPolicy.num(value ?? NaN, NaN)), pad = n => String(n).padStart(2, '0');
+        if (!Number.isFinite(date.getTime())) return '—';
+        return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
       }
       paintTrade(s) {
         this.paintFragment('.trade-status', this.tradeStatusHTML(s));
@@ -12786,7 +12836,13 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       }
       scoreTableHTML(headers, rows, mapTable = false) {
         return '<div class="table-scroll"><table class="income-table"><thead><tr>' + headers.map((v) => '<th>' + esc(v) + '</th>').join('') +
-          '</tr></thead><tbody>' + rows.map((row) => '<tr>' + row.map((v, i) => (mapTable && i === 0 ? '<td title="' + esc(v) + '">' : '<td>') + (v && typeof v === 'object' && 'html' in v ? v.html : esc(v)) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>';
+          '</tr></thead><tbody>' + rows.map(row => '<tr>' + row.map((v, i) => this.tableCellHTML(v, mapTable && i === 0)).join('') +
+            '</tr>').join('') + '</tbody></table></div>';
+      }
+      tableCellHTML(value, mapLabel) {
+        const title = mapLabel ? value : value?.title;
+        const body = value && typeof value === 'object' && 'html' in value ? value.html : esc(value?.text ?? value);
+        return '<td' + (title != null || mapLabel ? ' title="' + esc(title) + '"' : '') + '>' + body + '</td>';
       }
       scoreDangerHTML(v, isRings, settlement) {
         const percent = (n) => (Number(n || 0) * 100).toFixed(1) + '%',
