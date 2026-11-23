@@ -189,6 +189,7 @@
       },
       warehouse: { enabled: false, minQuality: 3, sets: true, perfect: false },
       shop: { enabled: true, minimumStock: 8, targetStock: 30, maxBatch: 20 },
+      trade: { enabled: false, scanSeconds: 60, yuanbaoReserve: 0, sell: [], buy: [] },
       gems: {
         enabled: true,
         drill: true,
@@ -425,6 +426,54 @@
       const scope = { before: localGlobal?.roleConfig === 'per-role' ? 'per-role' : 'shared', after: perRole ? 'per-role' : 'shared' };
       return { data: out, scope };
     }
+    const TRADE_CATEGORIES = {
+      gem: '宝石', cotton: '棉布', mithril: '秘银', fragment: '残页', book: '技能书',
+    };
+    const TRADE_CURRENCIES = [[1, '金币'], [2, '元宝']];
+    const tradeCategoryKey = item => typeof item === 'string' && Object.hasOwn(TRADE_CATEGORIES, item);
+    const tradeNumber = (value, fallback) =>
+      typeof value === 'number' || typeof value === 'string' && value.trim() ? num(value, fallback) : fallback;
+    const tradeInt = (value, min, max = Number.MAX_SAFE_INTEGER, fallback = min) =>
+      Math.min(max, Math.max(min, Math.floor(tradeNumber(value, fallback))));
+    const tradePositiveId = value => typeof value === 'string' || typeof value === 'number'
+      ? /^[1-9]\d*$/.test(String(value).trim().replace(/^0+(?=\d)/, '')) : false;
+    const tradeRuleId = () => globalThis.crypto?.randomUUID?.().slice(0, 12) ||
+      Math.random().toString(36).slice(2, 12) || 'trade';
+    const tradeSwitch = (value, fallback = false) => typeof value === 'boolean' ? value : fallback;
+    function tradeRule(rule, id, kind) {
+      const base = { id, on: tradeSwitch(rule.on, true), currency: tradeNumber(rule.currency, 1) === 2 ? 2 : 1 };
+      if (kind === 'buy') {
+        const unit = tradeNumber(rule.maxUnit, 1);
+        return { ...base, item: typeof rule.item === 'string' ? rule.item.trim() : '',
+          mode: rule.mode === 'count' ? 'count' : 'continuous', count: tradeInt(rule.count, 1),
+          overbuy: tradeSwitch(rule.overbuy), maxUnit: unit <= 0 ? 1 : Math.max(0.01, Number(unit.toFixed(2))),
+          onlyMine: tradeSwitch(rule.onlyMine), budget: tradeInt(rule.budget, 0) };
+      }
+      const item = tradeCategoryKey(rule.item) ? rule.item :
+        tradePositiveId(rule.item) && Number.isSafeInteger(Number(rule.item)) ? Number(rule.item) : 0;
+      return { ...base, on: base.on && !!item, item, count: tradeInt(rule.count, 1, 9999999),
+        price: tradeInt(rule.price, 1, 2000000000),
+        targetId: tradePositiveId(rule.targetId) ? String(rule.targetId).trim().replace(/^0+/, '') : '',
+        keep: tradeInt(rule.keep, 0), maxListings: tradeInt(rule.maxListings, 1, 10) };
+    }
+    function tradeRuleList(value, kind) {
+      const rules = array(value).slice(0, 10), seen = new Set();
+      const ids = rules.map(rule => typeof rule?.id === 'string' && /^[\w-]{1,32}$/.test(rule.id) ? rule.id : '');
+      return rules.map((rule, index) => {
+        let id = ids[index];
+        if (!id || seen.has(id)) {
+          id = kind + '-' + (index + 1);
+          while (ids.includes(id) || seen.has(id)) id += '-';
+        }
+        seen.add(id);
+        return tradeRule(rule || {}, id, kind);
+      });
+    }
+    function tradeConfig(value) {
+      return { enabled: tradeSwitch(value?.enabled),
+        scanSeconds: tradeInt(value?.scanSeconds, 20, 600, 60), yuanbaoReserve: tradeInt(value?.yuanbaoReserve, 0),
+        sell: tradeRuleList(value?.sell, 'sell'), buy: tradeRuleList(value?.buy, 'buy') };
+    }
     function config(value) {
       if (value?.budget && Object.hasOwn(value.budget, 'expPerDay')) {
         const budget = { ...value.budget };
@@ -433,6 +482,7 @@
         value = { ...value, budget };
       }
       const p = merge(DEFAULTS, value);
+      p.trade = tradeConfig(value?.trade);
       for (const key of ['depositKeys', 'sellKeys'])
         if (!warehouseKeys.includes(p.convenience[key])) p.convenience[key] = DEFAULTS.convenience[key];
       p.version = 2;
@@ -2259,6 +2309,78 @@
       if (num(item.owner_id) === num(role.id)) return false;
       return item.target_id == null || item.target_id === '' || num(item.target_id) === num(role.id);
     }
+    function tradeCategory(template) {
+      const name = template?.name;
+      if (num(template?.gemLevel) > 0) return 'gem';
+      if (typeof name !== 'string') return '';
+      if (name === '棉布碎片' || /^\d级棉布$/.test(name)) return 'cotton';
+      if (name === '秘银碎片' || /^\d级秘银$/.test(name)) return 'mithril';
+      if (name.endsWith('技能秘籍残页')) return 'fragment';
+      if (name.startsWith('珍兽技能书·')) return 'book';
+      return '';
+    }
+    const tradeAsset = asset => {
+      const template = asset?.display?.itemTmpl;
+      return { id: num(asset?.bag?.itemId ?? template?.id), template, name: asset?.display?.itemName || template?.name };
+    };
+    const tradeBagItem = bag => ({ id: num(bag?.itemId ?? bag?.itemTmpl?.id), template: bag?.itemTmpl, name: bag?.itemTmpl?.name });
+    const tradeNameMatches = (item, entry) => item === entry.name || item === entry.template?.name;
+    const tradeSellMatches = (rule, entry) => typeof rule.item === 'number'
+      ? rule.item === entry.id : rule.item === tradeCategory(entry.template);
+    const tradeBuyMatches = (rule, entry) => !rule.item || (tradeCategoryKey(rule.item)
+      ? rule.item === tradeCategory(entry.template) : tradeNameMatches(rule.item, entry));
+    const tradeNeedsTarget = item => !item || tradeCategoryKey(item);
+    function tradeSellReason(rule, role) {
+      if (!rule.item) return '请选择可上架的物品';
+      if (tradeCategoryKey(rule.item) && !rule.targetId) return '大类仅用于指定角色ID的转移';
+      if (rule.targetId && num(rule.targetId) === num(role?.id)) return '不能指定自己的角色ID';
+      return '';
+    }
+    function tradeBuyReason(rule, sells, items) {
+      if (tradeNeedsTarget(rule.item) && !rule.onlyMine) return '大类或物品留空时仅能采购指定给我的商品';
+      if (rule.currency === 2 && !rule.budget) return '元宝采购必须填写累计花费上限';
+      if (rule.item && sells.some(sell => sell.item === rule.item ||
+        items.some(item => tradeSellMatches(sell, item) && tradeBuyMatches(rule, item))))
+        return '同一物品不能同时自动上架和采购';
+      return '';
+    }
+    function tradeItems(s) {
+      const cache = s?.trade, items = [...array(s?.bagItems), ...array(s?.warehouseItems)].map(tradeBagItem);
+      const listings = [...array(cache?.mine?.listings), ...(cache?.feed?.rows || []),
+        ...Array.from(cache?.lists?.values() || []).flatMap(list => list.rows)];
+      const assets = [...array(cache?.inventory?.assets), ...listings.flatMap(row => array(row?.assets))];
+      return items.concat(assets.filter(asset => asset?.kind === 'BAG').map(tradeAsset));
+    }
+    function tradeRules(s, prefs) {
+      const sells = prefs.sell.filter(rule => rule.on), items = sells.length && prefs.buy.length ? tradeItems(s) : [];
+      return { sell: prefs.sell.map(rule => ({ rule, reason: tradeSellReason(rule, s?.role) })),
+        buy: prefs.buy.map(rule => ({ rule, reason: tradeBuyReason(rule, sells, items) })) };
+    }
+    function tradeSafe(s, p, now) {
+      if (!p.trade?.enabled || !s.role?.id || FARM_MAP_EXCLUDED_IDS.includes(num(s.role.mapId))) return false;
+      if (s.activity || s.arenaMatch?.active || arenaRush(p, now) || s.trial?.run || s.rings?.run || s.invasionVisit ||
+          array(s.invasion?.board?.runs).some(run => run.status === 'FIGHTING')) return false;
+      const map = roleMap(s);
+      return num(map?.mapType) === 1 || farmMap(map);
+    }
+    const tradeUnitText = (price, count) => String(Number((price / count).toFixed(2)));
+    const tradeNet = (price, currency) => price - Math.ceil(price * (currency === 2 ? 0.01 : 0.05));
+    const tradeCurrency = currency => TRADE_CURRENCIES[num(currency) === 2 ? 1 : 0][1];
+    function tradeExpiry(value) {
+      if (value == null || value === '') return NaN;
+      const n = Number(value);
+      return Number.isFinite(n) ? (n < 1e12 ? n * 1000 : n) : Date.parse(value);
+    }
+    function tradeClaimText(claim) {
+      const names = array(claim.assets).map(asset => {
+        const name = tradeAsset(asset).name || asset?.equip?.equipTmpl?.name || asset?.pet?.name || '物品';
+        return name + '×' + Math.max(1, integer(asset?.bag?.count, 1));
+      });
+      if (num(claim.gold) > 0) names.push(num(claim.gold) + ' 金币');
+      const yuanbao = num(claim.recharge) + num(claim.gift);
+      if (yuanbao > 0) names.push(yuanbao + ' 元宝');
+      return names.join('、') || '待领取物品';
+    }
     // The role id shown on a character window: the own role, or a viewed player the server answered GET_PLAYER_INFO
     // for. Arena mirrors carry snapshot ids instead of role ids, so a viewed window without such an answer shows none.
     function profileRoleId(viewed, props, role, entries) {
@@ -2659,6 +2781,8 @@
       );
     }
     function budgetBlock(a, s, p, ledger) {
+      if (a.tradeBuy && num(a.payload.price) > tradeSpendable(s, p, a.payload.currency))
+        return { code: 'trade-reserve', reason: '商会采购后余额不足保留额度' };
       const money = Math.max(0, num(a.moneyCost)),
         exp = Math.max(0, num(a.expCost)),
         fmt = (n) => Math.floor(num(n)).toLocaleString('zh-CN');
@@ -2804,6 +2928,140 @@
         ...options,
         key: type + ':' + JSON.stringify(payload),
       };
+    }
+    const TRADE_FEED = 'newest';
+    const tradeListKey = rule => JSON.stringify([rule.item, rule.currency]);
+    function tradeRequest(name, payload, label, options) {
+      return action('MARKET_COMMAND', { action: name, ...payload }, '商会：' + label, 'trade',
+        { responseType: 'MARKET_RESPONSE', ...options });
+    }
+    function tradeListRequest(keyword, currency, sort, page, tradeQuery) {
+      return tradeRequest('list', { mode: 'SALE', category: 'all', subcategory: '', keyword, currency, sort,
+        suitable: false, species: '', form: '', pet_sex: '', minRoot: '', minSkills: '', minExt: '', minInt: '',
+        minHp: '', minDef: '', skill: '', breedable: false, slot: '', minLevel: '', maxLevel: '',
+        minPrice: '', maxPrice: '', minQuality: '', page },
+      keyword ? '查询「' + keyword + '」' : '查询最新商品', { readOnly: true, inBattle: true, tradeQuery });
+    }
+    const tradeDue = (entry, interval, now) => !entry || now - entry.at >= interval;
+    function tradeOwnReads(cache, interval, now) {
+      const reads = [];
+      if (tradeDue(cache?.mine, interval, now))
+        reads.push(tradeRequest('mine', { page: 1 }, '查询我的交易', { readOnly: true, inBattle: true }));
+      if (tradeDue(cache?.inventory, interval, now))
+        reads.push(tradeRequest('inventory', {}, '查询可上架物品', { readOnly: true, inBattle: true }));
+      for (const read of reads) read.key += ':' + num(cache?.revision);
+      return reads;
+    }
+    function tradeReads(s, prefs, now, rules = tradeRules(s, prefs)) {
+      if (!prefs.enabled) return [];
+      const cache = s.trade, interval = prefs.scanSeconds * 1000, reads = tradeOwnReads(cache, interval, now);
+      const buy = rules.buy.filter(({ rule, reason }) => rule.on && !reason).map(({ rule }) => rule);
+      if (buy.some(rule => rule.onlyMine) && (cache?.feedScan || tradeDue(cache?.feed, interval, now)))
+        reads.push(tradeListRequest('', 0, 'newest', cache?.feedScan?.nextPage || 1, TRADE_FEED));
+      const seen = new Set();
+      for (const rule of buy) {
+        const key = tradeListKey(rule);
+        if (rule.onlyMine || seen.has(key) || !tradeDue(cache?.lists?.get(key), interval, now)) continue;
+        reads.push(tradeListRequest(rule.item, rule.currency, 'unit_asc', 1, key));
+        seen.add(key);
+      }
+      return reads;
+    }
+    function tradeClaims(mine) {
+      return array(mine.claims).filter(claim => claim?.id != null).map(claim =>
+        tradeRequest('claim', { claimId: claim.id }, '领取' + tradeClaimText(claim), { tradeClaim: claim }));
+    }
+    const tradeSales = mine => array(mine.listings).filter(row => row?.mode === 'SALE');
+    function tradeCancels(mine, now) {
+      return tradeSales(mine).filter(row => row.id != null && tradeExpiry(row.expires_at) < now).map(row =>
+        tradeRequest(row.source === 'LEGACY' ? 'legacyCancel' : 'cancel', { listingId: row.id, legacyId: row.id },
+          '下架过期的「' + row.title + '」'));
+    }
+    function tradeStacks(inventory) {
+      const stacks = new Map();
+      for (const asset of array(inventory?.assets)) {
+        if (asset?.kind !== 'BAG' || asset.bag?.id == null || asset.bag.isBound || num(asset.bag.count) <= 0) continue;
+        const item = tradeAsset(asset);
+        if (!item.id) continue;
+        const group = stacks.get(item.id) || { ...item, units: 0, largest: asset.bag };
+        group.units += num(asset.bag.count);
+        if (num(asset.bag.count) > num(group.largest.count)) group.largest = asset.bag;
+        stacks.set(item.id, group);
+      }
+      return stacks;
+    }
+    function tradeSellPlan(rule, item, listings) {
+      const { count, keep, price, currency, targetId, maxListings } = rule;
+      if (!tradeSellMatches(rule, item) || num(item.largest.count) < count || item.units - keep < count) return null;
+      // A missing target cannot verify spare capacity. An explicit null is a public listing.
+      const listed = listings.filter(row => row.assets?.length === 1 && tradeAsset(row.assets[0]).id === item.id &&
+        num(row.price) === price && num(row.currency) === currency &&
+        (row.target_id === undefined || String(row.target_id ?? '') === targetId)).length;
+      if (listed >= maxListings) return null;
+      const label = '上架「' + (item.name || item.id) + '」×' + count + '（' + price + ' ' + tradeCurrency(currency) +
+        '，单价 ' + tradeUnitText(price, count) + '）' + (targetId ? '，指定 ' + targetId : '');
+      const a = tradeRequest('create', { mode: 'SALE', assets: [{ kind: 'BAG', id: String(item.largest.id), count }],
+        price, currency, targetId: targetId || null, note: '' }, label);
+      a.key = 'MARKET_COMMAND:create:' + JSON.stringify([item.id, count, price, currency, targetId]);
+      return a;
+    }
+    function tradeSells(s, rules) {
+      const active = rules.sell.filter(({ rule, reason }) => rule.on && !reason);
+      if (!active.length || !s.trade?.inventory) return [];
+      const items = [...tradeStacks(s.trade.inventory).values()], listings = tradeSales(s.trade.mine);
+      return active.flatMap(({ rule }) => items.map(item => tradeSellPlan(rule, item, listings)).filter(Boolean));
+    }
+    const tradeBalance = (role, currency) => num(currency === 2 ? role.yuanbao : role.money);
+    const tradeFunds = (s, currency) => Math.min(tradeBalance(s.role, currency), s.trade?.wallet?.[currency] ?? Infinity);
+    const tradeSpendable = (s, p, currency) =>
+      tradeFunds(s, currency) - (currency === 2 ? p.trade.yuanbaoReserve : p.budget.moneyReserve);
+    const tradeProgress = (progress, id) => Object.hasOwn(progress || {}, id) ? progress[id] || {} : {};
+    const tradeBought = (rule, progress) => num(tradeProgress(progress, rule.id).bought);
+    const tradeDone = (rule, progress) => rule.mode === 'count' && tradeBought(rule, progress) >= rule.count;
+    function tradeBuyCandidate(row, rule, s, limits) {
+      if (row?.mode !== 'SALE' || row.state !== 'OPEN' || row.id == null ||
+          row.assets?.length !== 1 || row.assets[0]?.kind !== 'BAG' || num(row.currency) !== rule.currency) return false;
+      if (s.trade.used?.has(String(row.id)) || !listingBuyable(row, s.role) ||
+          (rule.onlyMine && num(row.target_id) !== num(s.role.id)) || !tradeBuyMatches(rule, tradeAsset(row.assets[0]))) return false;
+      const price = num(row.price), quantity = num(row.quantity);
+      return Number.isSafeInteger(price) && price > 0 && Number.isSafeInteger(quantity) && quantity > 0 &&
+        quantity <= limits.quantity && price <= limits.price && price / quantity <= rule.maxUnit;
+    }
+    function tradeBuyPlan(row, rule) {
+      const price = num(row.price), quantity = num(row.quantity);
+      return tradeRequest(row.source === 'LEGACY' ? 'legacyBuy' : 'buy',
+        { listingId: row.id, legacyId: row.id, price, currency: rule.currency },
+        '购买「' + row.title + '」×' + quantity + '（' + price + ' ' + tradeCurrency(rule.currency) + '）',
+        { tradeBuy: { id: rule.id, quantity, unit: price / quantity } });
+    }
+    function tradeBuyOption(s, p, now, rule, sells) {
+      const cache = s.trade, progress = s.tradeProgress, interval = p.trade.scanSeconds * 1000;
+      const list = rule.onlyMine ? cache.feed : cache.lists?.get(tradeListKey(rule));
+      if (!list || tradeDone(rule, progress)) return null;
+      const spent = num(tradeProgress(progress, rule.id).spent?.[rule.currency]);
+      const limits = {
+        price: Math.min(tradeSpendable(s, p, rule.currency), rule.budget ? rule.budget - spent : Infinity),
+        quantity: rule.mode === 'count' && !rule.overbuy ? rule.count - tradeBought(rule, progress) : Infinity,
+      };
+      let best = null;
+      for (const [index, row] of list.rows.entries()) {
+        if (now - (list.times?.[index] ?? list.at) > 2 * interval || !tradeBuyCandidate(row, rule, s, limits)) continue;
+        if (!rule.item && sells.some(sell => tradeSellMatches(sell, tradeAsset(row.assets[0])))) continue;
+        if (best && row.price / row.quantity >= best.tradeBuy.unit) continue;
+        const a = tradeBuyPlan(row, rule);
+        if ((s.tradeSuppressed?.get(a.key) ?? -Infinity) < now) best = a;
+      }
+      return best;
+    }
+    function tradePlans(s, p, now) {
+      if (!p.trade.enabled) return [];
+      const rules = tradeRules(s, p.trade), reads = tradeReads(s, p.trade, now, rules), mine = s.trade?.mine;
+      if (!mine || !tradeSafe(s, p, now)) return reads;
+      const sells = p.trade.sell.filter(rule => rule.on);
+      const buy = rules.buy.filter(({ rule, reason }) => rule.on && !reason)
+        .map(({ rule }) => tradeBuyOption(s, p, now, rule, sells)).filter(Boolean)
+        .sort((a, b) => a.tradeBuy.unit - b.tradeBuy.unit)[0];
+      return [...reads, ...tradeClaims(mine), ...tradeCancels(mine, now), ...(buy ? [buy] : []), ...tradeSells(s, rules)];
     }
     function petScreenable(entry, state, prefs = DEFAULTS.pets) {
       const pet = entry?.pet;
@@ -3483,6 +3741,7 @@
             );
         }
       }
+      for (const trade of tradePlans(s, p, now)) add(trade);
       if (materials && p.gems.enabled) {
         if (p.gems.synth) {
           const grouped = new Map();
@@ -4091,6 +4350,9 @@
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
+      TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
+      tradeRules, tradeNeedsTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText,
+      tradeOwnReads, tradeReads, tradePlans, tradeBalance, tradeFunds, tradeProgress, tradeBought, tradeDone,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       transferKind, transferKeyRole, transferMerge, transferMergeData,
       CRIT_BASE, CRIT_RATE, CRIT_FLOOR, CRIT_DEF_OFFSET, CRIT_DEF_RATE, CRIT_DEF_DIVISOR, critMultiplier,
@@ -4183,7 +4445,7 @@
       else doc.addEventListener('DOMContentLoaded', show, { once: true });
     }
     const ALLOWED = new Set([
-      'ARENA_COMMAND', 'PET_COMMAND', 'TRIAL_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'COMBAT_START',
+      'ARENA_COMMAND', 'PET_COMMAND', 'TRIAL_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'MARKET_COMMAND', 'COMBAT_START',
       'ENTER_GAME',
       'ENTER_MAP',
       'EQUIP_ITEM',
@@ -4559,7 +4821,7 @@
       return ALLOWED.has(action?.type) || (action?.type === 'USE_ITEM' &&
         (action.petHatch === true || action.doubleExp === true || action.ringsPotion === true));
     }
-    const responseHasId = (action) => ['ARENA_COMMAND', 'PET_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'ONLINE_LOTTERY_COMMAND', 'WELFARE_LOTTERY_COMMAND'].includes(action.type) || action.petHatch;
+    const responseHasId = (action) => ['ARENA_COMMAND', 'PET_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'ONLINE_LOTTERY_COMMAND', 'WELFARE_LOTTERY_COMMAND', 'MARKET_COMMAND'].includes(action.type) || action.petHatch;
     const responseType = (action) => action.responseType || action.type + '_RESPONSE';
     const responseKey = (action) => JSON.stringify([responseType(action),
       responseHasId(action) ? action.requestId ?? action.payload?.requestId ?? null : null]);
@@ -5171,7 +5433,7 @@
               if (this.welfareRequests.size > 100)
                 this.welfareRequests.delete(this.welfareRequests.keys().next().value);
             }
-            if (!this.sending && this.waiter && !this.waiter.petHatch && packet.type === this.waiter.type && !['ARENA_COMMAND', 'PET_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'WELFARE_LOTTERY_COMMAND'].includes(packet.type))
+            if (!this.sending && this.waiter && !this.waiter.petHatch && packet.type === this.waiter.type && !['ARENA_COMMAND', 'PET_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'WELFARE_LOTTERY_COMMAND', 'MARKET_COMMAND'].includes(packet.type))
               this.waiter.interference = true;
           } catch {}
         }
@@ -5622,11 +5884,68 @@
         this.cache.arenaLosses = losses;
         writeStorage(PREFIX + ':arenaLosses:' + role, losses);
       }
+      tradeState(role) {
+        const id = P.num(role?.id);
+        if (!id) { this.cache.trade = null; return null; }
+        if (this.cache.trade?.role !== id) {
+          this.tradeUsed ||= new Map();
+          if (!this.tradeUsed.has(id)) this.tradeUsed.set(id, new Set());
+          this.cache.trade = { role: id, lists: new Map(), used: this.tradeUsed.get(id), wallet: {}, revision: 0 };
+        }
+        const cache = this.cache.trade;
+        for (const currency of [1, 2])
+          if (P.tradeBalance(role, currency) <= cache.wallet[currency]) delete cache.wallet[currency];
+        return cache;
+      }
+      resetTradeScans() {
+        const cache = this.cache.trade;
+        if (cache) this.cache.trade = { role: cache.role, lists: new Map(), used: cache.used,
+          wallet: cache.wallet, revision: cache.revision + 1 };
+      }
+      cacheTradeRead(action, packet, cache, revision) {
+        const data = packet.data, name = action.payload.action, at = Date.now(), key = action.tradeQuery;
+        if (!packet.success || data?.action !== name || !cache || this.cache.trade !== cache ||
+            cache.role !== P.num(this.character()?.role?.id)) return;
+        if (name === 'mine' || name === 'inventory') {
+          if (cache.revision === revision) cache[name] = { ...data, at };
+          return;
+        }
+        if (name !== 'list' || !key || !Array.isArray(data.items)) return;
+        if (key === P.TRADE_FEED) this.cacheTradeFeed(cache, data, action.payload.page, at);
+        else {
+          cache.lists.delete(key);
+          cache.lists.set(key, { at, rows: data.items });
+          while (cache.lists.size > 20) cache.lists.delete(cache.lists.keys().next().value);
+        }
+      }
+      cacheTradeFeed(cache, data, page, at) {
+        const scan = page === 1 ? { rows: [], times: [], seen: new Set(), nextPage: 1 } : cache.feedScan;
+        if (scan?.nextPage !== page) return;
+        const previous = cache.feed?.seen;
+        let overlap = false;
+        for (const row of data.items) {
+          if (row?.id == null) continue;
+          const key = row.source + ':' + row.id;
+          if (previous?.has(key)) overlap = true;
+          if (scan.seen.has(key)) continue;
+          scan.seen.add(key);
+          scan.rows.push(row);
+          scan.times.push(at);
+        }
+        if (overlap || page >= 5 || page >= P.num(data.pages, 1)) {
+          cache.feed = { at, rows: scan.rows, times: scan.times, seen: scan.seen };
+          cache.feedScan = null;
+        } else {
+          scan.nextPage++;
+          cache.feedScan = scan;
+        }
+      }
       state() {
         const c = this.character();
         this.syncPetRole(c?.role?.id);
         this.syncInvasionRole(c?.role?.id);
         this.syncRingsCombatRole(c?.role?.id);
+        const trade = this.tradeState(c?.role);
         if (!c?.role?.id) return null;
         const r = c.role,
           role = {};
@@ -5648,6 +5967,7 @@
         const shop = this.stores().get('shop');
         return {
           role,
+          trade,
           ...(this.noBatchSell ? { batchSell: false } : {}),
           pets: this.cache.pets && !this.petListRequired ? { ...copy(this.cache.pets.state), at: this.cache.pets.at } : null,
           petHall: copy(this.cache.petHall),
@@ -5808,6 +6128,8 @@
             this.sending = false;
           }
         }
+        const trade = action.type === 'MARKET_COMMAND' && query ? this.tradeState(this.character()?.role) : null,
+          tradeRevision = trade?.revision;
         return new Promise((resolve, reject) => {
           const waiter = {
             type: action.type,
@@ -5820,7 +6142,10 @@
             key: responseKey(action),
             petHatch: action.petHatch,
             doubleExp: action.doubleExp,
-            resolve,
+            resolve: trade ? (packet) => {
+              this.cacheTradeRead(action, packet, trade, tradeRevision);
+              resolve(packet);
+            } : resolve,
             reject,
             answered: false,
             interference: false,
@@ -7706,6 +8031,7 @@
         this.reason = '正在检查角色与策略';
         // Automatic recovery retains cooldowns so retries do not consume unkeyed late replies.
         if (!wasUncertain && !fromLateResponse) this.suppressed.clear();
+        this.bridge.resetTradeScans?.();
         this.log('完整托管已开始');
         if (wasUncertain && this.bridge.connected && this.bridge.sessionReady) {
           await this.reconcileRole();
@@ -8039,10 +8365,62 @@
         return { ringsFighting: fighting, ringsStartAt: this.ringsStartAt, ringsPrepareSince: this.ringsPrepareSince,
           ringsPotionAt: this.ringsPotionAt, ringsPotionFull: this.ringsPotionFull || [] };
       }
+      tradeData(role) {
+        const saved = role ? readTagged('tradeData', role, null) : null;
+        return { progress: saved?.progress || {}, daily: saved?.daily?.day === day() ? saved.daily :
+          { day: day(), income: {}, spent: {} } };
+      }
+      resetTradeProgress(id) {
+        const role = P.num(this.bridge.state()?.role?.id);
+        if (!role) return;
+        const data = this.tradeData(role);
+        delete data.progress[id];
+        writeStorage(taggedKey('tradeData', role), data);
+      }
+      tradeContext(s) {
+        return { ...s, tradeProgress: this.tradeData(P.num(s.role?.id)).progress,
+          tradeSuppressed: this.suppressed, activity: this.activity || this.arenaPending || s.activity,
+          invasionVisit: this.invasionVisit || s.invasionVisit };
+      }
+      recordTrade(a, role) {
+        const data = this.tradeData(role), { progress, daily } = data;
+        if (a.tradeBuy) {
+          const { id, quantity } = a.tradeBuy, { price, currency } = a.payload;
+          const previous = P.tradeProgress(progress, id), spent = previous.spent || {};
+          data.progress = { ...progress, [id]: { bought: P.num(previous.bought) + quantity,
+            spent: { ...spent, [currency]: P.num(spent[currency]) + price } } };
+          daily.spent[currency] = P.num(daily.spent[currency]) + price;
+        } else if (a.tradeClaim) {
+          const { gold, recharge, gift } = a.tradeClaim;
+          daily.income[1] = P.num(daily.income[1]) + P.num(gold);
+          daily.income[2] = P.num(daily.income[2]) + P.num(recharge) + P.num(gift);
+        } else return;
+        writeStorage(taggedKey('tradeData', role), data);
+      }
+      async tradeResult(a, before, result, funds) {
+        const role = P.num(before.role.id), cache = before.trade, { currency, listingId, price } = a.payload;
+        if (a.tradeBuy) cache?.used.add(String(listingId));
+        if (result.success) {
+          this.recordTrade(a, role);
+          if (a.tradeBuy && cache) cache.wallet[currency] = funds - price;
+          this.log(a.label + '：完成', 'success');
+        } else {
+          this.log(a.label + '：' + (result.message || '操作未成功'), 'warning');
+          if (!a.tradeBuy) this.suppress(a, 300000);
+        }
+        const after = this.bridge.state();
+        if (!cache || after?.trade !== cache) return;
+        // Reads sent before the trade answer cannot confirm the post-trade state.
+        cache.revision++;
+        delete cache.mine;
+        delete cache.inventory;
+        if (this.enabled && this.prefs.trade.enabled)
+          await this.executeQueries(P.tradeOwnReads(cache, this.prefs.trade.scanSeconds * 1000, Date.now()));
+      }
       planningPass(state, prefs, now = Date.now()) {
         const clock = this.planNow || monotonicNow, started = clock();
         try {
-          const s = this.gearState(state, now);
+          const s = this.gearState(prefs.trade?.enabled ? this.tradeContext(state) : state, now);
           if (!prefs.rings?.enabled && !prefs.invasion?.enabled) return P.plans(s, prefs, this.ledger, now);
           return P.plans({ ...s, invasionVisit: this.invasionVisit, invasionPriorRefused: this.invasionPriorRefused,
             activity: this.activity || this.arenaPending || s.activity,
@@ -8173,6 +8551,11 @@
         const snapshot = this.bridge.state(), before = snapshot && { ...snapshot, gearProfile: this.gearProfile };
         const petSession = this.bridge.cache.petHall;
         if (!before) return;
+        const market = a.type === 'MARKET_COMMAND', trade = market && !a.readOnly;
+        if (market && (!this.enabled || !this.prefs.trade?.enabled)) return;
+        if (trade && (!P.tradeSafe(this.tradeContext(before), this.prefs, Date.now()) ||
+            this.bridge.battle().stage !== 'idle')) return;
+        const buyFunds = a.tradeBuy ? P.tradeFunds(before, a.payload.currency) : null;
         if (a.breedSuccess) {
           const town = P.townFor(before, P.NPC.petKeeper);
           if (!this.enabled || !town || P.num(town.id) !== P.num(before.role.mapId)) return;
@@ -8218,7 +8601,7 @@
             this.invasionAwaitPush = false;
             this.invasionVisit.joinPush = false;
           }
-        } else if (!welfareBet) this.charge(a);
+        } else if (!welfareBet && !trade) this.charge(a);
         // Stamped before sending: an unanswered request must not lead to a second pill.
         if (a.doubleExp) {
           this.ledger.tianlingUsedAt = Date.now();
@@ -8233,6 +8616,7 @@
             this.ringsPotionLast = { attr: a.potionAttr, field, value: this.bridge.ringsCombatState?.[field], pending: true };
           }
           const result = await this.bridge.request(a, this.responseTimeout());
+          if (trade) { await this.tradeResult(a, before, result, buyFunds); return; }
           if (a.breedSuccess) {
             if (result.success) this.log(a.breedSuccess, 'success');
             if (result.success && a.payload.action === 'claim') {
@@ -8354,7 +8738,8 @@
           } else if (!success) {
             this.log(a.label + '：' + (result.message || '操作未成功'), 'warning');
             // A full bag must not cause a town trip every five minutes.
-            this.suppress(a, lotteryDraw || a.type === 'GET_MONSTER_TMPL' ? 1800000 : 300000);
+            this.suppress(a, market ? this.prefs.trade.scanSeconds * 1000 :
+              lotteryDraw || a.type === 'GET_MONSTER_TMPL' ? 1800000 : 300000);
           } else {
             if (queryBatch?.multiple) queryBatch.completed.add(a);
             else this.log(a.label + '：完成', 'success');
@@ -8625,6 +9010,10 @@
           this.paint();
           return;
         }
+        if (this.prefs.trade?.enabled) {
+          const reads = P.tradeReads(s, this.prefs.trade, now);
+          if (reads.length) this.executeQueries(reads).catch(e => this.pause(e.message));
+        }
         const rings = P.RINGS_MAP_IDS.includes(P.num(s.role.mapId));
         if (!actionBlocked) this.updateProfile(s, now);
         const autoRings = this.prefs.rings?.enabled && P.num(s.role.level) >= 56;
@@ -8691,7 +9080,7 @@
           const first = (a) => Number(a.type === 'TRIAL_COMMAND' || a.type === 'RINGS_COMMAND');
           const a = this.planningPass(s, prefs, now)
             .sort((a, b) => first(b) - first(a)).find((a) =>
-            (a.readOnly || a.type === 'UPDATE_SETTINGS') &&
+            a.type !== 'MARKET_COMMAND' && (a.readOnly || a.type === 'UPDATE_SETTINGS') &&
             (this.suppressed.get(a.key) || 0) < now &&
             (a.type !== 'UPDATE_SETTINGS' || now - this.lastSettings > 15000));
           if (a) await this.execute(a);
@@ -8770,7 +9159,7 @@
         );
         if (special)
           plans = plans.filter((a) => ['GET_POTION_LIST', 'UPDATE_SETTINGS'].includes(a.type));
-        const queries = plans.filter(parallelQuery);
+        const queries = plans.filter(a => a.type !== 'MARKET_COMMAND' && parallelQuery(a));
         if (queries.length) this.executeQueries(queries).catch((e) => this.pause(e.message));
         if (actionBlocked) return;
         const errandTown = (a) => a.townId ? { id: a.townId } : P.townFor(s, a.npc);
@@ -9613,7 +10002,7 @@
       );
     const groups = [
       ['overview', '概览', [['status', '状态'], ['stats', '统计'], ['logs', '日志']]],
-      ['strategy', '策略', [['battle', '挂机日常'], ['growth', '成长装备'], ['pets', '珍兽'], ['craft', '宝石工艺'], ['economy', '出售补药'], ['budget', '预算']]],
+      ['strategy', '策略', [['battle', '挂机日常'], ['growth', '成长装备'], ['pets', '珍兽'], ['craft', '宝石工艺'], ['economy', '出售补药'], ['trade', '商会交易'], ['budget', '预算']]],
       ['score', '评分', [['score', '评分设置'], ['scoreStatus', '当前状态'], ['scoreStats', '属性分数'], ['scoreFormula', '计算公式']]],
       ['convenience', '便利性', [['bagTools', '背包仓库'], ['gameTools', '详情与窗口']]],
       ['system', '系统', [['settings', '设置'], ['updates', '更新']]],
@@ -9628,6 +10017,7 @@
       [4, '橙色（4）'],
       [5, '红色（5）'],
     ];
+    const tradeCategoryChoices = Object.entries(TLPolicy.TRADE_CATEGORIES).map(([key, name]) => [key, name + '（大类）']);
     const pathGet = (o, path) => path.split('.').reduce((v, k) => v?.[k], o);
     const pathSet = (o, path, value) => {
       const ks = path.split('.');
@@ -9648,6 +10038,9 @@
       tailor: "打造按角色已持有材料处理，目标以当前下发的模板与神器预览为准。",
       sellAppraised: "不勾选时，资质不是外攻、内攻双完美（都高于 1500）的已鉴定武器按其余规则出售；品质上限、强化、套装等保护照常生效。",
       sell: "穿戴、强化、镶宝和星级装备始终保留。材料仅按填写的模板ID处理。",
+      trade: '查询商会（搜索商品、看自己的交易和可上架物品）不用停止战斗，也不用打开商会窗口。上架、购买、领取、下架要先停止战斗：只在城里或普通野外挂机图上短暂停一下，办完继续打；珍珑棋局、熊林、伪宋军领地、无相浮屠、新三环、宵小入侵和比武时不交易，结束后再办。只在托管运行时工作。卖出的钱和买到的物品自动领取。',
+      tradeSell: '只卖未绑定的物品，不卖装备和珍兽。背包里未绑定的数量（减去保留）够一单才上架，攒够再卖。大类（宝石、棉布、秘银、残页、技能书）只能指定角色ID出售，用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
+      tradeBuy: '只买一口价的道具和材料（不买装备、珍兽、以物易物）。按物品名完全一致匹配，单价 = 整单价 ÷ 数量。买的人只能买下整单。物品留空或选大类时，只买别人指定卖给你的商品。',
       warehouse: "只处理背包中未穿戴的装备；可穿戴的更优装备会先穿戴。仓库装备格满 200 时暂停存仓。符合存仓条件的装备不会被自动出售。",
       potions: "回血量长期等于掉血量，阈值高低不改变吃药数量，只决定安全余量。智能顺序按实测的每秒掉血和耗蓝，选回复速度够用、每金币回复最多的药，并改买这种药；血量低于 35% 或阵亡后一段时间内改用最强的药。",
       potionOrder: "游戏自动回复每次只用一颗药且有冷却。智能选择会按“最大值×(100%−阈值)”算出触发时的缺口，优先用刚好补满缺口的最小药，补不满的低级药排在后面兜底。填写指定模板ID时按填写顺序。",
@@ -9713,6 +10106,7 @@ textarea{width:100%;background:var(--control);border:1px solid var(--stroke);bor
 .help{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;margin-left:4px;flex:none;border:1px solid var(--stroke-strong);border-radius:50%;background:transparent;color:var(--text-3);font-size:11px;line-height:1;vertical-align:middle}
 .tooltip{position:fixed;z-index:1;max-width:280px;overflow:auto;padding:8px 12px;border:1px solid var(--stroke);border-radius:6px;background:var(--surface);box-shadow:var(--shadow);color:var(--text);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none}
 .stat-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--divider);font-size:12px}.stat-row:last-child{border-bottom:0}.stat-label{color:var(--text-2);flex:none}.stat-value{display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:4px;text-align:right;min-width:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.trade-rule,.trade-status{border:1px solid var(--divider);border-radius:4px;padding:4px 8px;margin:8px 0}.trade-rule .actions{flex-wrap:wrap}.trade-preview,.trade-progress,.trade-reason{font-size:12px}.trade-reason{color:var(--warn)}
 .stat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0}.stat-tile{min-width:0;padding:8px;border:1px solid var(--stroke);border-radius:6px;background:var(--surface)}.stat-tile>span,.stat-tile>small{display:block;font-size:11px;color:var(--text-2)}.stat-tile>strong{display:block;font-size:18px;font-weight:600;overflow-wrap:anywhere}
 .chip{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border:1px solid var(--stroke);border-radius:4px;background:var(--surface-alt);font-size:11px;white-space:nowrap}.chips{display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:8px 0}.tone-neutral{color:var(--text-2)}.tone-ok{color:var(--ok)}.tone-warn{color:var(--warn)}.tone-err{color:var(--err)}.tone-accent{color:var(--accent-text)}
 .info-bar{display:flex;align-items:center;gap:8px;padding:8px;margin:8px 0;border:1px solid var(--stroke);border-radius:6px;background:var(--surface-alt);font-size:12px}.info-bar>span:first-child{font-weight:600;flex:none}.empty-state{padding:8px 0;color:var(--text-2);font-size:12px}.block-title{display:flex;align-items:center;gap:4px;margin:12px 0 4px;font-size:12px;font-weight:600}
@@ -10040,6 +10434,10 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           const b = e.target.closest('button');
           if (!b) return;
           const action = b.dataset.action;
+          if (['tradeAdd', 'tradeDelete', 'tradeReset'].includes(action)) {
+            this.editTradeRules(action, b);
+            return;
+          }
           if (action === 'captureHotkey') {
             this.captureButton = b;
             b.textContent = '请按下新的快捷键…';
@@ -10166,6 +10564,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         });
         this.root.addEventListener('input', (e) => {
           if (e.target === this.search) { this.setQuery(this.search.value); return; }
+          if (e.target.dataset.tradeField) { this.editTradeField(e.target); return; }
           const path = e.target.dataset.path;
           if (!path) return;
           const base = pathGet(TLPolicy.DEFAULTS, path);
@@ -11189,6 +11588,15 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('指定生命药模板ID', 'potions.hpPriority') +
             f('指定内力药模板ID', 'potions.mpPriority') +
             '', false, { help: [HELP.potions, HELP.potionOrder] });
+        if (this.section === 'trade')
+          html = g('商会自动交易',
+            f('启用商会自动交易', 'trade.enabled') +
+            f('查询间隔', 'trade.scanSeconds', { unit: '秒', min: 20, max: 600 }) +
+            f('元宝保留', 'trade.yuanbaoReserve', { unit: '元宝', help: '采购后元宝不少于此数' }),
+          true, { help: HELP.trade }) +
+          g('自动上架', this.tradeRulesHTML('sell', s), false, { help: HELP.tradeSell }) +
+          g('自动采购', this.tradeRulesHTML('buy', s), false, { help: HELP.tradeBuy }) +
+          '<div class="trade-status">' + (this.indexing ? '' : this.tradeStatusHTML(s)) + '</div>';
         if (this.section === 'budget')
           html =
             g('资源预算',
@@ -11304,6 +11712,182 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           (s.batchSell !== false && count > 0 && count < p.sell.batchMin ? this.statTile('还差', p.sell.batchMin - count + ' 件') : '') +
           '</div><div class="chips">' + [...reasons].map(([reason, n]) => this.chip(reason + ' ' + n)).join('') + '</div>' +
           this.scoreTableHTML(['名称', '品质', '等级', '评分', '模板ID'], rows);
+      }
+      editTradeRules(action, button) {
+        const row = button.closest('.trade-rule'), kind = row?.dataset.tradeKind || button.dataset.tradeKind;
+        const rules = this.pending.trade[kind];
+        if (action === 'tradeReset') {
+          this.controller.resetTradeProgress(rules[Number(row.dataset.tradeIndex)].id);
+          this.paintTrade(this.controller.bridge.state());
+          return;
+        }
+        if (action === 'tradeAdd' && rules.length < 10) {
+          let id = TLPolicy.tradeRuleId();
+          while (rules.some(rule => rule.id === id)) id += '-';
+          rules.push(TLPolicy.tradeRule({ onlyMine: true }, id, kind));
+        } else if (action === 'tradeDelete') rules.splice(Number(row.dataset.tradeIndex), 1);
+        else return;
+        this.dirty = true;
+        this.requestBody();
+      }
+      editTradeField(control) {
+        const { tradeKind: kind, tradeIndex: index } = control.closest('.trade-rule').dataset;
+        const rule = this.pending.trade[kind][Number(index)], field = control.dataset.tradeField;
+        let value = control.type === 'checkbox' ? control.checked : control.value;
+        if (field === 'item' && kind === 'buy') {
+          value = tradeCategoryChoices.find(([, label]) => label === value)?.[0] || value;
+          if (TLPolicy.tradeNeedsTarget(value.trim())) rule.onlyMine = true;
+        } else if (field === 'item') value = TLPolicy.tradeCategoryKey(value) ? value : Number(value);
+        else if (typeof rule[field] === 'number') value = Number(value);
+        rule[field] = value;
+        this.dirty = true;
+        this.paintDirty();
+        this.paintTrade(this.controller.bridge.state());
+      }
+      tradeField(label, key, value, opts = {}) {
+        const attrs = ' data-trade-field="' + key + '" aria-label="' + esc(label) + '"';
+        let control;
+        if (opts.choices)
+          control = '<select class="control-select"' + attrs + '>' + this.tradeOptions(opts.choices, value) + '</select>';
+        else if (typeof value === 'boolean')
+          control = '<input type="checkbox"' + attrs + (value ? ' checked' : '') + (opts.disabled ? ' disabled' : '') + '>';
+        else
+          control = '<input class="control-input" type="' + (opts.text ? 'text' : 'number') + '"' + attrs +
+            ' value="' + esc(value) + '"' + (opts.placeholder ? ' placeholder="' + esc(opts.placeholder) + '"' : '') +
+            (opts.list ? ' list="' + opts.list + '"' : '') + (opts.min != null ? ' min="' + opts.min + '"' : '') +
+            (opts.max != null ? ' max="' + opts.max + '"' : '') + (opts.step ? ' step="' + opts.step + '"' : '') + '>';
+        return '<label class="field"><span class="field-label"><span>' + esc(label) + '</span>' + this.help(opts.help) +
+          '</span><span class="field-control">' + control + (opts.unit ? '<span class="unit">' + esc(opts.unit) + '</span>' : '') +
+          (opts.currency ? '<select class="control-select" data-trade-field="currency" aria-label="币种">' +
+            this.tradeOptions(TLPolicy.TRADE_CURRENCIES, opts.currency) + '</select>' : '') +
+          '</span></label>';
+      }
+      tradeOptions(choices, value) {
+        return choices.map(([key, label]) => '<option value="' + esc(key) + '"' +
+          (String(value) === String(key) ? ' selected' : '') + '>' + esc(label) + '</option>').join('');
+      }
+      tradeSellItems(s) {
+        const items = new Map();
+        for (const bag of TLPolicy.array(s?.bagItems)) {
+          const id = TLPolicy.num(bag.itemId ?? bag.itemTmpl?.id), count = TLPolicy.num(bag.count);
+          if (bag.isBound || !id || count <= 0) continue;
+          const item = items.get(id) || { name: bag.itemTmpl?.name || '物品 #' + id, units: 0 };
+          item.units += count;
+          items.set(id, item);
+        }
+        return [...items].map(([id, item]) => [id, item.name + ' ×' + item.units]);
+      }
+      tradeSellChoices(s, item, items) {
+        const choices = [...tradeCategoryChoices, ...items];
+        if (!item) return [...choices, [0, '请选择物品']];
+        if (!choices.some(([id]) => id === item)) {
+          const saved = [...TLPolicy.array(s?.bagItems), ...TLPolicy.array(s?.warehouseItems)]
+            .find(bag => TLPolicy.num(bag.itemId ?? bag.itemTmpl?.id) === item);
+          choices.push([item, saved?.itemTmpl?.name || '物品 #' + item]);
+        }
+        return choices;
+      }
+      tradeSellPreview(rule) {
+        return '单价 ' + TLPolicy.tradeUnitText(rule.price, rule.count) + ' · 税后到账 ' +
+          TLPolicy.tradeNet(rule.price, rule.currency);
+      }
+      tradeSellHTML(rule, s, items) {
+        const field = (label, key, opts) => this.tradeField(label, key, rule[key], opts);
+        return field('物品', 'item', { choices: this.tradeSellChoices(s, rule.item, items) }) +
+          field('每单个数', 'count', { min: 1, max: 9999999 }) +
+          field('每单价格', 'price', { min: 1, max: 2000000000, currency: rule.currency }) +
+          '<div class="trade-preview">' + this.tradeSellPreview(rule) + '</div>' +
+          field('指定角色ID', 'targetId', { text: true, placeholder: '可空；大类必填' }) +
+          field('背包保留', 'keep', { min: 0 }) + field('同时在售', 'maxListings', { min: 1, max: 10 });
+      }
+      tradeBuyHTML(rule) {
+        const field = (label, key, opts) => this.tradeField(label, key, rule[key], opts);
+        const label = tradeCategoryChoices.find(([key]) => key === rule.item)?.[1] || rule.item;
+        const forced = TLPolicy.tradeNeedsTarget(rule.item);
+        return this.tradeField('物品', 'item', label, { text: true, list: 'tl-trade-buy-items' }) +
+          field('模式', 'mode', { choices: [['continuous', '持续采购'], ['count', '指定数量']] }) +
+          '<div class="trade-count-options"' + (rule.mode === 'count' ? '' : ' hidden') + '>' +
+          field('数量', 'count', { min: 1, unit: '件' }) +
+          field('允许多买', 'overbuy', { help: '一单的数量比还差的多时也买下整单' }) + '</div>' +
+          field('单价上限', 'maxUnit', { min: 0.01, step: 0.01, currency: rule.currency }) +
+          this.tradeField('仅采购指定给我的', 'onlyMine', forced || rule.onlyMine, { disabled: forced }) +
+          field('累计花费上限', 'budget', { min: 0, placeholder: '0 不限；元宝必填', help: '0 不限；元宝必填' });
+      }
+      tradeProgressText(rule, progress) {
+        return '已购 ' + TLPolicy.tradeBought(rule, progress) + ' 件 · 已花 ' +
+          TLPolicy.num(TLPolicy.tradeProgress(progress, rule.id).spent?.[rule.currency]) + ' ' +
+          TLPolicy.tradeCurrency(rule.currency) + (TLPolicy.tradeDone(rule, progress) ? ' · 已完成' : '');
+      }
+      tradeBuyNames(s) {
+        const names = [...TLPolicy.array(s?.bagItems), ...TLPolicy.array(s?.warehouseItems)].map(bag => bag.itemTmpl?.name);
+        return [...new Set([...tradeCategoryChoices.map(([, label]) => label), ...names.filter(Boolean)])]
+          .map(name => '<option value="' + esc(name) + '"></option>').join('');
+      }
+      tradeRulesHTML(kind, s) {
+        if (this.indexing) return '';
+        const rules = TLPolicy.tradeRules(s, TLPolicy.tradeConfig(this.pending.trade))[kind], sell = kind === 'sell';
+        const items = sell ? this.tradeSellItems(s) : this.tradeBuyNames(s);
+        const progress = this.controller.tradeData?.(s?.role?.id)?.progress;
+        const rows = rules.map(({ rule, reason }, index) =>
+          '<div class="trade-rule" data-trade-kind="' + kind + '" data-trade-index="' + index + '">' +
+          this.tradeField('启用', 'on', rule.on) + (sell ? this.tradeSellHTML(rule, s, items) : this.tradeBuyHTML(rule)) +
+          '<div class="actions">' + (sell ? '' :
+            '<span class="trade-progress">' + this.tradeProgressText(rule, progress) + '</span>' +
+            '<button type="button" class="btn" data-action="tradeReset">重置</button>') +
+          '<button type="button" class="btn" data-action="tradeDelete">删除</button></div>' +
+          '<div class="trade-reason" aria-live="polite">' + esc(reason) + '</div></div>').join('');
+        const add = '<button type="button" class="btn" data-action="tradeAdd" data-trade-kind="' + kind + '">添加' +
+          (sell ? '上架' : '采购') + '规则</button>';
+        return rows + (rules.length < 10 ? '<div class="actions">' + add + '</div>' : '') +
+          (sell ? '' : '<datalist class="trade-buy-items" id="tl-trade-buy-items">' + items + '</datalist>');
+      }
+      tradeStatusHTML(s) {
+        const mine = s?.trade?.mine, daily = this.controller.tradeData?.(s?.role?.id)?.daily;
+        const total = amounts => TLPolicy.num(amounts?.[1]) + ' 金币 · ' + TLPolicy.num(amounts?.[2]) + ' 元宝';
+        const listings = TLPolicy.array(mine?.listings).filter(row => row.mode === 'SALE').map(row => {
+          const at = TLPolicy.tradeExpiry(row.expires_at);
+          const expiry = Number.isFinite(at) ? '到期 ' + new Date(at).toLocaleString('zh-CN') : '到期时间未知';
+          return this.statRow(row.title, row.price + ' ' + TLPolicy.tradeCurrency(row.currency) + ' · ' + expiry);
+        }).join('');
+        const claims = TLPolicy.array(mine?.claims).map(claim => this.statRow('待领取', TLPolicy.tradeClaimText(claim))).join('');
+        return this.statRow('今日卖出已领取', total(daily?.income)) + this.statRow('今日采购花费', total(daily?.spent)) +
+          (mine ? (listings || this.statRow('我的在售', '暂无')) + (claims || this.statRow('待领取', '暂无')) : this.statRow('商会数据', '等待查询'));
+      }
+      paintTrade(s) {
+        this.paintFragment('.trade-status', this.tradeStatusHTML(s));
+        this.paintFragment('.trade-buy-items', this.tradeBuyNames(s));
+        const rows = this.root.querySelectorAll('.trade-rule');
+        if (!rows.length) return;
+        const rules = TLPolicy.tradeRules(s, TLPolicy.tradeConfig(this.pending.trade));
+        const progress = this.controller.tradeData?.(s?.role?.id)?.progress, items = this.tradeSellItems(s);
+        for (const row of rows) {
+          const { tradeKind: kind, tradeIndex: index } = row.dataset;
+          const { rule, reason } = rules[kind][Number(index)];
+          const reasonNode = row.querySelector('.trade-reason');
+          if (reasonNode.textContent !== reason) reasonNode.textContent = reason;
+          if (kind === 'sell') this.paintTradeSell(row, rule, s, items);
+          else this.paintTradeBuy(row, rule, progress);
+        }
+      }
+      paintTradeSell(row, rule, s, items) {
+        const select = row.querySelector('[data-trade-field="item"]');
+        const choices = this.tradeSellChoices(s, rule.item, items), key = JSON.stringify(choices);
+        if (select.getAttribute('data-trade-options') !== key) {
+          select.innerHTML = this.tradeOptions(choices, rule.item);
+          select.value = String(rule.item);
+          select.setAttribute('data-trade-options', key);
+        }
+        const preview = row.querySelector('.trade-preview'), text = this.tradeSellPreview(rule);
+        if (preview.textContent !== text) preview.textContent = text;
+      }
+      paintTradeBuy(row, rule, progress) {
+        const onlyMine = row.querySelector('[data-trade-field="onlyMine"]'), forced = TLPolicy.tradeNeedsTarget(rule.item);
+        const countOptions = row.querySelector('.trade-count-options');
+        if (onlyMine.disabled !== forced) onlyMine.disabled = forced;
+        if (onlyMine.checked !== (forced || rule.onlyMine)) onlyMine.checked = forced || rule.onlyMine;
+        if (countOptions.hidden !== (rule.mode !== 'count')) countOptions.hidden = rule.mode !== 'count';
+        const current = row.querySelector('.trade-progress'), text = this.tradeProgressText(rule, progress);
+        if (current.textContent !== text) current.textContent = text;
       }
       ringsHTML(r) {
         if (!r) return '';
@@ -11862,6 +12446,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         if (this.section === 'economy') {
           this.paintFragment('.sell-preview', this.sellPreview(this.controller.bridge.state()));
         }
+        if (this.section === 'trade') this.paintTrade(this.controller.bridge.state());
         if (this.section === 'status') {
           this.paintFragment('.runtime-status', this.runtimeHTML(s));
           this.paintFragment('.login-status', !s.role?.id ? this.infoBar('请先在游戏里登录角色') : '');
