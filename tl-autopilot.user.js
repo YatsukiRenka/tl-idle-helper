@@ -4946,6 +4946,186 @@
         return { hour, previous, today, recent, day24, maps: Object.values(maps).filter((b) => b.battle > 0).sort((a, b) => b.battle - a.battle) };
       }
     }
+    const MARKET_PAGE_SIZE = 24, MARKET_MAX_PAGES = 30, MARKET_SET_TTL = 60000, MARKET_FETCH_LIMIT = 8000;
+    class MarketPages {
+      constructor(bridge, socket, send) {
+        this.bridge = bridge;
+        this.socket = socket;
+        this.send = send;
+        this.requests = new Map();
+        this.sets = new Map();
+        this.failures = new Map();
+        this.prefix = 'tl-market-' + Math.random().toString(36).slice(2) + '-';
+        this.serial = 0;
+        this.generation = 0;
+      }
+      install() {
+        const socket = this.socket;
+        let owner = socket, native;
+        while (owner && !native) {
+          native = Object.getOwnPropertyDescriptor(owner, 'onmessage');
+          owner = Object.getPrototypeOf(owner);
+        }
+        const current = socket.onmessage, pages = this;
+        let wrapped;
+        Object.defineProperty(socket, 'onmessage', {
+          configurable: true, enumerable: native?.enumerable ?? true,
+          get: () => wrapped,
+          set(handler) {
+            wrapped = typeof handler === 'function' ? function (event) {
+              const deliver = (message) => Reflect.apply(handler, this, [message]);
+              let message = event;
+              try { message = pages.receive(event, deliver); } catch {}
+              if (message) return deliver(message);
+            } : null;
+            native?.set?.call(socket, wrapped);
+          },
+        });
+        socket.onmessage = current;
+      }
+      observe(payload) {
+        if (payload?.action !== 'list' || payload.mine || !['SALE', 'BARTER'].includes(payload.mode) ||
+            payload.requestId == null) return;
+        const { requestId, page, ...query } = payload, key = JSON.stringify(query, (_, value) =>
+          value && typeof value === 'object' && !Array.isArray(value)
+            ? Object.fromEntries(Object.keys(value).sort().map((k) => [k, value[k]])) : value);
+        if (this.query !== key) this.generation++;
+        this.query = key;
+        this.requests.set(requestId, { query, key, page: page ?? 1, generation: this.generation });
+        if (this.requests.size > 100) this.requests.delete(this.requests.keys().next().value);
+        if (this.job && this.job.key !== key) this.finish(this.job);
+      }
+      receive(event, deliver) {
+        if (typeof event.data !== 'string' || !event.data.includes('MARKET_RESPONSE')) return event;
+        const packet = JSON.parse(event.data);
+        if (packet.type !== 'MARKET_RESPONSE') return event;
+        const id = packet.data?.requestId;
+        if (typeof id === 'string' && id.startsWith(this.prefix)) {
+          const job = this.job;
+          if (job?.requestId !== id) return null;
+          try { this.accept(job, packet); } catch { this.fail(job); }
+          return null;
+        }
+        const request = this.requests.get(id);
+        if (!request) return event;
+        this.requests.delete(id);
+        this.visible = null;
+        if (this.bridge.socket !== this.socket || request.generation !== this.generation) return event;
+        try {
+          return this.gameReply(request, { event, deliver, packet });
+        } catch {
+          this.recordFailure(request.key, Date.now());
+          return event;
+        }
+      }
+      setKey(query, options) {
+        return JSON.stringify([query, options.prefs.market.sort, options.mode, options.hide, options.role?.id ?? null]);
+      }
+      gameReply(request, held) {
+        const score = this.bridge.marketScore, options = score?.globalListingOptions();
+        if (!options || !held.packet.success || held.packet.data.action !== 'list') return held.event;
+        held.page = request.page;
+        const key = this.setKey(request.key, options), now = Date.now(), cached = this.sets.get(key);
+        if (cached && now - cached.at < MARKET_SET_TTL) return this.rewrite(held, cached.items);
+        if (now < (this.failures.get(request.key) ?? 0)) return held.event;
+        if (this.job?.setKey === key) {
+          this.job.held.push(held);
+          return null;
+        }
+        if (this.job) this.finish(this.job);
+        const { page, pages, items } = held.packet.data, count = Math.max(1, pages);
+        if (!Number.isInteger(pages) || pages < 0 || pages > MARKET_MAX_PAGES ||
+            !Number.isInteger(page) || page < 1 || page > count || !Array.isArray(items)) {
+          this.recordFailure(request.key, now);
+          return held.event;
+        }
+        const job = { ...request, setKey: key, count, rows: new Array(count), held: [held], next: 0,
+          deadline: now + MARKET_FETCH_LIMIT };
+        job.rows[page - 1] = items;
+        job.timer = setTimeout(() => this.fail(job), MARKET_FETCH_LIMIT);
+        this.job = job;
+        this.advance(job);
+        return null;
+      }
+      accept(job, packet) {
+        const { action, page, pages, items } = packet.data;
+        if (!packet.success || action !== 'list' || page !== job.next + 1 || pages !== job.count || !Array.isArray(items)) {
+          this.fail(job);
+          return;
+        }
+        job.rows[job.next] = items;
+        this.advance(job);
+      }
+      advance(job) {
+        try {
+          if (Date.now() >= job.deadline) return this.fail(job);
+          while (job.rows[job.next]) job.next++;
+          if (job.next === job.count) return this.build(job);
+          job.requestId = this.prefix + ++this.serial;
+          Reflect.apply(this.send, this.socket, [JSON.stringify({
+            type: 'MARKET_COMMAND', payload: { ...job.query, page: job.next + 1, requestId: job.requestId },
+          })]);
+        } catch {
+          if (this.job === job) this.fail(job);
+        }
+      }
+      build(job) {
+        const score = this.bridge.marketScore, options = score?.globalListingOptions();
+        if (!options || this.setKey(job.key, options) !== job.setKey) return this.finish(job);
+        let items = job.rows.flat();
+        if (options.hide) items = items.filter((row) => P.listingBuyable(row, options.role));
+        if (options.mode !== 'off') {
+          const compare = score.sortListings(items, options.mode, options.state || score.state() || {}, options.prefs);
+          if (!compare) return this.finish(job);
+          items.sort(compare);
+        }
+        const now = Date.now();
+        if (now >= job.deadline) return this.fail(job);
+        for (const [key, set] of this.sets) if (now - set.at >= MARKET_SET_TTL) this.sets.delete(key);
+        this.sets.set(job.setKey, { at: now, items });
+        if (this.sets.size > 8) this.sets.delete(this.sets.keys().next().value);
+        this.finish(job, items);
+      }
+      recordFailure(key, now) {
+        for (const [query, until] of this.failures) if (until <= now) this.failures.delete(query);
+        this.failures.set(key, now + MARKET_SET_TTL);
+      }
+      fail(job) {
+        if (this.job !== job) return;
+        this.recordFailure(job.key, Date.now());
+        this.finish(job);
+      }
+      cancelPending() {
+        this.generation++;
+        this.finish(this.job);
+      }
+      finish(job, items) {
+        if (!job || this.job !== job) return;
+        this.job = null;
+        clearTimeout(job.timer);
+        for (const held of job.held) {
+          let message = held.event;
+          this.visible = null;
+          try {
+            if (items) message = this.rewrite(held, items);
+          } catch {
+            this.sets.delete(job.setKey);
+            this.recordFailure(job.key, Date.now());
+            items = null;
+          }
+          try { held.deliver(message); } catch (error) { window.reportError?.(error); }
+        }
+      }
+      rewrite(held, set) {
+        const total = set.length, pages = Math.max(1, Math.ceil(total / MARKET_PAGE_SIZE)),
+          page = Math.max(1, Math.min(pages, held.page)), first = (page - 1) * MARKET_PAGE_SIZE,
+          items = set.slice(first, first + MARKET_PAGE_SIZE), packet = held.packet;
+        const message = { data: JSON.stringify({ ...packet, data: { ...packet.data, items, page, pages, total } }) };
+        this.bridge.cacheMarketItems(items);
+        this.visible = { query: this.query, rows: items.map(MarketScore.cardKey) };
+        return message;
+      }
+    }
     class Bridge {
       constructor(log, roleHint = 0) {
         this.noBatchSell = false;
@@ -5157,10 +5337,12 @@
       syncInvasionRole(roleId) {
         if (this.invasionRoleId !== roleId) this.clearInvasion(roleId);
       }
-      observeSend(data) {
+      observeSend(data, socket = this.socket) {
         if (typeof data === 'string') {
           try {
             const packet = JSON.parse(data);
+            if (packet.type === 'MARKET_COMMAND' && !this.sending && this.socket === socket)
+              this.marketPages?.observe(packet.payload);
             if (packet.type === 'RINGS_COMMAND') {
               this.ringsRequests.set(packet.payload?.requestId, packet.payload?.action);
               this.ringsRequestAt.set(packet.payload?.requestId, Date.now());
@@ -5177,6 +5359,7 @@
         }
       }
       attach(socket, adopted = false) {
+        if (this.socket !== socket) this.marketPages?.cancelPending();
         this.socket = socket;
         this.adopted = adopted;
         this.sessionReady = false;
@@ -5185,13 +5368,21 @@
         this.ringsRequests = new Map();
         this.ringsRequestAt = new Map();
         this.hookedSockets ||= new WeakSet();
+        this.marketSocketPages ||= new WeakMap();
+        this.marketPages = this.marketSocketPages.get(socket);
         if (this.hookedSockets.has(socket)) return;
         this.hookedSockets.add(socket);
         const send = socket.send;
         const bridge = this;
+        try {
+          const pages = new MarketPages(this, socket, send);
+          pages.install();
+          this.marketSocketPages.set(socket, pages);
+          this.marketPages = pages;
+        } catch {}
         socket.send = function (data) {
           if (this === socket && socket !== bridge.socket) bridge.tryAdopt(socket);
-          bridge.observeSend(data);
+          bridge.observeSend(data, socket);
           return Reflect.apply(send, this, arguments);
         };
         socket.addEventListener('open', () => {
@@ -5202,6 +5393,7 @@
         });
         socket.addEventListener('close', () => {
           if (this.socket !== socket) return;
+          this.marketPages?.cancelPending();
           this.sessionReady = false;
           this.lastClose = Date.now();
           for (const waiter of this.pendingWaiters())
@@ -5264,20 +5456,8 @@
               equipSets: copy(data.equipSets), at: Date.now() });
             while (entries.size > 5) entries.delete(entries.keys().next().value);
           }
-          // 商会 pages (client of 2026-11-23): the server pages and sorts; the rows of recent pages are kept for labels.
-          if (type === 'MARKET_RESPONSE' && packet.success && packet.data?.action === 'list' && Array.isArray(packet.data.items)) {
-            const market = this.cache.market;
-            let changed = false;
-            for (const item of packet.data.items)
-              if (item && item.id != null) {
-                const key = item.source + ':' + item.id;
-                market.delete(key);
-                market.set(key, item);
-                changed = true;
-              }
-            while (market.size > 2000) market.delete(market.keys().next().value);
-            if (changed) this.cache.marketVersion = P.num(this.cache.marketVersion) + 1;
-          }
+          if (type === 'MARKET_RESPONSE' && packet.success && packet.data?.action === 'list' && Array.isArray(packet.data.items))
+            this.cacheMarketItems(packet.data.items);
           if (type === 'GET_MONSTER_TMPL_RESPONSE' && packet.success && Array.isArray(packet.data)) {
             for (const entry of packet.data.filter((e) => e.template))
               this.cache.monsterTemplates.set(entry.category + ':' + entry.id, {
@@ -5453,6 +5633,19 @@
             }
           }, 0);
         });
+      }
+      cacheMarketItems(items) {
+        const market = this.cache.market;
+        let changed = false;
+        for (const item of items) {
+          if (!item || item.id == null) continue;
+          const key = item.source + ':' + item.id;
+          market.delete(key);
+          market.set(key, item);
+          changed = true;
+        }
+        while (market.size > 2000) market.delete(market.keys().next().value);
+        if (changed) this.cache.marketVersion = P.num(this.cache.marketVersion) + 1;
       }
       get connected() {
         return this.socket?.readyState === 1;
@@ -6057,7 +6250,7 @@
           a = raw(a); b = raw(b);
           if (a == null || b == null) return a == null ? (b == null ? 0 : 1) : -1;
           const x = keys.get(a), y = keys.get(b);
-          return Number(y.equipment) - Number(x.equipment) || y.value - x.value || (Number(b.id) || 0) - (Number(a.id) || 0);
+          return Number(y.equipment) - Number(x.equipment) || y.value - x.value;
         };
       }
       // The sort value of each listing: equipment or not, and its power, score or gain.
@@ -6076,20 +6269,32 @@
         }
         return keys;
       }
-      // The 商会 window (client of 2026-11-23) pages on the server, 24 rows a page, so the script sorts and hides the rows
-      // of the page on screen. The rows form a CSS grid: the order goes through `order` and the game's DOM stays as it is.
+      globalListingOptions() {
+        const prefs = this.controller.prefs, { sort, hideUnbuyable: hide, showScore } = prefs.market;
+        if (showScore === false || (sort === 'off' && !hide)) return null;
+        const scored = sort === 'combat' || sort === 'gain', state = scored ? this.state() : null,
+          mode = scored && !this.listingKeys([], sort, state, prefs) ? 'off' : sort;
+        return mode !== 'off' || hide ? { prefs, mode, hide, role: this.role(), state } : null;
+      }
       refreshListings() {
         this.schedule();
+        const game = typeof document !== 'undefined' && this.gameSort();
+        if (!game) return;
+        this.controller.bridge?.marketPages?.cancelPending();
+        game.dispatchEvent(new Event('change', { bubbles: true }));
       }
       role() {
         const c = this.controller.bridge?.character?.(), role = c ? storeField(c, 'role') : null;
         return role?.id ? role : null;
       }
-      // In the game's filter bar: the script sort after its sort select, and 隐藏无法购买, a copy of its 适合我的等级 box.
-      scanControls() {
-        const bar = document.querySelectorAll('.market-window .filter-bar')[0], prefs = this.controller.prefs;
-        const game = bar && Array.from(bar.querySelectorAll('select')).find((node) =>
+      gameSort(bar = document.querySelectorAll('.market-window .filter-bar')[0]) {
+        return bar && Array.from(bar.querySelectorAll('select')).find((node) =>
           !node.classList.contains('tl-market-sort') && Array.from(node.options || []).some((option) => option.value === 'newest'));
+      }
+      // The script sort and hide controls sit in the game's filter bar.
+      scanControls() {
+        const bar = document.querySelectorAll('.market-window .filter-bar')[0], prefs = this.controller.prefs,
+          game = this.gameSort(bar);
         if (prefs.market.showScore === false) for (const node of document.querySelectorAll('.tl-market-sort')) node.remove();
         else if (game) this.scanSort(game, prefs);
         const own = bar && Array.from(bar.querySelectorAll('label')).find((node) =>
@@ -6101,7 +6306,7 @@
         if (!label) {
           label = own.cloneNode(true);
           label.classList.add('tl-market-unbuyable');
-          label.title = '勾选后本页不显示买不了的商品：自己上架的和指定卖给他人的';
+          label.title = '隐藏自己上架和指定卖给他人的商品';
           for (const node of Array.from(label.childNodes)) if (node.nodeType === 3) node.remove();
           label.appendChild(document.createTextNode('隐藏无法购买'));
           own.before(label);
@@ -6116,6 +6321,7 @@
       }
       constructor(controller) {
         this.controller = controller;
+        if (controller.bridge) controller.bridge.marketScore = this;
         this.petLevelButton = new PetLevelButton(controller);
         if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
         this.timer = 0;
@@ -6163,6 +6369,9 @@
         return JSON.stringify([String(it.owner_id ?? ''), String(it.title || '').trim(),
           sale ? P.num(it.price) : -1, sale ? P.num(it.currency, 1) : 0]);
       }
+      static rowKey(info) {
+        return JSON.stringify([info.owner, info.title, info.price, info.currency]);
+      }
       static index(owner) {
         const cache = owner.controller.bridge.cache, source = cache.market, version = cache.marketVersion;
         let index = owner.marketIndex;
@@ -6181,7 +6390,7 @@
       matches(row) {
         const info = this.read(row);
         if (!info.title || !info.owner) return { info, list: [] };
-        return { info, list: MarketScore.index(this).get(JSON.stringify([info.owner, info.title, info.price, info.currency])) || [] };
+        return { info, list: MarketScore.index(this).get(MarketScore.rowKey(info)) || [] };
       }
       label(row, state, prefs, view, found = this.matches(row)) {
         const scoringPrefs = MarketScore.scorePrefs(prefs, prefs.market.scoreType);
@@ -6391,8 +6600,8 @@
           select.className = 'tl-market-sort';
           for (const attr of game.attributes)
             if (attr.name.startsWith('data-v-')) select.setAttribute(attr.name, attr.value);
-          for (const [value, text] of [['off', '脚本排序：关'], ['power', '本页按战斗力'],
-            ['combat', '本页按实战评分'], ['gain', '本页按实战提升']]) {
+          for (const [value, text] of [['off', '脚本排序：关'], ['power', '按战斗力'],
+            ['combat', '按实战评分'], ['gain', '按实战提升']]) {
             const option = document.createElement('option');
             option.value = value;
             option.textContent = text;
@@ -6406,8 +6615,11 @@
           });
         }
         if (select.value !== prefs.market.sort) select.value = prefs.market.sort;
-        const title = ['combat', 'gain'].includes(prefs.market.sort) && !this.sortListings([], prefs.market.sort, this.state(), prefs)
-          ? '实战评分等待战斗数据，暂按游戏排序' : '商会每页 24 条，只排当前这一页';
+        const options = this.globalListingOptions(), pages = this.controller.bridge?.marketPages,
+          fallback = pages && pages.visible?.query !== pages.query && Date.now() < (pages.failures.get(pages.query) ?? 0);
+        const title = options && !fallback ? '按全部页排序（最多 30 页，每分钟刷新一次）' :
+          !options && ['combat', 'gain'].includes(prefs.market.sort) ? '实战评分等待战斗数据，暂按游戏排序' :
+          '商会每页 24 条，只排当前这一页';
         if (select.title !== title) select.title = title;
       }
       scan() {
@@ -6883,8 +7095,10 @@
         }
       }
       scanMarket(rows, state, prefs) {
-        const view = state ? MarketScore.prepare(this, state, prefs) : null, role = prefs.market.hideUnbuyable ? this.role() : null,
-          found = rows.map((row) => this.matches(row));
+        const view = state ? MarketScore.prepare(this, state, prefs) : null,
+          found = rows.map((row) => this.matches(row)), visible = this.controller.bridge?.marketPages?.visible?.rows,
+          global = visible?.length === rows.length && found.every(({ info }, i) => MarketScore.rowKey(info) === visible[i]),
+          role = !global && prefs.market.hideUnbuyable ? this.role() : null;
         rows.forEach((row, i) => {
           const text = row.querySelector('.product-info > span'),
             old = Array.from(row.querySelectorAll('.tl-market-score'));
@@ -6912,7 +7126,7 @@
             el.style.color = want.color;
           }
         });
-        this.orderRows(rows, found, state, prefs);
+        this.orderRows(rows, found, global ? null : state, prefs);
       }
       // Equipment first by the chosen value, the rest after it in the game's order.
       orderRows(rows, found, state, prefs) {
