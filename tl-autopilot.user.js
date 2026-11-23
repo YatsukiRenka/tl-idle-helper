@@ -2570,15 +2570,19 @@
       const types = tabText === '道具' ? [2] : tabText === '材料' ? [3, 4] : [];
       return array(items).filter(item => types.includes(item?.itemTmpl?.type));
     }
-    function bagTabItems(tabText, character) {
-      return tabItems(tabText, character?.bagItems);
+    // The bag window of the client of 2026-11-23 filters by bound state ('all', 'bound' or 'unbound') the way
+    // the game does: Number(isBound || 0) === 1 is bound.
+    function bagTabItems(tabText, character, bound = 'all') {
+      const items = tabItems(tabText, character?.bagItems);
+      if (bound !== 'bound' && bound !== 'unbound') return items;
+      return items.filter(item => (Number(item.isBound || 0) === 1) === (bound === 'bound'));
     }
     function warehouseTabItems(tabText, character) {
       return tabItems(tabText, character?.warehouseItems);
     }
-    function bagCellItem(tabText, index, character) {
-      if (!Number.isInteger(index) || index < 0 || index >= 72) return null;
-      return bagTabItems(tabText, character)[index] || null;
+    function bagCellItem(tabText, index, character, bound) {
+      if (!Number.isInteger(index) || index < 0) return null;
+      return bagTabItems(tabText, character, bound)[index] || null;
     }
     function potionChoices(s, attr) {
       const templates = new Map(array(s.potionTemplates).map((t) => [num(t.id), t]));
@@ -9631,11 +9635,13 @@
         const filled = (node) => !!node.querySelector('.v-img, img');
         if (!win || !grid?.matches('.inventory-grid') || !filled(cell)) return null;
         const tab = win.querySelector('.game-tab-button.is-active')?.textContent.trim();
+        const bound = win.querySelector('select[aria-label="绑定状态筛选"]')?.value || 'all';
         const cells = Array.from(grid.children).filter(node => node.matches('.grid-slot'));
-        const character = this.bridge.character(), count = P.bagTabItems(tab, character).length, shown = cells.filter(filled).length;
+        const character = this.bridge.character(), count = P.bagTabItems(tab, character, bound).length;
+        const shown = cells.filter(filled).length, index = cells.indexOf(cell);
         // Older clients page the bag 72 cells at a time; the client of 2026-11-23 shows every item.
-        if (shown !== count && shown !== Math.min(72, count)) return null;
-        return P.bagCellItem(tab, cells.indexOf(cell), character);
+        if (shown !== count && (shown !== Math.min(72, count) || index >= 72)) return null;
+        return P.bagCellItem(tab, index, character, bound);
       }
       warehouseTab(target) {
         return target?.closest?.('.warehouse-window')?.querySelector('.game-tab-button.is-active')?.textContent.trim();
