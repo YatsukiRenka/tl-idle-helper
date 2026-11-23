@@ -452,8 +452,8 @@
       }
       const item = tradeCategoryKey(rule.item) ? rule.item :
         tradePositiveId(rule.item) && Number.isSafeInteger(Number(rule.item)) ? Number(rule.item) : 0;
-      const unit = tradeNumber(rule.unitPrice, 1);
-      return { ...base, on: base.on && !!item, item, count: tradeInt(rule.count, 1, 9999999),
+      const unit = tradeNumber(rule.unitPrice, 1), count = tradeInt(rule.count, 1, 9999999);
+      return { ...base, on: base.on && !!item, item, count, minCount: tradeInt(rule.minCount, 1, count),
         maxMode: tradeSwitch(rule.maxMode), priceMode: rule.priceMode === 'unit' ? 'unit' : 'lot',
         price: tradeInt(rule.price, 1, TRADE_MAX_PRICE),
         unitPrice: unit <= 0 ? 1 : Math.max(0.01, Number(unit.toFixed(2))),
@@ -2337,7 +2337,7 @@
       if (!rule.item) return '请选择可上架的物品';
       if (tradeCategoryKey(rule.item) && !rule.targetId) return '大类仅用于指定角色ID的转移';
       if (rule.targetId && num(rule.targetId) === num(role?.id)) return '不能指定自己的角色ID';
-      if (tradeLotPrice(rule, rule.maxMode ? 1 : rule.count) > TRADE_MAX_PRICE) return tradePriceError;
+      if (tradeLotPrice(rule, rule.maxMode ? rule.minCount : rule.count) > TRADE_MAX_PRICE) return tradePriceError;
       return '';
     }
     function tradeBuyReason(rule, sells, items) {
@@ -3023,7 +3023,7 @@
     }
     function tradeLotCount(rule, item, stored) {
       const q = Math.min(rule.count, num(item.largest.count), item.units + num(stored?.units) - rule.keep);
-      return q >= 1 && (rule.maxMode || q === rule.count) ? q : 0;
+      return q >= (rule.maxMode ? rule.minCount : rule.count) ? q : 0;
     }
     function tradeMaxPriceReason(rule, inventory, warehouse, bag) {
       if (!inventory || !rule.maxMode || tradeLotPrice(rule, rule.count) <= TRADE_MAX_PRICE) return '';
@@ -3061,7 +3061,7 @@
       const count = Math.max(0, Math.min(num(item.largest.count), item.units - rule.keep));
       const q = rule.maxMode ? Math.min(rule.count, count)
         : largest < rule.count && largest + count >= rule.count ? rule.count : 0;
-      return { count, q };
+      return { count, q: rule.maxMode && q < rule.minCount ? 0 : q };
     }
     function tradeWithdrawItem(rule, item, bag) {
       if (!tradeSellMatches(rule, item)) return null;
@@ -10446,6 +10446,7 @@
       [5, '红色（5）'],
     ];
     const tradeCategoryChoices = Object.entries(TLPolicy.TRADE_CATEGORIES).map(([key, name]) => [key, name + '（大类）']);
+    const tradeKindLabels = { sell: '上架', buy: '采购' };
     const pathGet = (o, path) => path.split('.').reduce((v, k) => v?.[k], o);
     const pathSet = (o, path, value) => {
       const ks = path.split('.');
@@ -10467,7 +10468,7 @@
       sellAppraised: "不勾选时，资质不是外攻、内攻双完美（都高于 1500）的已鉴定武器按其余规则出售；品质上限、强化、套装等保护照常生效。",
       sell: "穿戴、强化、镶宝和星级装备始终保留。材料仅按填写的模板ID处理。",
       trade: '查询商会（搜索商品、看自己的交易和可上架物品）不用停止战斗，也不用打开商会窗口。上架、购买、领取、下架要先停止战斗：只在城里或普通野外挂机图上短暂停一下，办完继续打；珍珑棋局、熊林、伪宋军领地、无相浮屠、新三环、宵小入侵和比武时不交易，结束后再办。只在托管运行时工作。卖出的钱和买到的物品自动领取。',
-      tradeSell: '只上架未绑定的道具和材料，每单只用背包里的一组。关闭最大个数时，攒够一单才上架；开启后，扣掉保留数量，有多少卖多少，最多卖到填写的个数。按物品单价时，整单价向上取整。大类（宝石、棉布、秘银、残页、技能书）只能指定角色ID，用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
+      tradeSell: '只上架未绑定的道具和材料，每单只用背包里的一组。关闭最大个数时，攒够一单才上架；开启后，扣掉保留数量，达到每单最少个数才上架，最多卖到每单最大个数。从仓库取出时也要够每单最少个数。按物品单价时，整单价向上取整。大类（宝石、棉布、秘银、残页、技能书）只能指定角色ID，用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
       tradeWarehouse: '商会只能上架背包里的物品；开启后，仓库里符合上架规则的未绑定物品会自动取出到背包再上架（战斗中取出，不用停战）',
       tradeBuy: '只买一口价的道具和材料（不买装备、珍兽、以物易物）。按物品名完全一致匹配，单价 = 整单价 ÷ 数量。买的人只能买下整单。物品留空或选大类时，只买别人指定卖给你的商品。为防止高频扫货，采购最快 5 分钟查一次商会（查询间隔更长时按查询间隔）。',
       warehouse: "装备存仓只处理未穿戴的装备；可穿戴的更优装备会先穿戴。仓库装备格满 200 时暂停存装备。符合存仓条件的装备不会被自动出售。",
@@ -10522,7 +10523,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.4;curs
 .facts{display:grid;row-gap:4px;margin:8px 0 0;padding-top:8px;border-top:1px solid var(--divider)}.facts>div{display:grid;grid-template-columns:2em minmax(0,1fr);column-gap:12px}.facts dt{color:var(--text-2);white-space:nowrap}.facts dd{margin:0;min-width:0;text-align:left;overflow-wrap:anywhere}.summary-login{margin-top:4px;font-size:12px;color:var(--text-2)}
 .tabs{display:flex}.tabs button{position:relative;flex:none;height:28px;border:0;background:transparent;color:var(--text-2);padding:0 12px;border-radius:4px;white-space:nowrap}.tabs button:hover,.tabs button:active{background:transparent}.tabs button.active{color:var(--text);font-weight:600}
 .tabs .has-update::after{content:'';display:inline-block;width:6px;height:6px;margin-left:4px;vertical-align:middle;border-radius:50%;background:var(--accent)}
-.main{display:grid;grid-template-columns:190px minmax(0,1fr);min-height:0;flex:1;overflow:hidden;border-top:1px solid var(--divider)}.page-tabs{flex-direction:column;min-height:0;padding:8px;background:var(--surface-alt);border-right:1px solid var(--stroke);overflow:auto}.page-tabs button{transition:none;text-align:left;padding:0 8px;overflow:hidden;text-overflow:ellipsis}.page-tabs button.active{background:var(--surface)}.page-tabs button.active::before{content:'';position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:4px;background:var(--accent)}
+.main{display:grid;grid-template-columns:190px minmax(0,1fr);min-height:0;flex:1;overflow:hidden;border-top:1px solid var(--divider)}.trade-rule-tabs,.page-tabs{flex-direction:column;min-height:0;padding:8px;background:var(--surface-alt);border-right:1px solid var(--stroke);overflow:auto}.trade-rule-tabs button,.page-tabs button{transition:none;text-align:left;padding:0 8px;overflow:hidden;text-overflow:ellipsis}.trade-rule-tabs button.active,.page-tabs button.active{background:var(--surface)}.trade-rule-tabs button.active::before,.page-tabs button.active::before{content:'';position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:4px;background:var(--accent)}
 .body{padding:12px;flex:1;overflow:auto;min-height:0;min-width:0}.group{background:var(--surface);border:1px solid var(--stroke);border-radius:6px;margin-top:8px}.group:first-child{margin-top:0}.group>summary{display:flex;align-items:center;gap:8px;min-height:40px;padding:8px 12px;list-style:none;border-radius:4px;font-weight:600}.group>summary::-webkit-details-marker{display:none}.group>summary::after{content:'›';flex:none;color:var(--text-2);transform:rotate(0deg);transition:transform 120ms ease}.group[open]>summary::after{transform:rotate(90deg)}.section-title{min-width:0;flex:1}.section-state{font-size:12px;font-weight:400;color:var(--text-2);white-space:nowrap}.master{display:flex;align-items:center;flex:none}.section-content{padding:0 12px 8px;border-top:1px solid var(--divider)}
 .field{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:4px 8px;min-height:40px;padding:4px 0;border-bottom:1px solid var(--divider)}.field:last-child:not(.search-field){border-bottom:0}.field-label{display:flex;align-items:center;gap:4px;min-width:0;white-space:nowrap}.field-label>span{overflow:hidden;text-overflow:ellipsis}.field-control{display:flex;align-items:center;gap:4px}.field.dependent{padding-left:12px}.field.disabled{opacity:.45}.instant,.field-error{grid-column:1/-1}.unit{font-size:11px;color:var(--text-2);white-space:nowrap}.instant{font-size:12px;color:var(--accent-text);margin-left:4px;white-space:nowrap}
 .control-input,.control-select{height:28px;border:1px solid var(--stroke);border-bottom-color:var(--stroke-strong);background:var(--control);border-radius:4px;padding:0 8px}.control-input{width:96px}.control-select{width:auto;max-width:100%;text-overflow:ellipsis;white-space:nowrap;overflow:hidden}
@@ -10536,7 +10537,12 @@ textarea{width:100%;background:var(--control);border:1px solid var(--stroke);bor
 .help{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;margin-left:4px;flex:none;border:1px solid var(--stroke-strong);border-radius:50%;background:transparent;color:var(--text-3);font-size:11px;line-height:1;vertical-align:middle}
 .tooltip{position:fixed;z-index:1;max-width:280px;overflow:auto;padding:8px 12px;border:1px solid var(--stroke);border-radius:6px;background:var(--surface);box-shadow:var(--shadow);color:var(--text);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none}
 .stat-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--divider);font-size:12px}.stat-row:last-child{border-bottom:0}.stat-label{color:var(--text-2);flex:none}.stat-value{display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:4px;text-align:right;min-width:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-.trade-rule,.trade-status{border:1px solid var(--divider);border-radius:4px;padding:4px 8px;margin:8px 0}.trade-rule .actions{flex-wrap:wrap}.trade-preview,.trade-progress,.trade-reason{font-size:12px}.trade-reason{color:var(--warn)}
+.trade-status{border:1px solid var(--divider);border-radius:4px;padding:4px 8px;margin:8px 0}.trade-preview,.trade-progress,.trade-reason{font-size:12px}.trade-reason{color:var(--warn)}
+.trade-tabs{margin:8px 0;border-bottom:1px solid var(--divider)}.trade-tabs button.active{background:var(--surface-alt)}
+.trade-layout{display:grid;grid-template-columns:minmax(0,192px) minmax(0,1fr);gap:12px}.trade-rule-tabs{gap:4px;border-radius:4px}
+.trade-rule-tabs button{height:auto;min-height:44px;padding:4px 8px}.trade-rule-heading{display:flex;align-items:center;gap:4px}.trade-rule-name,.trade-rule-summary{display:block;overflow:hidden;text-overflow:ellipsis}.trade-rule-summary,.trade-rule-disabled,.trade-empty{font-size:12px;color:var(--text-2);font-weight:400}.trade-rule-disabled{flex:none}
+.trade-rule label.field:has(select){display:grid}.trade-rule label.field:has(select) .field-control{max-width:none}.trade-rule .control-select[data-trade-field="item"]{max-width:144px}
+@media(max-width:819px){.trade-layout{grid-template-columns:minmax(0,1fr)}}
 .stat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0}.stat-tile{min-width:0;padding:8px;border:1px solid var(--stroke);border-radius:6px;background:var(--surface)}.stat-tile>span,.stat-tile>small{display:block;font-size:11px;color:var(--text-2)}.stat-tile>strong{display:block;font-size:18px;font-weight:600;overflow-wrap:anywhere}
 .chip{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border:1px solid var(--stroke);border-radius:4px;background:var(--surface-alt);font-size:11px;white-space:nowrap}.chips{display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:8px 0}.tone-neutral{color:var(--text-2)}.tone-ok{color:var(--ok)}.tone-warn{color:var(--warn)}.tone-err{color:var(--err)}.tone-accent{color:var(--accent-text)}
 .info-bar{display:flex;align-items:center;gap:8px;padding:8px;margin:8px 0;border:1px solid var(--stroke);border-radius:6px;background:var(--surface-alt);font-size:12px}.info-bar>span:first-child{font-weight:600;flex:none}.empty-state{padding:8px 0;color:var(--text-2);font-size:12px}.block-title{display:flex;align-items:center;gap:4px;margin:12px 0 4px;font-size:12px;font-weight:600}
@@ -10725,6 +10731,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         this.loadPanelState();
         this.section = this.panelState.page;
         this.pending = TLPolicy.clone(controller.prefs);
+        this.tradeKind = 'sell';
+        this.tradeSelection = { sell: 0, buy: 0 };
         this.dirty = false;
         this.previewPlans = [];
         this.roleKey = '';
@@ -10864,6 +10872,10 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           const b = e.target.closest('button');
           if (!b) return;
           const action = b.dataset.action;
+          if (action === 'tradeTab' || action === 'tradeSelect') {
+            this.selectTrade(action, b);
+            return;
+          }
           if (['tradeAdd', 'tradeDelete', 'tradeReset'].includes(action)) {
             this.editTradeRules(action, b);
             return;
@@ -11047,7 +11059,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
           const button = e.target.closest('[role="tab"]'), row = button?.closest('[role="tablist"]');
           if (!row) return;
-          if (['ArrowUp', 'ArrowDown'].includes(e.key) && !row.classList.contains('page-tabs')) return;
+          if (['ArrowUp', 'ArrowDown'].includes(e.key) && !row.classList.contains('page-tabs') &&
+            row.getAttribute('aria-orientation') !== 'vertical') return;
           const buttons = [...row.querySelectorAll('[role="tab"]')].filter((tab) => !tab.hidden),
             index = buttons.indexOf(button), next = buttons[(index + (['ArrowRight', 'ArrowDown'].includes(e.key) ? 1 : -1) + buttons.length) % buttons.length];
           e.preventDefault();
@@ -12027,8 +12040,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('查询间隔', 'trade.scanSeconds', { unit: '秒', min: 20, max: 600, help: '查自己的交易和可上架物品的间隔；采购查商品最快 5 分钟一次' }) +
             f('元宝保留', 'trade.yuanbaoReserve', { unit: '元宝', help: '采购后元宝不少于此数' }),
           true, { help: HELP.trade }) +
-          g('自动上架', this.tradeRulesHTML('sell', s), false, { help: HELP.tradeSell }) +
-          g('自动采购', this.tradeRulesHTML('buy', s), false, { help: HELP.tradeBuy }) +
+          g('自动交易', this.tradeTabsHTML(s), false, { help: this.tradeHelp() }) +
           '<div class="trade-status">' + (this.indexing ? '' : this.tradeStatusHTML(s)) + '</div>';
         if (this.section === 'budget')
           html =
@@ -12146,11 +12158,21 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           '</div><div class="chips">' + [...reasons].map(([reason, n]) => this.chip(reason + ' ' + n)).join('') + '</div>' +
           this.scoreTableHTML(['名称', '品质', '等级', '评分', '模板ID'], rows);
       }
+      selectTrade(action, button) {
+        const { tradeKind: kind, tradeIndex: index } = button.dataset;
+        if (action === 'tradeTab') {
+          if (kind === this.tradeKind) return;
+          this.root.querySelector('[data-trade-panel="' + this.tradeKind + '"]').innerHTML = '';
+          this.tradeKind = kind;
+          this.hideTooltip();
+        } else this.tradeSelection[kind] = Number(index);
+        this.paintTrade(this.controller.bridge.state());
+      }
       editTradeRules(action, button) {
         const row = button.closest('.trade-rule'), kind = row?.dataset.tradeKind || button.dataset.tradeKind;
-        const rules = this.pending.trade[kind];
+        const rules = this.pending.trade[kind], index = Number(row?.dataset.tradeIndex);
         if (action === 'tradeReset') {
-          this.controller.resetTradeProgress(rules[Number(row.dataset.tradeIndex)].id);
+          this.controller.resetTradeProgress(rules[index].id);
           this.paintTrade(this.controller.bridge.state());
           return;
         }
@@ -12158,10 +12180,16 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           let id = TLPolicy.tradeRuleId();
           while (rules.some(rule => rule.id === id)) id += '-';
           rules.push(TLPolicy.tradeRule({ onlyMine: true }, id, kind));
-        } else if (action === 'tradeDelete') rules.splice(Number(row.dataset.tradeIndex), 1);
-        else return;
+          this.tradeSelection[kind] = rules.length - 1;
+        } else if (action === 'tradeDelete') {
+          rules.splice(index, 1);
+          this.tradeSelection[kind] = Math.max(0, index - 1);
+        } else return;
         this.dirty = true;
-        this.requestBody();
+        this.paintDirty();
+        this.paintTrade(this.controller.bridge.state());
+        const selected = this.root.querySelector('.trade-rule-tabs .active');
+        (selected || this.root.querySelector('[data-action="tradeAdd"]'))?.focus();
       }
       editTradeField(control) {
         const { tradeKind: kind, tradeIndex: index } = control.closest('.trade-rule').dataset;
@@ -12214,21 +12242,26 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       tradeSellChoices(s, item, items) {
         const choices = [...tradeCategoryChoices, ...items];
         if (!item) return [...choices, [0, '请选择物品']];
-        if (!choices.some(([id]) => id === item)) {
-          const saved = [...TLPolicy.array(s?.bagItems), ...TLPolicy.array(s?.warehouseItems)]
-            .find(bag => TLPolicy.num(bag.itemId ?? bag.itemTmpl?.id) === item);
-          choices.push([item, saved?.itemTmpl?.name || '物品 #' + item]);
-        }
+        if (!choices.some(([id]) => id === item)) choices.push([item, this.tradeSellName(s, item)]);
         return choices;
+      }
+      tradeSellName(s, item) {
+        const saved = [...TLPolicy.array(s?.bagItems), ...TLPolicy.array(s?.warehouseItems)]
+          .find(bag => TLPolicy.num(bag.itemId ?? bag.itemTmpl?.id) === item && bag.itemTmpl?.name);
+        return saved?.itemTmpl.name || '物品 #' + item;
+      }
+      tradeSellQuantity(rule) {
+        return '每单 ' + (rule.maxMode ? rule.minCount + '–' : '') + rule.count;
       }
       tradeSellPreview(rule) {
         const price = TLPolicy.tradeLotPrice(rule, rule.count);
+        const range = rule.maxMode ? this.tradeSellQuantity(rule) + ' · ' : '';
         if (rule.priceMode === 'unit') {
-          const prefix = rule.maxMode ? '每单最多 ' : '每单 ';
-          return prefix + (Number.isFinite(price) ? price : '超过 20 亿');
+          const prefix = rule.maxMode ? '最高价 ' : '每单 ';
+          return range + prefix + (Number.isFinite(price) ? price : '超过 20 亿');
         }
         const unit = rule.maxMode ? '单价随个数变化' : '单价 ' + TLPolicy.tradeUnitText(price, rule.count);
-        return unit + ' · 税后到账 ' + TLPolicy.tradeNet(price, rule.currency);
+        return range + unit + ' · 税后到账 ' + TLPolicy.tradeNet(price, rule.currency);
       }
       tradeSellPriceHTML(rule) {
         return rule.priceMode === 'unit'
@@ -12243,11 +12276,15 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         return field('物品', 'item', { choices: this.tradeSellChoices(s, rule.item, items) }) +
           field('最大个数', 'maxMode') +
           field(rule.maxMode ? '每单最大个数' : '每单个数', 'count', { min: 1, max: 9999999 }) +
+          '<div class="trade-min">' + this.tradeMinHTML(rule) + '</div>' +
           field('计价方式', 'priceMode', { choices: [['lot', '每单价格'], ['unit', '物品单价']] }) +
           '<div class="trade-price">' + this.tradeSellPriceHTML(rule) + '</div>' +
           '<div class="trade-preview">' + this.tradeSellPreview(rule) + '</div>' +
           field('指定角色ID', 'targetId', { text: true, placeholder: '可空；大类必填' }) +
           field(this.tradeKeepLabel(), 'keep', { min: 0 });
+      }
+      tradeMinHTML(rule) {
+        return rule.maxMode ? this.tradeField('每单最少个数', 'minCount', rule.minCount, { min: 1, max: rule.count }) : '';
       }
       tradeBuyHTML(rule) {
         const field = (label, key, opts) => this.tradeField(label, key, rule[key], opts);
@@ -12272,23 +12309,71 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
         return [...new Set([...tradeCategoryChoices.map(([, label]) => label), ...names.filter(Boolean)])]
           .map(name => '<option value="' + esc(name) + '"></option>').join('');
       }
-      tradeRulesHTML(kind, s) {
+      tradeHelp() {
+        return this.tradeKind === 'sell' ? HELP.tradeSell : HELP.tradeBuy;
+      }
+      tradeTabLabel(kind) {
+        return tradeKindLabels[kind] + '（' + this.pending.trade[kind].length + '）';
+      }
+      tradeTabHTML(id, panel, selected, action, data, content) {
+        return '<button type="button" role="tab" id="' + id + '" aria-controls="' + panel + '" aria-selected="' + selected +
+          '" tabindex="' + (selected ? '0' : '-1') + '" class="' + (selected ? 'active' : '') +
+          '" data-action="' + action + '"' + data + '>' + content + '</button>';
+      }
+      tradeTabsHTML(s) {
         if (this.indexing) return '';
-        const rules = TLPolicy.tradeRules(s, TLPolicy.tradeConfig(this.pending.trade))[kind], sell = kind === 'sell';
-        const items = sell ? this.tradeSellItems(s) : this.tradeBuyNames(s);
-        const progress = this.controller.tradeData?.(s?.role?.id)?.progress;
-        const rows = rules.map(({ rule, reason }, index) =>
-          '<div class="trade-rule" data-trade-kind="' + kind + '" data-trade-index="' + index + '">' +
+        const kinds = Object.keys(tradeKindLabels);
+        return '<div class="tabs trade-tabs" role="tablist" aria-label="自动交易">' + kinds.map(kind =>
+          this.tradeTabHTML('tl-trade-tab-' + kind, 'tl-trade-panel-' + kind, kind === this.tradeKind, 'tradeTab',
+            ' data-trade-kind="' + kind + '"', this.tradeTabLabel(kind))).join('') + '</div>' + kinds.map(kind =>
+          '<div role="tabpanel" id="tl-trade-panel-' + kind + '" aria-labelledby="tl-trade-tab-' + kind +
+          '" data-trade-panel="' + kind + '"' + (kind === this.tradeKind ? '>' + this.tradeRulesHTML(kind, s) : ' hidden>') +
+          '</div>').join('');
+      }
+      tradeView(kind, s) {
+        const rules = TLPolicy.tradeRules(s, TLPolicy.tradeConfig(this.pending.trade))[kind];
+        return { rules, index: Math.min(this.tradeSelection[kind], rules.length - 1),
+          items: kind === 'sell' ? this.tradeSellItems(s) : [],
+          progress: this.controller.tradeData?.(s?.role?.id)?.progress };
+      }
+      tradeRuleSummary(kind, { rule, reason }, s, progress) {
+        const category = tradeCategoryChoices.find(([key]) => key === rule.item)?.[1];
+        const sell = kind === 'sell', currency = TLPolicy.tradeCurrency(rule.currency);
+        const name = category || (sell ? (rule.item ? this.tradeSellName(s, rule.item) : '请选择物品')
+          : rule.item || '指定给我的商品');
+        const summary = sell
+          ? this.tradeSellQuantity(rule) + ' · ' + (rule.priceMode === 'unit' ? '单价 ' + rule.unitPrice : rule.price) +
+            ' ' + currency + (rule.targetId ? ' · 指定 ' + rule.targetId : '')
+          : '单价≤' + rule.maxUnit + ' ' + currency + ' · ' + (rule.mode === 'count'
+            ? '已买 ' + TLPolicy.tradeBought(rule, progress) + '/' + rule.count : '持续');
+        return '<span class="trade-rule-heading"><span class="trade-rule-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
+          (rule.on ? '' : '<span class="trade-rule-disabled">已停用</span>') +
+          (reason ? '<span class="dot warn" role="img" aria-label="' + esc(reason) + '" title="' + esc(reason) + '"></span>' : '') +
+          '</span><span class="trade-rule-summary" title="' + esc(summary) + '">' + esc(summary) + '</span>';
+      }
+      tradeRulesHTML(kind, s, view = this.tradeView(kind, s)) {
+        const { rules, index, progress } = view, label = tradeKindLabels[kind];
+        const list = rules.length ? '<div class="tabs trade-rule-tabs" role="tablist" aria-orientation="vertical" aria-label="' +
+          label + '规则">' + rules.map((entry, i) => this.tradeTabHTML('tl-trade-rule-' + kind + '-' + i, 'tl-trade-detail-' + kind,
+          i === index, 'tradeSelect', ' data-trade-kind="' + kind + '" data-trade-index="' + i + '"',
+          this.tradeRuleSummary(kind, entry, s, progress))).join('') + '</div>'
+          : '<div class="trade-empty">还没有' + label + '规则</div>';
+        const add = rules.length < 10 ? '<div class="actions"><button type="button" class="btn" data-action="tradeAdd" data-trade-kind="' +
+          kind + '">添加' + label + '规则</button></div>' : '';
+        return '<div class="trade-layout"><div>' + list + add + '</div>' + (index < 0 ? '' :
+          '<div class="trade-detail" role="tabpanel" id="tl-trade-detail-' + kind + '" aria-labelledby="tl-trade-rule-' + kind + '-' +
+          index + '">' + this.tradeDetailHTML(kind, s, view) + '</div>') + '</div>' +
+          (kind === 'buy' ? '<datalist class="trade-buy-items" id="tl-trade-buy-items">' + this.tradeBuyNames(s) + '</datalist>' : '');
+      }
+      tradeDetailHTML(kind, s, { rules, index, items, progress }) {
+        const { rule, reason } = rules[index], sell = kind === 'sell';
+        return '<div class="trade-rule" data-trade-kind="' + kind + '" data-trade-index="' + index + '">' +
           this.tradeField('启用', 'on', rule.on) + (sell ? this.tradeSellHTML(rule, s, items) : this.tradeBuyHTML(rule)) +
           '<div class="actions">' + (sell ? '' :
             '<span class="trade-progress">' + this.tradeProgressText(rule, progress) + '</span>' +
             '<button type="button" class="btn" data-action="tradeReset">重置</button>') +
           '<button type="button" class="btn" data-action="tradeDelete">删除</button></div>' +
-          '<div class="trade-reason" aria-live="polite">' + esc(reason) + '</div></div>').join('');
-        const add = '<button type="button" class="btn" data-action="tradeAdd" data-trade-kind="' + kind + '">添加' +
-          (sell ? '上架' : '采购') + '规则</button>';
-        return rows + (rules.length < 10 ? '<div class="actions">' + add + '</div>' : '') +
-          (sell ? '' : '<datalist class="trade-buy-items" id="tl-trade-buy-items">' + items + '</datalist>');
+          '<div class="trade-reason" aria-live="polite">' + esc(reason) + '</div></div>';
       }
       tradeStatusHTML(s) {
         const mine = s?.trade?.mine, daily = this.controller.tradeData?.(s?.role?.id)?.daily;
@@ -12304,35 +12389,80 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       }
       paintTrade(s) {
         this.paintFragment('.trade-status', this.tradeStatusHTML(s));
-        this.paintFragment('.trade-buy-items', this.tradeBuyNames(s));
-        const rows = this.root.querySelectorAll('.trade-rule');
-        if (!rows.length) return;
-        const rules = TLPolicy.tradeRules(s, TLPolicy.tradeConfig(this.pending.trade));
-        const progress = this.controller.tradeData?.(s?.role?.id)?.progress, items = this.tradeSellItems(s);
-        for (const row of rows) {
-          const { tradeKind: kind, tradeIndex: index } = row.dataset;
-          const { rule, reason } = rules[kind][Number(index)];
-          const reasonNode = row.querySelector('.trade-reason');
-          if (reasonNode.textContent !== reason) reasonNode.textContent = reason;
-          if (kind === 'sell') this.paintTradeSell(row, rule, s, items);
-          else this.paintTradeBuy(row, rule, progress);
+        const kind = this.tradeKind, panel = this.root.querySelector('[data-trade-panel="' + kind + '"]');
+        if (!panel) return;
+        this.paintTradeTabs();
+        const view = this.tradeView(kind, s), { rules, index, progress, items } = view;
+        const tabs = panel.querySelectorAll('[data-action="tradeSelect"]');
+        if (!panel.querySelector('.trade-layout') || tabs.length !== rules.length) {
+          if (this.tipAnchor?.closest('.trade-layout')) this.hideTooltip();
+          panel.innerHTML = this.tradeRulesHTML(kind, s, view);
+          delete this.fragmentKeys['.trade-buy-items'];
+          return;
         }
+        this.paintTradeRuleList(tabs, kind, s, view);
+        if (kind === 'buy') this.paintFragment('.trade-buy-items', this.tradeBuyNames(s));
+        if (index < 0) return;
+        const detail = panel.querySelector('.trade-detail'), row = detail.querySelector('.trade-rule');
+        if (Number(row.dataset.tradeIndex) !== index) {
+          if (this.tipAnchor?.closest('.trade-detail')) this.hideTooltip();
+          detail.innerHTML = this.tradeDetailHTML(kind, s, view);
+          detail.setAttribute('aria-labelledby', tabs[index].getAttribute('id'));
+          return;
+        }
+        const { rule, reason } = rules[index], reasonNode = row.querySelector('.trade-reason');
+        if (reasonNode.textContent !== reason) reasonNode.textContent = reason;
+        if (kind === 'sell') this.paintTradeSell(row, rule, s, items);
+        else this.paintTradeBuy(row, rule, progress);
+      }
+      paintTradeTabs() {
+        for (const tab of this.root.querySelectorAll('[data-action="tradeTab"]')) {
+          const kind = tab.dataset.tradeKind, selected = kind === this.tradeKind, label = this.tradeTabLabel(kind);
+          const panel = this.root.querySelector('[data-trade-panel="' + kind + '"]');
+          this.paintTradeTab(tab, selected);
+          if (tab.textContent !== label) tab.textContent = label;
+          if (panel.hidden === selected) panel.hidden = !selected;
+        }
+        const help = this.root.querySelector('[data-section="trade:自动交易"] .section-title .help'), tip = this.tradeHelp();
+        if (help.dataset.tip !== tip) help.setAttribute('data-tip', tip);
+      }
+      paintTradeTab(tab, selected) {
+        if (tab.getAttribute('aria-selected') === String(selected)) return;
+        tab.setAttribute('aria-selected', selected);
+        tab.tabIndex = selected ? 0 : -1;
+        tab.classList.toggle('active', selected);
+      }
+      paintTradeRuleList(tabs, kind, s, { rules, index, progress }) {
+        tabs.forEach((tab, i) => {
+          this.paintTradeTab(tab, i === index);
+          const summary = this.tradeRuleSummary(kind, rules[i], s, progress);
+          if (tab.tradeSummaryHTML === summary) return;
+          if (tab.innerHTML !== summary) tab.innerHTML = summary;
+          tab.tradeSummaryHTML = summary;
+        });
       }
       paintTradeSell(row, rule, s, items) {
         const select = row.querySelector('[data-trade-field="item"]');
         const choices = this.tradeSellChoices(s, rule.item, items), key = JSON.stringify(choices);
-        if (select.getAttribute('data-trade-options') !== key) {
-          select.innerHTML = this.tradeOptions(choices, rule.item);
-          select.value = String(rule.item);
-          select.setAttribute('data-trade-options', key);
+        if (select.tradeChoices !== key) {
+          const options = this.tradeOptions(choices, rule.item);
+          if (select.innerHTML !== options) select.innerHTML = options;
+          if (select.value !== String(rule.item)) select.value = String(rule.item);
+          select.tradeChoices = key;
         }
         this.paintTradeLabel(row, 'count', rule.maxMode ? '每单最大个数' : '每单个数');
+        this.paintTradeMin(row, rule);
         this.paintTradeLabel(row, 'keep', this.tradeKeepLabel());
         const price = row.querySelector('.trade-price');
         if (!price.querySelector('[data-trade-field="' + (rule.priceMode === 'unit' ? 'unitPrice' : 'price') + '"]'))
           price.innerHTML = this.tradeSellPriceHTML(rule);
         const preview = row.querySelector('.trade-preview'), text = this.tradeSellPreview(rule);
         if (preview.textContent !== text) preview.textContent = text;
+      }
+      paintTradeMin(row, rule) {
+        const container = row.querySelector('.trade-min'), input = container.querySelector('input');
+        if (!!input !== rule.maxMode) container.innerHTML = this.tradeMinHTML(rule);
+        else if (input && input.max !== String(rule.count)) input.setAttribute('max', rule.count);
       }
       paintTradeLabel(row, field, text) {
         const input = row.querySelector('[data-trade-field="' + field + '"]');
