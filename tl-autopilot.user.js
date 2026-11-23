@@ -1024,8 +1024,12 @@
       }
       return result.sort((a, b) => b.owned / b.total - a.owned / a.total || b.owned - a.owned || a.id - b.id);
     }
+    function boundFilterMatch(item, bound) {
+      return (bound !== 'bound' && bound !== 'unbound') ||
+        (Number(item.isBound || 0) === 1) === (bound === 'bound');
+    }
     function bagFilterMatch(eq, filter, info) {
-      return (!filter.slot || num(template(eq).slotType) === filter.slot) &&
+      return boundFilterMatch(eq, filter.bound) && (!filter.slot || num(template(eq).slotType) === filter.slot) &&
         (!filter.setId || info.setId === filter.setId) && (!filter.upgrade || !!info.upgrade);
     }
     const MAIN_SOFTCAP = 1.15, ELEMENT_RATE = 2.5;
@@ -2575,7 +2579,7 @@
     function bagTabItems(tabText, character, bound = 'all') {
       const items = tabItems(tabText, character?.bagItems);
       if (bound !== 'bound' && bound !== 'unbound') return items;
-      return items.filter(item => (Number(item.isBound || 0) === 1) === (bound === 'bound'));
+      return items.filter(item => boundFilterMatch(item, bound));
     }
     function warehouseTabItems(tabText, character) {
       return tabItems(tabText, character?.warehouseItems);
@@ -4374,7 +4378,7 @@
       slots,
       lookup,
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
-      SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
+      SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, boundFilterMatch, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
@@ -6517,6 +6521,7 @@
         this.refresh(entry, pet);
       }
     }
+    const BAG_BOUND_SELECT = 'select[aria-label="绑定状态筛选"]';
     class MarketScore {
       static scoreCache = new WeakMap();
       static scorePrefs(prefs, type) {
@@ -6689,6 +6694,9 @@
             childList: true,
             subtree: true,
             characterData: true,
+          });
+          document.addEventListener('change', event => {
+            if (event.target?.matches?.(BAG_BOUND_SELECT) && event.target.closest('.inventory-window')) this.schedule();
           });
           this.schedule();
         };
@@ -6943,6 +6951,7 @@
               equipments: field('equipments'),
               bagItems: field('bagItems'),
               warehouseEquips: field('warehouseEquips'),
+              warehouseItems: field('warehouseItems'),
               equipSets: field('equipSets'),
               gemInfos: field('gemInfos'),
               allEquipTemplates: field('allEquipTemplates'),
@@ -7266,13 +7275,7 @@
         dialog._elements = Array.from(dialog.querySelectorAll('*'), node => [node, node.parentNode]);
       }
       drawBagBar(frame, data, scoring) {
-        const filter = this.bagFilter;
-        let bar = frame.querySelector('.tl-bag-bar');
-        if (!bar) {
-          bar = this.bagNode(frame, 'div', 'tl-bag-bar');
-          bar.setAttribute('role', 'toolbar');
-          bar.setAttribute('aria-label', '装备筛选');
-        }
+        const bar = frame.querySelector('.tl-bag-bar') || this.bagNode(frame, 'div', 'tl-bag-bar');
         // The game stage clips what leaves it. With little room at the left the strip moves over the window border
         // (the grid starts 18 px inside); with none it goes to the right side.
         const room = frame.getBoundingClientRect().left - (frame.closest?.('.web-game-stage')?.getBoundingClientRect?.().left ?? 0);
@@ -7281,37 +7284,56 @@
         const margin = shift ? 4 - shift + 'px' : '';
         if (bar.style.marginRight !== margin) bar.style.marginRight = margin;
         bar._listInside = !side && room < 290 ? shift : null;
-        const slots = P.SLOT_NAMES.length;
-        if (bar.children.length !== slots + 2 + Number(scoring) || bar._scoring !== scoring) {
+        this.drawBagButtons(bar, frame, !!data, scoring);
+        if (this.openBagFrame !== frame) return;
+        if (!data) return this.closeSetList();
+        const dialog = this.drawSetList(frame, data, side) || frame.querySelector('.tl-bag-sets');
+        // Without room for the list outside, it opens over the window, right of the strip.
+        if (!dialog?.style) return;
+        const inside = bar._listInside, left = inside == null ? '' : inside + 'px', right = inside == null ? '' : 'auto';
+        if (dialog.style.left !== left) dialog.style.left = left;
+        if (dialog.style.right !== right) dialog.style.right = right;
+      }
+      drawBagButtons(bar, frame, equipment, scoring) {
+        const filter = this.bagFilter, slots = P.SLOT_NAMES.length;
+        const mode = !equipment ? 'bound' : scoring ? 'score' : 'equipment';
+        const count = equipment ? slots + 4 + Number(scoring) : 2;
+        if (bar._mode !== mode || bar.children.length !== count) {
           bar.textContent = '';
-          bar._scoring = scoring;
-          for (let slot = 0; slot < slots; slot++)
-            this.bagButton(bar, 'tl-bag-slot', P.SLOT_SHORT[slot] || '全', slot ? '部位：' + P.SLOT_NAMES[slot] : '全部部位', () => {
-              filter.slot = filter.slot === slot ? 0 : slot;
+          bar._mode = mode;
+          bar.setAttribute('role', 'toolbar');
+          bar.setAttribute('aria-label', equipment ? '装备筛选' : '绑定筛选');
+          if (equipment) this.drawBagEquipmentButtons(bar, frame, scoring);
+          for (const [value, text, title] of [['unbound', '未', '只看未绑定'], ['bound', '绑', '只看已绑定']]) {
+            this.bagButton(bar, 'tl-bag-bound', text, title, () => {
+              filter.bound = filter.bound === value ? '' : value;
               this.scan();
             });
-          this.bagNode(bar, 'div', 'tl-bag-separator');
-          this.bagButton(bar, 'tl-bag-toggle', '套', '套装收集', () => this.toggleSetList(frame));
-          if (scoring) this.bagButton(bar, 'tl-bag-upgrade', '▲', '只看可提升', () => {
-            filter.upgrade = !filter.upgrade;
-            this.scan();
-          });
-        }
-        Array.from(bar.children).forEach((button, i) => {
-          if (i === slots) return;
-          const pressed = String(i < slots ? filter.slot === i : i === slots + 1 ? !!filter.setId : filter.upgrade);
-          if (button.getAttribute('aria-pressed') !== pressed) button.setAttribute('aria-pressed', pressed);
-        });
-        if (this.openBagFrame === frame) {
-          const dialog = this.drawSetList(frame, data, side) || frame.querySelector('.tl-bag-sets');
-          // Without room for the list outside, it opens over the window, right of the strip.
-          const inside = bar._listInside;
-          if (dialog?.style) {
-            const left = inside == null ? '' : inside + 'px', right = inside == null ? '' : 'auto';
-            if (dialog.style.left !== left) dialog.style.left = left;
-            if (dialog.style.right !== right) dialog.style.right = right;
           }
         }
+        const states = equipment ? P.SLOT_NAMES.map((_, slot) => filter.slot === slot).concat(null, !!filter.setId) : [];
+        if (equipment && scoring) states.push(filter.upgrade);
+        states.push(filter.bound === 'unbound', filter.bound === 'bound');
+        Array.from(bar.children).forEach((button, i) => {
+          if (states[i] === null) return;
+          const pressed = String(states[i]);
+          if (button.getAttribute('aria-pressed') !== pressed) button.setAttribute('aria-pressed', pressed);
+        });
+      }
+      drawBagEquipmentButtons(bar, frame, scoring) {
+        const filter = this.bagFilter;
+        P.SLOT_NAMES.forEach((name, slot) => {
+          this.bagButton(bar, 'tl-bag-slot', P.SLOT_SHORT[slot] || '全', slot ? '部位：' + name : '全部部位', () => {
+            filter.slot = filter.slot === slot ? 0 : slot;
+            this.scan();
+          });
+        });
+        this.bagNode(bar, 'div', 'tl-bag-separator');
+        this.bagButton(bar, 'tl-bag-toggle', '套', '套装收集', () => this.toggleSetList(frame));
+        if (scoring) this.bagButton(bar, 'tl-bag-upgrade', '▲', '只看可提升', () => {
+          filter.upgrade = !filter.upgrade;
+          this.scan();
+        });
       }
       clearClosedBags(grids) {
         for (const [grid, frame] of this.bagFrames) {
@@ -7339,18 +7361,24 @@
         }
         return tab ? tab.textContent.trim() : null;
       }
-      // Inventory equip tab: slot i renders the i-th unequipped equipment in store order.
-      bagList(grid, state, frame) {
-        if (!state) return null;
+      // The inventory grid renders unequipped equipment in filtered store order.
+      bagList(grid, state, frame, tab = this.bagTab(grid, frame)) {
+        if (!state || tab !== '装备') return null;
         const slots = Array.from(grid.children).filter((n) => n.classList?.contains('grid-slot'));
         if (!slots.length) return null;
-        if (this.bagTab(grid, frame) !== '装备') return null;
         const warehouse = grid.classList.contains('warehouse-grid'),
+          bound = warehouse ? 'all' : grid.closest?.('.inventory-window')?.querySelector(BAG_BOUND_SELECT)?.value,
           items = P.array(warehouse ? state.warehouseEquips : state.equipments)
-            .filter((e) => e.equipTmpl && (warehouse || !e.isEquipped));
+            .filter((e) => e.equipTmpl && (warehouse || (!e.isEquipped && P.boundFilterMatch(e, bound))));
         const filled = slots.filter((n) => !n.classList.contains('empty-slot')).length;
         if (filled !== Math.min(items.length, slots.length)) return null;
         return { slots, items };
+      }
+      warehouseStackList(slots, state, tab) {
+        const items = P.warehouseTabItems(tab, state);
+        // Stack cells can have the empty-slot class while holding an icon.
+        const filled = slots.filter(slot => slot.querySelector('.v-img')).length;
+        return filled === Math.min(P.WAREHOUSE_CAPACITY, items.length) ? items.slice(0, P.WAREHOUSE_CAPACITY) : null;
       }
       bagLabel(eq, state, prefs, view) {
         view ||= MarketScore.prepare(this, state, prefs);
@@ -7390,64 +7418,74 @@
         };
       }
       scanBag(grids, state, prefs, getCollection = () => this.inventoryCollection(state)) {
-        const { bagFilter, setTag, bagScore } = prefs.market, scoring = bagScore !== false;
-        const filter = this.bagFilter ||= { slot: 0, setId: 0, upgrade: false };
+        const scoring = prefs.market.bagScore !== false;
+        const filter = this.bagFilter ||= { slot: 0, setId: 0, upgrade: false, bound: '' };
         if (!scoring) filter.upgrade = false;
         const view = state && scoring ? MarketScore.prepare(this, state, prefs) : null;
-        for (const grid of grids) {
-          const frame = grid.closest?.('.game-window-shell__frame');
-          // The frame clips its children (overflow: hidden); the strip and the list hang outside it, on the shell.
-          const host = frame?.closest?.('.game-window-shell') || frame;
-          const list = this.bagList(grid, state, frame),
-            slots = list?.slots || Array.from(grid.querySelectorAll('.grid-slot'));
-          const equipmentTab = list || (bagFilter && frame?.querySelector('.game-tab-button.is-active')?.textContent.trim() === '装备');
-          const data = state && equipmentTab && (bagFilter || setTag) ? getCollection() : null;
-          if (frame && (bagFilter || setTag)) {
-            (this.bagFrames ||= new Map()).set(grid, host);
-            if (!grid._tlBagObserver && typeof MutationObserver !== 'undefined') {
-              grid._tlBagObserver = new MutationObserver(() => this.schedule());
-              grid._tlBagObserver.observe(frame.closest('.inventory-window, .warehouse-window') || frame,
-                { subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
-            }
-          } else if (this.bagFrames?.delete(grid)) {
-            grid._tlBagObserver?.disconnect();
-            grid._tlBagObserver = null;
-          }
-          if (bagFilter && host && data) this.drawBagBar(host, data, scoring);
-          else this.clearBagFrame(host);
-          slots.forEach((slot, i) => {
-            const old = slot.querySelector(':scope > .tl-bag-score'),
-              eq = list && !slot.classList.contains('empty-slot') ? list.items[i] : null,
-              want = eq && scoring ? this.bagLabel(eq, state, prefs, view) : null;
-            const set = eq && data && P.setOfTemplate(data.state, P.equipmentTemplateId(eq));
-            let tag = slot.querySelector(':scope > .tl-bag-set');
-            if (setTag && set) {
-              if (!tag) tag = this.bagNode(slot, 'span', 'tl-bag-set');
-              const entry = data.byId.get(set.id), cls = 'tl-bag-set' + (entry && entry.owned === entry.total ? ' tl-bag-complete' : '');
-              if (tag.className !== cls) tag.className = cls;
-              const letter = Array.from(set.name)[0];
-              if (tag.textContent !== letter) tag.textContent = letter;
-            } else tag?.remove();
-            const dim = bagFilter && eq && !P.bagFilterMatch(eq, filter, { setId: set?.id, upgrade: want?.text.startsWith('▲') });
-            if (dim && slot.style.opacity !== '0.22') slot.style.opacity = '0.22';
-            else if (!dim && slot.style.opacity === '0.22') slot.style.opacity = '';
-            if (!want) {
-              old?.remove();
-              return;
-            }
-            const el = old || document.createElement('span');
-            if (!old) {
-              el.className = 'tl-bag-score';
-              el.style.cssText =
-                'position:absolute;left:1px;bottom:0;font-size:9px;line-height:1;font-weight:700;text-shadow:1px 1px 1px #000,-1px -1px 1px #000;pointer-events:none;z-index:1;white-space:nowrap;';
-              slot.appendChild(el);
-            }
-            if (el.textContent !== want.text) el.textContent = want.text;
-            if (el.dataset.color !== want.color) {
-              el.dataset.color = want.color;
-              el.style.color = want.color;
-            }
-          });
+        for (const grid of grids) this.scanBagGrid(grid, state, prefs, view, getCollection);
+      }
+      watchBagGrid(grid, frame, host) {
+        if (!frame) {
+          if (!this.bagFrames?.delete(grid)) return;
+          grid._tlBagObserver?.disconnect();
+          grid._tlBagObserver = null;
+          return;
+        }
+        (this.bagFrames ||= new Map()).set(grid, host);
+        if (grid._tlBagObserver || typeof MutationObserver === 'undefined') return;
+        grid._tlBagObserver = new MutationObserver(() => this.schedule());
+        grid._tlBagObserver.observe(frame.closest('.inventory-window, .warehouse-window') || frame,
+          { subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+      }
+      scanBagGrid(grid, state, prefs, view, getCollection) {
+        const { bagFilter, setTag } = prefs.market, filter = this.bagFilter;
+        const frame = grid.closest?.('.game-window-shell__frame'), tab = this.bagTab(grid, frame);
+        // The frame clips its children (overflow: hidden); the strip and the list hang outside it, on the shell.
+        const host = frame?.closest?.('.game-window-shell') || frame;
+        const stackTab = grid.classList.contains('warehouse-grid') && (tab === '道具' || tab === '材料');
+        const list = this.bagList(grid, state, frame, tab);
+        const slots = list?.slots || Array.from(grid.children).filter(node => node.classList?.contains('grid-slot'));
+        const data = state && ((bagFilter && host && tab === '装备') || (setTag && list)) ? getCollection() : null;
+        const stacks = stackTab && bagFilter && state && filter.bound ? this.warehouseStackList(slots, state, tab) : null;
+        this.watchBagGrid(grid, bagFilter || setTag ? frame : null, host);
+        if (bagFilter && host && (data || stackTab)) this.drawBagBar(host, data, prefs.market.bagScore !== false);
+        else this.clearBagFrame(host);
+        const context = { state, prefs, view, data };
+        slots.forEach((slot, index) => {
+          const eq = list && !slot.classList.contains('empty-slot') ? list.items[index] : null;
+          const stack = stacks?.[index] && slot.querySelector('.v-img') ? stacks[index] : null;
+          this.drawBagCell(slot, eq, stack, context);
+        });
+      }
+      drawBagCell(slot, eq, stack, { state, prefs, view, data }) {
+        const filter = this.bagFilter, { bagFilter, setTag } = prefs.market;
+        const old = slot.querySelector(':scope > .tl-bag-score'),
+          want = eq && view ? this.bagLabel(eq, state, prefs, view) : null;
+        const set = eq && data && P.setOfTemplate(data.state, P.equipmentTemplateId(eq));
+        let tag = slot.querySelector(':scope > .tl-bag-set');
+        if (setTag && set) {
+          if (!tag) tag = this.bagNode(slot, 'span', 'tl-bag-set');
+          const entry = data.byId.get(set.id), cls = 'tl-bag-set' + (entry && entry.owned === entry.total ? ' tl-bag-complete' : '');
+          if (tag.className !== cls) tag.className = cls;
+          const letter = Array.from(set.name)[0];
+          if (tag.textContent !== letter) tag.textContent = letter;
+        } else tag?.remove();
+        const match = eq ? P.bagFilterMatch(eq, filter, { setId: set?.id, upgrade: want?.text.startsWith('▲') }) :
+          !stack || P.boundFilterMatch(stack, filter.bound);
+        if (bagFilter && !match && slot.style.opacity !== '0.22') slot.style.opacity = '0.22';
+        else if ((!bagFilter || match) && slot.style.opacity === '0.22') slot.style.opacity = '';
+        if (!want) return old?.remove();
+        const el = old || document.createElement('span');
+        if (!old) {
+          el.className = 'tl-bag-score';
+          el.style.cssText =
+            'position:absolute;left:1px;bottom:0;font-size:9px;line-height:1;font-weight:700;text-shadow:1px 1px 1px #000,-1px -1px 1px #000;pointer-events:none;z-index:1;white-space:nowrap;';
+          slot.appendChild(el);
+        }
+        if (el.textContent !== want.text) el.textContent = want.text;
+        if (el.dataset.color !== want.color) {
+          el.dataset.color = want.color;
+          el.style.color = want.color;
         }
       }
       scanMarket(rows, state, prefs) {
@@ -9635,7 +9673,7 @@
         const filled = (node) => !!node.querySelector('.v-img, img');
         if (!win || !grid?.matches('.inventory-grid') || !filled(cell)) return null;
         const tab = win.querySelector('.game-tab-button.is-active')?.textContent.trim();
-        const bound = win.querySelector('select[aria-label="绑定状态筛选"]')?.value || 'all';
+        const bound = win.querySelector(BAG_BOUND_SELECT)?.value || 'all';
         const cells = Array.from(grid.children).filter(node => node.matches('.grid-slot'));
         const character = this.bridge.character(), count = P.bagTabItems(tab, character, bound).length;
         const shown = cells.filter(filled).length, index = cells.indexOf(cell);
@@ -11743,7 +11781,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           html = g('显示',
             f('背包和仓库图标显示评分', 'market.bagScore') +
             f('背包仓库评分类型', 'market.bagScoreType', { dependsOn: 'market.bagScore', choices: [['combat', '实战评分'], ['power', '游戏内战力']] }) +
-            f('背包和仓库显示部位筛选条', 'market.bagFilter', { help: '筛选条在背包和仓库窗口左侧，只调暗不匹配的装备，不会移动或隐藏；角标是套装名的第一个字，集齐为金色；套装列表里绿点是已穿戴，金点是在背包或仓库，空心是还缺。' }) +
+            f('背包和仓库显示部位筛选条', 'market.bagFilter', { help: '筛选条在背包和仓库窗口旁。「未」只看未绑定，「绑」只看已绑定，再点一次取消。仓库的道具和材料页也能用这两个按钮。筛选只调暗不匹配的格子，不会移动或隐藏。角标是套装名的第一个字，集齐为金色。套装列表里绿点是已穿戴，金点是在背包或仓库，空心是还缺。' }) +
             f('套装装备显示角标', 'market.setTag'), true) +
           g('存取',
             f('打开仓库时，背包“整理”顺便存入仓库已有的物品', 'convenience.sortDeposit', { help: '只存道具和材料里仓库已经有的种类，整组存入；绑定和未绑定算不同种类；回复气血和内力的药品不存' }) +
