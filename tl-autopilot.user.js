@@ -703,12 +703,34 @@
       if (collection instanceof Map) return collection.get(num(id)) || collection.get(id);
       return array(collection).find((v) => num(v.id) === num(id));
     }
+    const YANHOU_IDS = new Set([10401002, 10403002, 10404002, 10405001, 10410001, 10420004, 10422013, 10423021]);
+    const isYanhou = (eq) => !!eq && YANHOU_IDS.has(equipmentTemplateId(eq));
+    // 燕弦血玉 (client of 2026-11-23): each level adds 10% to one affix of a Yanhou item, up to 3 levels.
+    function bloodJadeLevel(eq, key) {
+      if (!isYanhou(eq)) return 0;
+      const level = parse(eq.bloodJade, null)?.[key];
+      return Number.isInteger(level) && level >= 1 && level <= 3 ? level : 0;
+    }
+    // Three different Yanhou items with all five affixes at level 3 multiply these attacks by 1.1.
+    const BLOOD_JADE_SET = ['extAtk', 'intAtk', 'iceAtk', 'fireAtk', 'holyAtk', 'poisonAtk'];
+    function bloodJadeFull(eq) {
+      const extra = isYanhou(eq) ? parse(eq.extraStats, null) : null;
+      if (!extra || typeof extra !== 'object' || Array.isArray(extra)) return false;
+      const entries = Object.entries(extra);
+      return entries.length === 5 && entries.every(([k, v]) => typeof v === 'number' && v > 0 && bloodJadeLevel(eq, k) === 3);
+    }
+    // The attack multiplier of a worn set: 1.1 with the bonus, 1 without.
+    function bloodJadeSet(items) {
+      return new Set(array(items).filter(bloodJadeFull).map(equipmentTemplateId)).size >= 3 ? 1.1 : 1;
+    }
     function equipmentStats(eq, gemInfos) {
       const t = template(eq),
         base = stats(t.baseStats),
         out = {};
-      addStats(out, base, 1 + (ENHANCE[integer(eq?.enhanceLevel)] || 0) / 100);
-      addStats(out, stats(eq?.extraStats || t.extraStats));
+      // 装备刻铭 (client of 2026-11-23) adds 10% to the enhance percentage of the base stats.
+      addStats(out, base, 1 + (ENHANCE[integer(eq?.enhanceLevel)] || 0) / 100 + (eq?.inscribed ? 0.1 : 0));
+      for (const [k, n] of Object.entries(parse(eq?.extraStats || t.extraStats, {}) || {}))
+        if (Number.isFinite(Number(n))) addStats(out, { [camel(k)]: num(n) }, 1 + bloodJadeLevel(eq, k) / 10);
       const qual = stats(eq?.appraisalStats);
       if (eq?.isAppraisal && [1, 12].includes(num(t.slotType)) && num(t.reqLevel) >= 50) {
         out.extAtk = (out.extAtk || 0) + ((base.extAtk || 0) * (qual.extScore || 0)) / 10000;
@@ -749,7 +771,7 @@
       const t = template(eq);
       return [eq?.id, eq?.tmplId, t.id, t.slotType, t.reqLevel, t.baseStats, t.extraStats,
         eq?.enhanceLevel, eq?.gemSlots, eq?.isAppraisal, eq?.appraisalStats, eq?.extraStats,
-        eq?.quality, t.qualityBase, slots(eq).filter((id) => id > 0).map((id) => {
+        eq?.quality, t.qualityBase, !!eq?.inscribed, eq?.bloodJade, slots(eq).filter((id) => id > 0).map((id) => {
           const gem = lookup(state.gemInfos, id);
           return [id, gem?.id, gem?.subType, gem?.value];
         })];
@@ -853,15 +875,18 @@
         return ctx.worn;
       }
       ctx.worn = { key, items, stats: sumEquipment(items, state),
-        sets: setEffects(items, state), slots: new Map() };
+        sets: setEffects(items, state), jade: bloodJadeSet(items), slots: new Map() };
       return ctx.worn;
     }
     function equipmentValues(items, state, ctx) {
       const old = wornBaseline(state, ctx), next = sumEquipment(items, state);
-      const sets = setEffects(items, state), values = { ...ctx.me };
-      for (const k of Object.keys(WEIGHTS))
-        values[k] = Math.max(0, values[k] + (num(next[k]) - num(old.stats[k])) *
-          (ctx.statMult[k] ?? 1) + num(sets[k]) - num(old.sets[k]));
+      const sets = setEffects(items, state), jade = bloodJadeSet(items), values = { ...ctx.me };
+      for (const k of Object.keys(WEIGHTS)) {
+        // The blood jade set bonus scales the attack sum with the equipment in it; 1 keeps the old arithmetic exact.
+        const [now, was] = BLOOD_JADE_SET.includes(k) ? [jade, old.jade] : [1, 1];
+        values[k] = Math.max(0, values[k] * now / was + (num(next[k]) - num(old.stats[k])) *
+          (ctx.statMult[k] ?? 1) * now + num(sets[k]) * now - num(old.sets[k]) * now);
+      }
       values.weaponId = weaponId(items);
       return values;
     }
@@ -1196,7 +1221,6 @@
     const SCORE_ATTRIBUTES = Object.entries({ hp: '气血', extAtk: '外攻', intAtk: '内攻', extDef: '外防', intDef: '内防', critRate: '会心', critDef: '会防', avoidance: '闪避', precision: '命中', iceAtk: '冰攻', fireAtk: '火攻', poisonAtk: '毒攻', holyAtk: '玄攻', iceDef: '冰抗', fireDef: '火抗', poisonDef: '毒抗', holyDef: '玄抗' });
     const SET_EFFECT_NAMES = new Map([...SCORE_ATTRIBUTES, ['allAtk', '全属性攻击'], ['allDef', '全属性抗性']]);
     const PET_LEVEL_HELP = '珍兽窗口“喂到上限”右边多一个按钮：一级一级喂，直到 30 级（不超过人物等级），消耗人物经验。点一次后再点“确认”才开始，进行中可点“停止”。';
-    const YANHOU_IDS = new Set([10401002, 10403002, 10404002, 10405001, 10410001, 10420004, 10422013, 10423021]);
     const YANHOU_AFFIXES = {
       hp: [750, 1500], mp: [500, 850], extAtk: [110, 220], intAtk: [110, 220], extDef: [90, 180], intDef: [90, 180],
       precision: [110, 220], avoidance: [110, 220], critRate: [4, 8], critDef: [4, 8],
@@ -1222,13 +1246,15 @@
       });
     }
     function pieceAdvice(item, tmpl, pool, percent) {
-      const extra = stats(item.extraStats);
+      const extra = stats(item.extraStats), keys = Object.keys(parse(item.extraStats, {}) || {});
       const affixes = Object.entries(extra).map(([key, value]) => {
+        // A reroll also clears the blood jade on this affix.
+        const worth = value * (1 + bloodJadeLevel(item, keys.find(k => camel(k) === key)) / 10);
         const candidates = pool.filter(row => row.key === key || !Object.hasOwn(extra, row.key));
-        const change = row => row.key === key ? { [key]: row.typical - value } : { [key]: -value, [row.key]: row.typical };
+        const change = row => row.key === key ? { [key]: row.typical - worth } : { [key]: -worth, [row.key]: row.typical };
         const reroll = Object.hasOwn(YANHOU_AFFIXES, key)
           ? candidates.reduce((sum, row) => sum + percent(change(row)), 0) / candidates.length : null;
-        return { key, name: affixNames.get(key) || key, value, contribution: -percent({ [key]: -value }), reroll };
+        return { key, name: affixNames.get(key) || key, value, contribution: -percent({ [key]: -worth }), reroll };
       });
       const best = affixes.reduce((best, row) => row.reroll > (best?.reroll ?? 0) ? row : best, null);
       return { id: item.id, name: tmpl.name, affixes, suggest: best?.key ?? null };
@@ -3882,6 +3908,8 @@
           e.extraStats,
           e.isAppraisal,
           e.appraisalStats,
+          !!e.inscribed,
+          e.bloodJade,
         ]),
         bag: array(s.bagItems).map((b) => [
           b.id,
@@ -4064,7 +4092,7 @@
       CRIT_CHANCE_CAP, CRIT_MULT_CAP, critChance,
       MAIN_SOFTCAP, ELEMENT_RATE, hitDamage, setEffects, combatContext, combatParts, combatValue, combatWeights, gearWeights, statScore,
       hiddenClaimElement,
-      equipmentStats,
+      equipmentStats, bloodJadeLevel, bloodJadeSet,
       scoreStats,
       equipmentScore, equipmentValues, characterScore, SCORE_UNIT, CRIT_CHANCE_OFFSET, scoringDetail, SCORE_ATTRIBUTES,
       artifactUptime, artifactEffects, artifactAdvice, gearAdvice, PET_LEVEL_HELP,
@@ -5974,7 +6002,7 @@
         const t = raw(eq.equipTmpl || eq.tmpl || eq);
         return JSON.stringify([eq.id, eq.tmplId, eq.itemId, eq.enhanceLevel, raw(eq.gemSlots),
           eq.isAppraisal, raw(eq.appraisalStats), raw(eq.extraStats), eq.quality,
-          t.id, t.slotType, t.reqLevel, raw(t.baseStats), raw(t.extraStats), t.qualityBase]);
+          t.id, t.slotType, t.reqLevel, raw(t.baseStats), raw(t.extraStats), t.qualityBase, !!eq.inscribed, raw(eq.bloodJade)]);
       }
       static prepare(owner, state, prefs, mode = prefs.market.sort) {
         // The listing cache tracks display preferences separately from policy scoring.
