@@ -11710,8 +11710,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           g('逛商会',
             f('逛商会显示装备评分', 'market.showScore') +
             f('逛商会评分类型', 'market.scoreType', { dependsOn: 'market.showScore', choices: [['combat', '实战评分'], ['power', '游戏内战力']] }) +
-            f('逛商会本页按脚本排序', 'market.sort', { immediate: true, help: '商会每页 24 条，由服务器排序和翻页，脚本只排当前这一页：装备在前，其余按游戏顺序。商会窗口排序框右边的“脚本排序”是同一个设置', choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
-            f('逛商会隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '本页不显示自己上架的和指定卖给他人的商品，所以这一页可能少于 24 条。商会窗口里“适合我的等级”左边的“隐藏无法购买”是同一个开关' })) +
+            f('逛商会按脚本排序', 'market.sort', { immediate: true, help: '脚本读取全部页（最多 30 页，每分钟刷新）后整体排序再按页显示：装备在前，其余按游戏顺序。超过 30 页或读取失败时只排当前这一页。商会窗口排序框右边的“脚本排序”是同一个设置', choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
+            f('逛商会隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '所有页都不显示自己上架的和指定卖给他人的商品，页数按剩下的重新计算。商会窗口里“适合我的等级”左边的“隐藏无法购买”是同一个开关' })) +
           g('工坊',
             f('显示“一键放入”按钮', 'fill.enabled', { help: '在游戏窗口显示' }) +
             f('完成后补回同种符和材料', 'fill.refill', { dependsOn: 'fill.enabled' }), false, { help: HELP.fill }) +
