@@ -458,7 +458,7 @@
         price: tradeInt(rule.price, 1, TRADE_MAX_PRICE),
         unitPrice: unit <= 0 ? 1 : Math.max(0.01, Number(unit.toFixed(2))),
         targetId: tradePositiveId(rule.targetId) ? String(rule.targetId).trim().replace(/^0+/, '') : '',
-        keep: tradeInt(rule.keep, 0), maxListings: tradeInt(rule.maxListings, 1, 10) };
+        keep: tradeInt(rule.keep, 0) };
     }
     function tradeRuleList(value, kind) {
       const rules = array(value).slice(0, 10), seen = new Set();
@@ -3034,18 +3034,11 @@
         if (over(item, tradeWithdrawLot(rule, item, bag.get(item.id)).q)) return tradePriceError;
       return '';
     }
-    function tradeSellFull(rule, item, listings) {
-      // A missing target cannot verify spare capacity. An explicit null is a public listing.
-      return listings.filter(row => (row.state == null || row.state === 'OPEN') &&
-        row.assets?.length === 1 && row.assets[0]?.kind === 'BAG' && tradeAsset(row.assets[0]).id === item.id &&
-        (rule.priceMode === 'lot' || num(row.quantity) > 0) &&
-        num(row.price) === tradeLotPrice(rule, num(row.quantity)) && num(row.currency) === rule.currency &&
-        (row.target_id === undefined || String(row.target_id ?? '') === rule.targetId)).length >= rule.maxListings;
-    }
-    function tradeSellPlan(rule, item, listings, stored) {
+    // There is no cap on open listings: every lot the bag can form is listed.
+    function tradeSellPlan(rule, item, stored) {
       if (!tradeSellMatches(rule, item)) return null;
       const count = tradeLotCount(rule, item, stored), price = tradeLotPrice(rule, count);
-      if (!count || price > TRADE_MAX_PRICE || tradeSellFull(rule, item, listings)) return null;
+      if (!count || price > TRADE_MAX_PRICE) return null;
       const { currency, targetId } = rule;
       const label = '上架「' + (item.name || item.id) + '」×' + count + '（' + price + ' ' + tradeCurrency(currency) +
         '，单价 ' + tradeUnitText(price, count) + '）' + (targetId ? '，指定 ' + targetId : '');
@@ -3059,9 +3052,9 @@
       if (!s.trade?.mine || !s.trade.inventory) return [];
       const active = tradeActiveSells(s, prefs);
       if (!active.length) return [];
-      const items = [...tradeInventoryStacks(s.trade.inventory).values()], listings = tradeSales(s.trade.mine);
+      const items = [...tradeInventoryStacks(s.trade.inventory).values()];
       const warehouse = prefs.fromWarehouse ? tradeStacks(s.warehouseItems) : null;
-      return active.flatMap(rule => items.map(item => tradeSellPlan(rule, item, listings, warehouse?.get(item.id))).filter(Boolean));
+      return active.flatMap(rule => items.map(item => tradeSellPlan(rule, item, warehouse?.get(item.id))).filter(Boolean));
     }
     function tradeWithdrawLot(rule, item, bag) {
       const largest = num(bag?.largest.count);
@@ -3070,10 +3063,10 @@
         : largest < rule.count && largest + count >= rule.count ? rule.count : 0;
       return { count, q };
     }
-    function tradeWithdrawItem(rule, item, bag, listings) {
+    function tradeWithdrawItem(rule, item, bag) {
       if (!tradeSellMatches(rule, item)) return null;
       const { count, q } = tradeWithdrawLot(rule, item, bag);
-      if (!count || !q || tradeLotPrice(rule, q) > TRADE_MAX_PRICE || tradeSellFull(rule, item, listings)) return null;
+      if (!count || !q || tradeLotPrice(rule, q) > TRADE_MAX_PRICE) return null;
       const a = action('WAREHOUSE_WITHDRAW', { warehouseItemId: item.largest.id, count },
         '取出仓库「' + (item.name || item.id) + '」×' + count + '准备上架', 'warehouse', { inBattle: true, warehouseMove: true });
       a.key = 'WAREHOUSE_WITHDRAW:trade:' + item.id;
@@ -3084,10 +3077,9 @@
       const active = tradeActiveSells(s, prefs);
       if (!active.length) return null;
       const warehouse = tradeStacks(s.warehouseItems), bag = tradeStacks(s.bagItems);
-      const listings = tradeSales(s.trade?.mine);
       for (const rule of active) {
         for (const item of warehouse.values()) {
-          const a = tradeWithdrawItem(rule, item, bag.get(item.id), listings);
+          const a = tradeWithdrawItem(rule, item, bag.get(item.id));
           if (a && !(s.warehouseSuppressed?.get(a.key) > now)) return a;
         }
       }
@@ -12255,7 +12247,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           '<div class="trade-price">' + this.tradeSellPriceHTML(rule) + '</div>' +
           '<div class="trade-preview">' + this.tradeSellPreview(rule) + '</div>' +
           field('指定角色ID', 'targetId', { text: true, placeholder: '可空；大类必填' }) +
-          field(this.tradeKeepLabel(), 'keep', { min: 0 }) + field('同时在售', 'maxListings', { min: 1, max: 10 });
+          field(this.tradeKeepLabel(), 'keep', { min: 0 });
       }
       tradeBuyHTML(rule) {
         const field = (label, key, opts) => this.tradeField(label, key, rule[key], opts);
