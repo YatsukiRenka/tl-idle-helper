@@ -172,8 +172,7 @@
         fieldCheck: true, fieldMinutes: 20, fieldDropPercent: 5,
       },
       market: { sort: 'off', showScore: true, bagScore: true, tipScore: true, tipBound: true,
-        bagFilter: true, setTag: true, tipSet: true, scoreType: 'combat', bagScoreType: 'combat', hideUnbuyable: false,
-        consignHighlight: true },
+        bagFilter: true, setTag: true, tipSet: true, scoreType: 'combat', bagScoreType: 'combat', hideUnbuyable: false },
       convenience: { sortDeposit: true, ctrlDeposit: true, depositKeys: 'ctrl', sellWarehouse: false, sellKeys: 'alt', petLevelButton: true },
       sell: {
         enabled: true,
@@ -979,8 +978,6 @@
       return (!filter.slot || num(template(eq).slotType) === filter.slot) &&
         (!filter.setId || info.setId === filter.setId) && (!filter.upgrade || !!info.upgrade);
     }
-    // The consignment window refuses bound items and worn equipment.
-    const consignable = (item) => !!item && ![1, '1', true, 'true'].includes(item.isBound) && !item.isEquipped;
     const MAIN_SOFTCAP = 1.15, ELEMENT_RATE = 2.5;
     function hitDamage(a, d, la, ld, mult = EMPTY_MULT, result = {}) {
       let main = 0, elem = 0;
@@ -1039,8 +1036,9 @@
       return { defenseMult, stun };
     }
     // The summoned pet's 借力, 凝神 and 强身 add to its owner for 60 s every 60 s, so all the time; finalAttributes
-    // leaves them out. Formula of the client's pet window, matched against live buffs on 2026-11-20.
-    const PET_OWNER_BUFFS = { 借力: ['extAtk', 0.15], 凝神: ['intAtk', 0.15], 强身: ['hp', 0.1] };
+    // leaves them out. Formula of the client's pet window, matched against live buffs on 2026-11-20; the client of
+    // 2026-11-23 lowers 借力 and 凝神 to 8%, matched against live buffs the same day.
+    const PET_OWNER_BUFFS = { 借力: ['extAtk', 0.08], 凝神: ['intAtk', 0.08], 强身: ['hp', 0.1] };
     function petOwnerBuffs(state) {
       const pets = state?.pets, entry = array(pets?.pets).find((e) => e?.pet?.id != null && e.pet.id === pets.activePetId);
       const out = {};
@@ -2255,11 +2253,11 @@
       const entry = collectionValues(entries).find((v) => num(v.role.id) === num(props.roleOverride?.id));
       return viewedState({ ...entry, ...props }, own);
     }
-    // The game's rule for its buy button: not the role's own listing, and no buyer named other than the role.
+    // A 商会 listing (client of 2026-11-23) the role can buy: not its own, and no buyer named other than the role.
     function listingBuyable(item, role) {
       if (!item || !role) return true;
-      if (num(item.sellerRoleId) === num(role.id)) return false;
-      return !item.targetNickname || item.targetNickname === role.nickname;
+      if (num(item.owner_id) === num(role.id)) return false;
+      return item.target_id == null || item.target_id === '' || num(item.target_id) === num(role.id);
     }
     // Since the client of 2026-11-19 the server answers GET_PLAYER_INFO without skills: a cached answer without them.
     function viewedSkillsMissing(props, entries) {
@@ -4083,7 +4081,7 @@
       slots,
       lookup,
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
-      SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, consignable, equipmentTemplateId, setIndex,
+      SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileState, profileScoreText, profileScoreValue, tooltipContext,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
@@ -4956,7 +4954,7 @@
         this.authFailed = false;
         this.manualUntil = 0;
         this.packetTypes = [];
-        this.cache = { potions: [], activityStatus: {}, forgePreviews: {}, consignment: new Map(), consignmentVersion: 0, viewedPlayers: new Map() };
+        this.cache = { potions: [], activityStatus: {}, forgePreviews: {}, market: new Map(), marketVersion: 0, viewedPlayers: new Map() };
         const potions = readStorage(PREFIX + ':potions', null);
         if (Number.isFinite(potions?.at) && Array.isArray(potions.list) && potions.list.every((p) => p && typeof p === 'object' && !Array.isArray(p)))
           this.cache.potions = potions.list;
@@ -5166,14 +5164,6 @@
               if (this.welfareRequests.size > 100)
                 this.welfareRequests.delete(this.welfareRequests.keys().next().value);
             }
-            if (
-              packet.type === 'CONSIGNMENT_LIST' &&
-              P.num(packet.payload?.page) === 1 &&
-              !packet.payload?.myList && this.cache.consignment.size
-            ) {
-              this.cache.consignment.clear();
-              this.cache.consignmentVersion = P.num(this.cache.consignmentVersion) + 1;
-            }
             if (!this.sending && this.waiter && !this.waiter.petHatch && packet.type === this.waiter.type && !['ARENA_COMMAND', 'PET_COMMAND', 'RINGS_COMMAND', 'XIAOXIAO_COMMAND', 'WELFARE_LOTTERY_COMMAND'].includes(packet.type))
               this.waiter.interference = true;
           } catch {}
@@ -5267,17 +5257,19 @@
               equipSets: copy(data.equipSets), at: Date.now() });
             while (entries.size > 5) entries.delete(entries.keys().next().value);
           }
-          if (
-            type === 'CONSIGNMENT_LIST_RESPONSE' &&
-            packet.success &&
-            Array.isArray(packet.data?.items)
-          ) {
-            const market = this.cache.consignment;
+          // 商会 pages (client of 2026-11-23): the server pages and sorts; the rows of recent pages are kept for labels.
+          if (type === 'MARKET_RESPONSE' && packet.success && packet.data?.action === 'list' && Array.isArray(packet.data.items)) {
+            const market = this.cache.market;
             let changed = false;
             for (const item of packet.data.items)
-              if (item && item.id != null) { market.set(item.id, item); changed = true; }
-            while (market.size > 4000) market.delete(market.keys().next().value);
-            if (changed) this.cache.consignmentVersion = P.num(this.cache.consignmentVersion) + 1;
+              if (item && item.id != null) {
+                const key = item.source + ':' + item.id;
+                market.delete(key);
+                market.set(key, item);
+                changed = true;
+              }
+            while (market.size > 2000) market.delete(market.keys().next().value);
+            if (changed) this.cache.marketVersion = P.num(this.cache.marketVersion) + 1;
           }
           if (type === 'GET_MONSTER_TMPL_RESPONSE' && packet.success && Array.isArray(packet.data)) {
             for (const entry of packet.data.filter((e) => e.template))
@@ -5986,9 +5978,15 @@
         }
         return cached[type];
       }
+      // A 商会 listing scores when it holds one piece of equipment; plain equipment objects score as they are.
       static equipment(it, state) {
         it = raw(it);
         if (!it) return null;
+        if (Array.isArray(it.assets)) {
+          const assets = it.assets.map(raw);
+          it = assets.length === 1 && assets[0]?.kind === 'EQUIP' ? raw(assets[0].display) : null;
+          if (!it) return null;
+        }
         if (!(P.num(it.itemType) === 1 || it.equipTmpl)) return null;
         const tmpl = raw(
           it.equipTmpl ||
@@ -6046,6 +6044,17 @@
         return entry.gains[type];
       }
       sortListings(list, mode, state, prefs) {
+        const keys = this.listingKeys(list, mode, state, prefs);
+        if (!keys) return null;
+        return (a, b) => {
+          a = raw(a); b = raw(b);
+          if (a == null || b == null) return a == null ? (b == null ? 0 : 1) : -1;
+          const x = keys.get(a), y = keys.get(b);
+          return Number(y.equipment) - Number(x.equipment) || y.value - x.value || (Number(b.id) || 0) - (Number(a.id) || 0);
+        };
+      }
+      // The sort value of each listing: equipment or not, and its power, score or gain.
+      listingKeys(list, mode, state, prefs) {
         if (mode === 'off' || !state) return null;
         const view = MarketScore.prepare(this, state, prefs, mode);
         if (mode !== 'power' && !view.ready) return null;
@@ -6058,64 +6067,36 @@
             ? MarketScore.gain(entry, 'combat', view).percent : MarketScore.score(entry, mode, view) }
             : { equipment: false, value: 0 });
         }
-        return (a, b) => {
-          a = raw(a); b = raw(b);
-          if (a == null || b == null) return a == null ? (b == null ? 0 : 1) : -1;
-          const x = keys.get(a), y = keys.get(b);
-          return Number(y.equipment) - Number(x.equipment) || y.value - x.value || (b.id || 0) - (a.id || 0);
-        };
+        return keys;
       }
-      static listings(list) {
-        const first = raw(raw(list).find((it) => it != null));
-        return !!first && typeof first === 'object' && 'sellerName' in first && 'price' in first;
-      }
-      static sortHook(original, isOpen, market) {
-        return function (compare) {
-          let selected = compare;
-          try {
-            const prefs = market.controller.prefs, scoring = prefs.market.showScore !== false && prefs.market.sort !== 'off';
-            if ((scoring || prefs.market.hideUnbuyable) && this.length && isOpen() && MarketScore.listings(this)) {
-              // The game filters into a fresh array, sorts it and pages through it; a reactive array is state and stays whole.
-              if (prefs.market.hideUnbuyable && raw(this) === this) market.dropUnbuyable(this);
-              if (scoring && this.length) selected = market.sortListings(this, prefs.market.sort, market.state(), prefs) || compare;
-            }
-          } catch { selected = compare; }
-          return original.call(this, selected);
-        };
-      }
-      dropUnbuyable(list) {
-        const c = this.controller.bridge?.character(), role = c ? storeField(c, 'role') : null;
-        if (!role?.id) return;
-        let kept = 0;
-        for (const it of list) if (it == null || P.listingBuyable(raw(it), role)) list[kept++] = it;
-        list.length = kept;
-      }
-      // The game's list is computed. It reads its 隐藏自己 box on every pass, but its sort select only through its own
-      // comparator (not called while the script sorts or with fewer than two listings): flipping the box twice makes it
-      // filter and sort again; the select is the fallback.
+      // The 商会 window (client of 2026-11-23) pages on the server, 24 rows a page, so the script sorts and hides the rows
+      // of the page on screen. The rows form a CSS grid: the order goes through `order` and the game's DOM stays as it is.
       refreshListings() {
-        if (typeof document === 'undefined') return;
-        const own = document.querySelectorAll('.consignment-window label.exclude-mine-checkbox:not(.tl-market-unbuyable) input')[0];
-        if (own) { own.click(); own.click(); return; }
-        const game = document.querySelectorAll('.consignment-window .sort-select')[0];
-        if (!game) return;
-        const value = game.value;
-        game.value = Array.from(game.options).find((option) => option.value !== value).value;
-        game.dispatchEvent(new Event('change', { bubbles: true }));
-        game.value = value;
-        game.dispatchEvent(new Event('change', { bubbles: true }));
+        this.schedule();
       }
-      // Left of the game's 隐藏自己: a copy of its label, so it takes the same style.
-      scanHide() {
-        const own = document.querySelectorAll('.consignment-window label.exclude-mine-checkbox:not(.tl-market-unbuyable)')[0];
-        if (!own) return;
+      role() {
+        const c = this.controller.bridge?.character?.(), role = c ? storeField(c, 'role') : null;
+        return role?.id ? role : null;
+      }
+      // In the game's filter bar: the script sort after its sort select, and 隐藏无法购买, a copy of its 适合我的等级 box.
+      scanControls() {
+        const bar = document.querySelectorAll('.market-window .filter-bar')[0], prefs = this.controller.prefs;
+        const game = bar && Array.from(bar.querySelectorAll('select')).find((node) =>
+          !node.classList.contains('tl-market-sort') && Array.from(node.options || []).some((option) => option.value === 'newest'));
+        if (prefs.market.showScore === false) for (const node of document.querySelectorAll('.tl-market-sort')) node.remove();
+        else if (game) this.scanSort(game, prefs);
+        const own = bar && Array.from(bar.querySelectorAll('label')).find((node) =>
+          !node.classList.contains('tl-market-unbuyable') && node.querySelector('input[type=checkbox]'));
+        if (own) this.scanHide(own, prefs);
+      }
+      scanHide(own, prefs) {
         let label = own.parentNode.querySelector('.tl-market-unbuyable');
         if (!label) {
           label = own.cloneNode(true);
           label.classList.add('tl-market-unbuyable');
-          label.title = '勾选后不显示买不了的商品：指定卖给他人的和自己上架的';
-          label.style.marginRight = '4px';
-          label.querySelector('.exclude-mine-label').textContent = '隐藏无法购买';
+          label.title = '勾选后本页不显示买不了的商品：自己上架的和指定卖给他人的';
+          for (const node of Array.from(label.childNodes)) if (node.nodeType === 3) node.remove();
+          label.appendChild(document.createTextNode('隐藏无法购买'));
           own.before(label);
           label.querySelector('input').addEventListener('change', (e) => {
             const current = this.controller.prefs;
@@ -6123,21 +6104,13 @@
             this.refreshListings();
           });
         }
-        // One line each: the two sort selects give up the width instead.
-        for (const node of [label, own]) if (node.style.whiteSpace !== 'nowrap') node.style.whiteSpace = 'nowrap';
-        const input = label.querySelector('input'), on = !!this.controller.prefs.market.hideUnbuyable;
+        const input = label.querySelector('input'), on = !!prefs.market.hideUnbuyable;
         if (input.checked !== on) input.checked = on;
       }
       constructor(controller) {
         this.controller = controller;
         this.petLevelButton = new PetLevelButton(controller);
-        if (typeof document === 'undefined') return;
-        if (!MarketScore.sortInstalled) {
-          Array.prototype.sort = MarketScore.sortHook(Array.prototype.sort,
-            () => !!document.querySelector('.consignment-window'), this);
-          MarketScore.sortInstalled = true;
-        }
-        if (typeof MutationObserver === 'undefined') return;
+        if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
         this.timer = 0;
         this.observer = null;
         const boot = () => {
@@ -6162,30 +6135,29 @@
           } catch {}
         }, 250);
       }
-      read(card) {
-        const price = card.querySelector('.price-number');
-        let seller = '';
-        for (const span of card.querySelectorAll('span')) {
-          const m = span.textContent.match(/^\s*卖家:\s*(.*)$/);
-          if (m) {
-            seller = m[1].trim();
-            break;
-          }
-        }
+      // A 商会 row: the seller id in the title of its item button, the title, and the whole price of a sale. Text sits in
+      // the element's own text nodes, between the empty anchors of Vue fragments and before a <small> or <em>.
+      read(row) {
+        const own = (el) => Array.from(el?.childNodes || []).filter((n) => n.nodeType === 3).map((n) => n.textContent).join('').trim();
+        const info = row.querySelector('.product-info'), strong = info?.querySelector('strong'),
+          owner = String(info?.getAttribute?.('title') || '').match(/ · #(\d+) · /),
+          price = own(row.querySelector('.price')).match(/^(.*\d)\s*(金币|元宝)$/);
         return {
-          name: (card.querySelector('.item-title')?.textContent || '').trim(),
-          seller,
-          price: P.num(String(price?.textContent || '').replace(/[^\d.]/g, ''), -1),
-          currency: price?.classList.contains('yuanbao-price') ? 2 : 1,
+          title: own(strong),
+          owner: owner ? owner[1] : '',
+          price: price ? P.num(price[1].replace(/\D/g, ''), -1) : -1,
+          currency: price ? (price[2] === '金币' ? 1 : 2) : 0,
         };
       }
+      // Barter rows show a note instead of a price.
       static cardKey(it) {
         it = raw(it);
-        return JSON.stringify([String(it.itemName || '').trim(), String(it.sellerName || '').trim(),
-          P.num(it.price), P.num(it.currency, 1)]);
+        const sale = it.mode === 'SALE';
+        return JSON.stringify([String(it.owner_id ?? ''), String(it.title || '').trim(),
+          sale ? P.num(it.price) : -1, sale ? P.num(it.currency, 1) : 0]);
       }
       static index(owner) {
-        const cache = owner.controller.bridge.cache, source = cache.consignment, version = cache.consignmentVersion;
+        const cache = owner.controller.bridge.cache, source = cache.market, version = cache.marketVersion;
         let index = owner.marketIndex;
         if (!index || index.source !== source || index.version !== version) {
           index = { source, version, items: new Map() };
@@ -6199,17 +6171,17 @@
         }
         return index.items;
       }
-      label(card, state, prefs, view) {
+      matches(row) {
+        const info = this.read(row);
+        if (!info.title || !info.owner) return { info, list: [] };
+        return { info, list: MarketScore.index(this).get(JSON.stringify([info.owner, info.title, info.price, info.currency])) || [] };
+      }
+      label(row, state, prefs, view, found = this.matches(row)) {
         const scoringPrefs = MarketScore.scorePrefs(prefs, prefs.market.scoreType);
-        const info = this.read(card);
-        if (!info.name || info.price < 0) return null;
-        const key = JSON.stringify([info.name, info.seller, info.price, info.currency]),
-          matches = MarketScore.index(this).get(key) || [];
-        if (!matches.length) return null;
+        if (!found.list.length) return null;
         view ||= MarketScore.prepare(this, state, prefs);
         const scored = [];
-        for (const it of matches) {
-          if (MarketScore.cardKey(it) !== key) continue;
+        for (const it of found.list) {
           const entry = MarketScore.entry(view, it);
           if (!entry.eq) continue;
           scored.push({
@@ -6405,21 +6377,15 @@
             }
           : null;
       }
-      scanSort() {
-        const game = document.querySelectorAll('.consignment-window .sort-select')[0], prefs = this.controller.prefs;
-        if (prefs.market.showScore === false) {
-          for (const node of document.querySelectorAll('.tl-market-sort')) node.remove();
-          return;
-        }
-        if (!game) return;
+      scanSort(game, prefs) {
         let select = game.parentNode.querySelector('.tl-market-sort');
         if (!select) {
           select = document.createElement('select');
-          select.className = 'filter-select tl-market-sort';
+          select.className = 'tl-market-sort';
           for (const attr of game.attributes)
             if (attr.name.startsWith('data-v-')) select.setAttribute(attr.name, attr.value);
-          for (const [value, text] of [['off', '脚本排序：关'], ['power', '⚔️ 战斗力从高到低'],
-            ['combat', '🎯 实战评分从高到低'], ['gain', '📈 实战提升从高到低']]) {
+          for (const [value, text] of [['off', '脚本排序：关'], ['power', '本页按战斗力'],
+            ['combat', '本页按实战评分'], ['gain', '本页按实战提升']]) {
             const option = document.createElement('option');
             option.value = value;
             option.textContent = text;
@@ -6430,19 +6396,17 @@
             const current = this.controller.prefs;
             this.controller.updateConfig({ ...current, market: { ...current.market, sort: select.value } });
             this.refreshListings();
-            this.scanSort();
           });
         }
-        select.value = prefs.market.sort;
-        select.title = ['combat', 'gain'].includes(prefs.market.sort) &&
-          !this.sortListings([], prefs.market.sort, this.state(), prefs)
-          ? '实战评分等待战斗数据，暂按游戏排序' : '';
+        if (select.value !== prefs.market.sort) select.value = prefs.market.sort;
+        const title = ['combat', 'gain'].includes(prefs.market.sort) && !this.sortListings([], prefs.market.sort, this.state(), prefs)
+          ? '实战评分等待战斗数据，暂按游戏排序' : '商会每页 24 条，只排当前这一页';
+        if (select.title !== title) select.title = title;
       }
       scan() {
         try { this.petLevelButton.scan(document); } catch { /* Game windows can disappear during a scan. */ }
-        this.scanHide();
-        this.scanSort();
-        const cards = document.querySelectorAll('.consignment-window .market-item-card'),
+        this.scanControls();
+        const cards = document.querySelectorAll('.market-window .product-list > .product-row'),
           grids = document.querySelectorAll('.inventory-grid, .warehouse-grid'),
           profiles = document.querySelectorAll('.stats-area'),
           tips = document.querySelectorAll('.tlbb-tooltip');
@@ -6490,9 +6454,8 @@
           }
         }
         if (scoreProfiles) for (const el of profiles) this.drawProfile(el, profileInstances, state, entries, prefs);
-        if (cards.length) this.scanMarket(cards, prefs.market?.showScore !== false ? state : null, prefs);
+        if (cards.length) this.scanMarket(Array.from(cards), prefs.market?.showScore !== false ? state : null, prefs);
         if (grids.length) this.scanBag(grids, state, prefs, getCollection);
-        if (grids.length) this.scanConsign(grids, state, prefs);
       }
       drawProfile(el, profileInstances, state, entries, prefs) {
         const vm = profileInstances.find(v => Bridge.renders(v, el));
@@ -6883,49 +6846,28 @@
           });
         }
       }
-      // 九州商会 · 寄售上架: a right click in the bag puts an item on sale; the items it refuses (bound) are dimmed.
-      scanConsign(grids, state, prefs) {
-        const sellTab = document.querySelectorAll('.consignment-window .game-tab-button.is-active')[0];
-        const selling = prefs.market.consignHighlight !== false && !!state && !!sellTab?.textContent.includes('寄售上架');
-        const dimmed = new Set();
-        for (const grid of selling ? grids : []) {
-          if (!grid.classList.contains('inventory-grid')) continue;
-          const slots = Array.from(grid.children).filter((n) => n.classList?.contains('grid-slot'));
-          const frame = grid.closest?.('.game-window-shell__frame'), tab = this.bagTab(grid, frame);
-          const items = tab === '装备' ? P.array(state.equipments).filter((e) => e.equipTmpl && !e.isEquipped) :
-            P.bagTabItems(tab, state);
-          // Props and materials carry no quality, so the game marks their slots `empty-slot` too: count the icons.
-          const filled = slots.filter((n) => !!n.querySelector('.v-img, img')).length;
-          if (filled !== Math.min(items.length, slots.length)) continue;
-          slots.forEach((slot, i) => { if (items[i] && !P.consignable(items[i])) dimmed.add(slot); });
-        }
-        // The same dimming as the bag filter, as a filter: the bag filter owns the slot's inline opacity.
-        for (const slot of document.querySelectorAll('[data-tl-consign]'))
-          if (!dimmed.has(slot)) {
-            delete slot.dataset.tlConsign;
-            slot.style.filter = '';
-          }
-        for (const slot of dimmed)
-          if (!slot.dataset.tlConsign) {
-            slot.dataset.tlConsign = '1';
-            slot.style.filter = 'opacity(0.22)';
-          }
-      }
-      scanMarket(cards, state, prefs) {
-        const view = state ? MarketScore.prepare(this, state, prefs) : null;
-        for (const card of cards) {
-          const row = card.querySelector('.item-title')?.parentElement,
-            old = Array.from(card.querySelectorAll('.tl-market-score'));
-          const want = state && row ? this.label(card, state, prefs, view) : null;
-          const keep = want && old.find((n) => n.parentElement === row);
+      scanMarket(rows, state, prefs) {
+        const view = state ? MarketScore.prepare(this, state, prefs) : null, role = prefs.market.hideUnbuyable ? this.role() : null,
+          found = rows.map((row) => this.matches(row));
+        rows.forEach((row, i) => {
+          const text = row.querySelector('.product-info > span'),
+            old = Array.from(row.querySelectorAll('.tl-market-score'));
+          const want = state && text ? this.label(row, state, prefs, view, found[i]) : null;
+          const keep = want && old.find((n) => n.parentElement === text);
           for (const n of old) if (n !== keep) n.remove();
-          if (!want) continue;
+          const hide = !!role && !P.listingBuyable(found[i].list[0] || { owner_id: found[i].info.owner }, role);
+          if (hide !== !!row.dataset.tlHidden) {
+            if (hide) row.dataset.tlHidden = '1';
+            else delete row.dataset.tlHidden;
+            row.style.display = hide ? 'none' : '';
+          }
+          if (!want) return;
           const el = keep || document.createElement('span');
           if (!keep) {
             el.className = 'tl-market-score';
             el.style.cssText =
-              'font-size:11px;line-height:16px;padding:0 6px;border:1px solid currentColor;border-radius:4px;white-space:nowrap;font-weight:600;';
-            row.appendChild(el);
+              'display:inline-block;font-size:10px;line-height:14px;padding:0 5px;border:1px solid currentColor;border-radius:4px;white-space:nowrap;font-weight:600;';
+            text.appendChild(el);
           }
           if (el.textContent !== want.text) el.textContent = want.text;
           if (el.title !== want.title) el.title = want.title;
@@ -6933,7 +6875,25 @@
             el.dataset.color = want.color;
             el.style.color = want.color;
           }
-        }
+        });
+        this.orderRows(rows, found, state, prefs);
+      }
+      // Equipment first by the chosen value, the rest after it in the game's order.
+      orderRows(rows, found, state, prefs) {
+        const items = found.map((f) => raw(f.list[0] ?? null)), order = rows.map((_, i) => i),
+          keys = state ? this.listingKeys(items, prefs.market.sort, state, prefs) : null,
+          compare = keys && ((a, b) => {
+            const x = keys.get(items[a]), y = keys.get(items[b]);
+            return Number(y.equipment) - Number(x.equipment) || y.value - x.value || a - b;
+          });
+        if (compare) order.sort(compare);
+        order.forEach((index, place) => {
+          const row = rows[index], value = compare ? String(place + 1) : '';
+          if ((row.dataset.tlOrder || '') === value) return;
+          if (value) row.dataset.tlOrder = value;
+          else delete row.dataset.tlOrder;
+          row.style.order = value;
+        });
       }
     }
     function applyConfig(controller, next, preserveData = false) {
@@ -8990,8 +8950,9 @@
         if (!win || !grid?.matches('.inventory-grid') || !filled(cell)) return null;
         const tab = win.querySelector('.game-tab-button.is-active')?.textContent.trim();
         const cells = Array.from(grid.children).filter(node => node.matches('.grid-slot'));
-        const character = this.bridge.character();
-        if (cells.filter(filled).length !== Math.min(72, P.bagTabItems(tab, character).length)) return null;
+        const character = this.bridge.character(), count = P.bagTabItems(tab, character).length, shown = cells.filter(filled).length;
+        // Older clients page the bag 72 cells at a time; the client of 2026-11-23 shows every item.
+        if (shown !== count && shown !== Math.min(72, count)) return null;
         return P.bagCellItem(tab, cells.indexOf(cell), character);
       }
       warehouseTab(target) {
@@ -11097,13 +11058,11 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('详情和人物面板显示实战评分', 'market.tipScore', { help: '装备详情及人物面板' }) +
             f('物品详情显示绑定状态', 'market.tipBound', { help: '已绑定、未绑定、装备后绑定' }) +
             f('物品详情显示套装收集情况', 'market.tipSet'), true) +
-          g('逛摊淘宝',
-            f('逛摊淘宝显示装备评分', 'market.showScore') +
-            f('逛摊评分类型', 'market.scoreType', { dependsOn: 'market.showScore', choices: [['combat', '实战评分'], ['power', '游戏内战力']] }) +
-            f('逛摊按脚本排序', 'market.sort', { immediate: true, choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
-            f('逛摊隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '指定卖给他人的和自己上架的商品不显示，页数只算能买的。逛摊窗口里“隐藏自己”左边的“隐藏无法购买”是同一个开关' })) +
-          g('寄售上架',
-            f('调暗背包里不能寄售的物品', 'market.consignHighlight', { help: '九州商会切到“寄售上架”时，背包装备、道具、材料三页里已绑定的物品调暗，未绑定的不变，右键即可放入寄售槽' })) +
+          g('逛商会',
+            f('逛商会显示装备评分', 'market.showScore') +
+            f('逛商会评分类型', 'market.scoreType', { dependsOn: 'market.showScore', choices: [['combat', '实战评分'], ['power', '游戏内战力']] }) +
+            f('逛商会本页按脚本排序', 'market.sort', { immediate: true, help: '商会每页 24 条，由服务器排序和翻页，脚本只排当前这一页：装备在前，其余按游戏顺序。商会窗口排序框右边的“脚本排序”是同一个设置', choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
+            f('逛商会隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '本页不显示自己上架的和指定卖给他人的商品，所以这一页可能少于 24 条。商会窗口里“适合我的等级”左边的“隐藏无法购买”是同一个开关' })) +
           g('工坊',
             f('显示“一键放入”按钮', 'fill.enabled', { help: '在游戏窗口显示' }) +
             f('完成后补回同种符和材料', 'fill.refill', { dependsOn: 'fill.enabled' }), false, { help: HELP.fill }) +
