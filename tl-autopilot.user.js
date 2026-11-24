@@ -3901,16 +3901,16 @@
             const t = bags[0].itemTmpl,
               level = num(t.gemLevel),
               units = bags.reduce((n, b) => n + integer(b.count), 0);
-            if (units < 5) continue;
-            const charm = gemCharm(s, 'synth', bags[0]);
-            const rate = synthRate(level, 5, !!charm);
+            const charm = gemCharm(s, 'synth', bags[0]), need = synthUnits(level, !!charm);
+            if (units < need) continue;
+            const rate = synthRate(level, need, !!charm);
             if (rate < p.gems.minSynthSuccess) continue;
             const ids = [];
             for (const b of bags) {
-              const use = Math.min(integer(b.count), 5 - ids.length);
+              const use = Math.min(integer(b.count), need - ids.length);
               for (let n = 0; n < use; n++) ids.push(num(b.id));
             }
-            if (ids.length !== 5) continue;
+            if (ids.length !== need) continue;
             const payload = { gemBagItemIds: ids };
             if (charm) payload.charmBagItemId = num(charm.id);
             if (
@@ -3920,7 +3920,7 @@
                   payload,
                   '合成「' + t.name + '」→' + (level + 1) + '级（' + rate + '%）',
                   'gem',
-                  { requiresTown: true, npc: NPC.gem, gemUnits: 5 },
+                  { requiresTown: true, npc: NPC.gem, gemUnits: need },
                 ),
               )
             )
@@ -4283,6 +4283,7 @@
       }
       return out;
     }
+    // The client's table (GemShopSynthTab, 2026-11-24): levels 5 to 8 share one row, level 9 does not combine.
     function synthRate(level, units, charm) {
       const r = {
         1: [20, 30, 100, 100],
@@ -4290,10 +4291,16 @@
         3: [15, 15, 60, 85],
         4: [12.5, 12.5, 50, 75],
         5: [10, 10, 40, 65],
-      }[level];
+      }[level >= 5 && level <= 8 ? 5 : level];
       if (!r || units < 2 || units > 5) return 0;
       const base = Math.min(r[2], r[0] + r[1] * (units - 2));
       return charm ? Math.min(r[3], base + 25) : base;
+    }
+    // The fewest gems that reach the best rate of a level: 4 with a charm at level 1 (100%), else 5.
+    function synthUnits(level, charm) {
+      const best = synthRate(level, 5, charm);
+      for (let units = 2; units < 5; units++) if (best > 0 && synthRate(level, units, charm) >= best) return units;
+      return 5;
     }
     function signature(s) {
       return JSON.stringify({
@@ -4396,9 +4403,15 @@
         const total = (group) => group.reduce((n, b) => n + num(b.count), 0);
         const group = selected.length ? groups.get(id(selected[0])) : [...groups.values()].filter((g) => total(g) >= 2)
           .sort((a, b) => Math.min(5, total(b)) - Math.min(5, total(a)) || level(a[0]) - level(b[0]) || id(a[0]) - id(b[0]))[0];
-        const units = (group || []).flatMap((b) => Array(Math.max(0, Math.min(5, num(b.count) - selected.filter((v) => v.id === b.id).length))).fill(b)).slice(0, Math.max(0, 5 - selected.length));
-        const gem = selected[0] || group?.[0];
-        return result(units.concat(gem && !current.selectedSynthCharm ? find(level(gem) <= 4 ? 5058 : 5059) : null));
+        const gem = selected[0] || group?.[0], held = current.selectedSynthCharm;
+        const found = gem && !held ? find(level(gem) <= 4 ? 5058 : 5059) : null;
+        // Only as many gems as the best rate needs: four and a charm make 100% at level 1.
+        const need = gem ? synthUnits(level(gem), held ? charmCompatible(s, held, 'synth', gem) : !!found) : 5;
+        const units = (group || []).flatMap((b) => Array(Math.max(0, Math.min(5, num(b.count) - selected.filter((v) => v.id === b.id).length))).fill(b)).slice(0, Math.max(0, need - selected.length));
+        // A charm goes in only when it raises the rate: five level-1 gems already make 100%.
+        const count = selected.length + units.length;
+        const charm = found && synthRate(level(gem), count, true) > synthRate(level(gem), count, false) ? found : null;
+        return result(units.concat(charm));
       }
       if (mode === 'GEM_REMOVE') {
         if (!current.selectedEquip) return result([], '请先放入装备并点选要摘除的宝石');
@@ -4543,7 +4556,7 @@
       potionThreshold,
       potionOrder,
       skillCost,
-      synthRate,
+      synthRate, synthUnits,
       petScreenable, claimedLocked, petRoomBlocked, PET_FULL_TEXT,
       breedable, breedingReady, breedingPick, breedingStatus,
       petEggs,
@@ -10205,8 +10218,10 @@
         if (interaction?.mode !== mode) return;
         if (mode !== 'GEM_SYNTH' || !item.itemTmpl?.gemLevel) return interaction.handleItemClick(this.live(item));
         if (g.selectedSynthGems?.length && g.selectedSynthGems[0].itemId !== item.itemId) { g.clearSynthGems(); g.clearSynthCharm(); }
-        const selected = g.selectedSynthGems || [];
-        const count = Math.min(5 - selected.length, item.count - selected.filter((b) => b.id === item.id).length);
+        const selected = g.selectedSynthGems || [], held = g.selectedSynthCharm;
+        // Four gems with a placed charm or five alone reach 100% at level 1; a charm still in the bag does not count.
+        const need = P.synthUnits(P.num(item.itemTmpl.gemLevel), !!held && P.charmCompatible(this.controller.bridge.state(), held, 'synth', item));
+        const count = Math.min(need - selected.length, item.count - selected.filter((b) => b.id === item.id).length);
         for (let n = 0; n < count; n++) if (interaction.handleItemClick(this.live(item)) === false) break;
       }
       subscribe() {
@@ -10242,9 +10257,18 @@
         if (!c.prefs.fill.enabled || !c.prefs.fill.refill || interaction?.mode !== mode || !g || !this.doc.querySelector('div.gem-shop-window')) return;
         const fields = { GEM_DRILL: ['selectedDrillMaterial'], GEM_INLAY: ['selectedCharm'], GEM_SYNTH: ['selectedSynthGems', 'selectedSynthCharm'], GEM_REMOVE: ['selectedRemoveCharm'], GEM_POLISH: ['selectedPolishGem', 'selectedPolishCharm'] }[mode] || [];
         if (mode === 'GEM_DRILL' && (!g.selectedEquip || P.slots(g.selectedEquip).filter((n) => n >= 0).length >= 3)) return;
-        for (const field of fields) this.refillField(mode, field, memory[field], g, interaction);
+        const limit = mode === 'GEM_SYNTH' ? this.synthLimit(memory) : 5;
+        for (const field of fields) this.refillField(mode, field, memory[field], g, interaction, limit);
       }
-      refillField(mode, field, memory, g, interaction) {
+      // Refilled gems stop at the best rate: four at level 1 while the remembered charm is still in the bag.
+      synthLimit(memory) {
+        const s = this.controller.bridge.state(), bags = P.array(s.bagItems), charm = memory.selectedSynthCharm;
+        const gem = bags.find((b) => b.itemId === memory.selectedSynthGems?.itemId && b.count > 0);
+        if (!gem) return 5;
+        const held = !!charm && bags.some((b) => b.itemId === charm.itemId && b.count > 0 && P.charmUsable(s, b) && P.charmCompatible(s, b, 'synth', gem));
+        return P.synthUnits(P.num(gem.itemTmpl?.gemLevel), held);
+      }
+      refillField(mode, field, memory, g, interaction, limit = 5) {
         if (!memory || (field === 'selectedSynthGems' ? g[field]?.length : g[field])) return;
         const s = this.controller.bridge.state(), kind = field === 'selectedSynthGems' || field === 'selectedPolishGem' ? 'gem' : field === 'selectedDrillMaterial' ? 'material' : 'charm';
         const all = P.slotChoices(mode, kind, s, this.controller.prefs, g).filter((b) => b.itemId === memory.itemId).sort((a, b) => Number(!!b.isBound) - Number(!!a.isBound));
@@ -10255,7 +10279,7 @@
         if (field === 'selectedSynthCharm' && (!g.selectedSynthGems?.length || !P.charmCompatible(s, all[0], 'synth', g.selectedSynthGems[0]))) return;
         const total = all.reduce((n, b) => n + b.count, 0);
         if (field === 'selectedSynthGems' && total < 2) return;
-        let remaining = field === 'selectedSynthGems' ? Math.min(5, memory.count, total) : 1;
+        let remaining = field === 'selectedSynthGems' ? Math.min(limit, memory.count, total) : 1;
         for (const item of all) {
           const count = Math.min(remaining, item.count);
           for (let n = 0; n < count; n++) if (interaction.handleItemClick(this.live(item)) === false) return;
@@ -12038,7 +12062,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('自动打孔', 'gems.drill') +
             f('每件装备目标孔数', 'gems.maxHoles', { max: 3, unit: '孔', dependsOn: 'gems.drill' }) +
             f('自动镶嵌', 'gems.inlay') +
-            f('自动合成', 'gems.synth', { help: '每次5颗' }) +
+            f('自动合成', 'gems.synth', { help: '每次5颗\n\n1级宝石有合成符时只用4颗加1张符（100%）' }) +
             f('宝石目标等级', 'gems.maxLevel', { max: 6, unit: '级' }) +
             f('最低合成成功率', 'gems.minSynthSuccess', { max: 100, unit: '%', dependsOn: 'gems.synth' }) +
             f('智慧/魅力宝石雕琢', 'gems.polish') +
