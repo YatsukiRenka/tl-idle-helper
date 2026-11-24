@@ -173,7 +173,8 @@
       },
       market: { sort: 'off', showScore: true, bagScore: true, tipScore: true, tipBound: true,
         bagFilter: true, setTag: true, tipSet: true, scoreType: 'combat', bagScoreType: 'combat', hideUnbuyable: false },
-      convenience: { sortDeposit: true, ctrlDeposit: true, depositKeys: 'ctrl', sellWarehouse: false, sellKeys: 'alt', petLevelButton: true },
+      convenience: { sortDeposit: true, ctrlDeposit: true, depositKeys: 'ctrl', sellWarehouse: false, sellKeys: 'alt', petLevelButton: true,
+        marketMax: true, marketStay: true },
       sell: {
         enabled: true,
         maxQuality: 1,
@@ -5820,6 +5821,12 @@
             const packet = JSON.parse(data);
             if (packet.type === 'MARKET_COMMAND' && !this.sending && this.socket === socket)
               this.marketPages?.observe(packet.payload);
+            // The player's own sale listings, for staying on 「我要出售」 after them.
+            if (packet.type === 'MARKET_COMMAND' && !this.sending && packet.payload?.action === 'create' &&
+                packet.payload.mode === 'SALE' && packet.payload.requestId) {
+              (this.marketCreates ||= new Set()).add(packet.payload.requestId);
+              if (this.marketCreates.size > 20) this.marketCreates.delete(this.marketCreates.values().next().value);
+            }
             if (packet.type === 'RINGS_COMMAND') {
               this.ringsRequests.set(packet.payload?.requestId, packet.payload?.action);
               this.ringsRequestAt.set(packet.payload?.requestId, Date.now());
@@ -5935,6 +5942,8 @@
           }
           if (type === 'MARKET_RESPONSE' && packet.success && packet.data?.action === 'list' && Array.isArray(packet.data.items))
             this.cacheMarketItems(packet.data.items);
+          if (type === 'MARKET_RESPONSE' && this.marketCreates?.delete(packet.data?.requestId) && packet.success)
+            this.onMarketCreate?.();
           if (type === 'GET_MONSTER_TMPL_RESPONSE' && packet.success && Array.isArray(packet.data)) {
             for (const entry of packet.data.filter((e) => e.template))
               this.cache.monsterTemplates.set(entry.category + ':' + entry.id, {
@@ -6606,6 +6615,50 @@
         });
       }
     }
+    // 九州商会「我要出售」: a 「最大」 button between each picked item's count box and its 「移除」, and staying on the
+    // tab after the player's own sale listing. The client switches to 「我的交易」 on success (market-window, 2026-11-24).
+    class MarketSellTools {
+      constructor(controller, schedule = (fn, ms) => setTimeout(fn, ms)) {
+        this.controller = controller;
+        this.schedule = schedule;
+        if (controller.bridge) controller.bridge.onMarketCreate = () => this.stay();
+      }
+      scan(doc) {
+        if (!this.controller.prefs.convenience?.marketMax) {
+          for (const button of doc.querySelectorAll('.tl-max')) button.remove();
+          return;
+        }
+        for (const row of doc.querySelectorAll('.market-window .picked')) {
+          const input = row.querySelector('input[type=number]');
+          const remove = [...row.children].find((b) => b.tagName === 'BUTTON' && b.textContent.trim() === '移除');
+          if (!input || !remove || row.querySelector('.tl-max')) continue;
+          const button = remove.cloneNode(false);
+          button.type = 'button';
+          button.classList.add('tl-max');
+          button.textContent = '最大';
+          button.title = '填入最大数量';
+          button.addEventListener('click', () => this.fillMax(input));
+          remove.before(button);
+        }
+      }
+      // The count box is a v-model number input: the game reads it on the input event.
+      fillMax(input) {
+        const max = Math.floor(Number(input.max || input.getAttribute('max')));
+        if (!(max >= 1)) return;
+        input.value = String(max);
+        const view = input.ownerDocument?.defaultView || globalThis;
+        input.dispatchEvent(new view.Event('input', { bubbles: true }));
+      }
+      // Runs after the game handled the response and re-rendered: 「我要出售」 resets the form and reloads the items.
+      stay(doc = document) {
+        if (!this.controller.prefs.convenience?.marketStay) return;
+        this.schedule(() => {
+          const buttons = [...(doc.querySelector('.market-window')?.querySelectorAll('button') || [])];
+          const tab = (label) => buttons.find((b) => b.textContent.trim() === label);
+          if (tab('我的交易')?.classList.contains('active')) tab('我要出售')?.click();
+        }, 0);
+      }
+    }
     class PetLevelButton {
       constructor(controller, schedule = (fn, ms) => setTimeout(fn, ms)) {
         this.controller = controller;
@@ -6873,6 +6926,7 @@
         this.controller = controller;
         if (controller.bridge) controller.bridge.marketScore = this;
         this.petLevelButton = new PetLevelButton(controller);
+        this.sellTools = new MarketSellTools(controller);
         if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
         this.timer = 0;
         this.observer = null;
@@ -7178,6 +7232,7 @@
       }
       scan() {
         try { this.petLevelButton.scan(document); } catch { /* Game windows can disappear during a scan. */ }
+        try { this.sellTools.scan(document); } catch { /* Same. */ }
         try { this.drawRoleIds(); } catch { /* Same. */ }
         this.scanControls();
         const cards = document.querySelectorAll('.market-window .product-list > .product-row'),
@@ -10331,7 +10386,7 @@
     const petRootRank = (text) => Number(String(text ?? '').match(/(?:悟性|根骨)\s*\+\s*(\d+)/)?.[1] || 0);
     const arraySafe = (v) => (Array.isArray(v) ? v : []);
     return {
-      petRootRank, PetLevelButton, WarehouseShortcuts, Filler, Stats, MapRates, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
+      petRootRank, PetLevelButton, MarketSellTools, WarehouseShortcuts, Filler, Stats, MapRates, statsNumber, statsDuration, requestAllowed, matchesResponse, mergeTargets, Controller, Bridge, MarketScore, ALLOWED, PREFIX, readStorage, writeStorage, taggedKey, readTagged, saveConfigField, day, safeMessage, createTicker, createKeepAwake, createLogStore, showConflictNotice, createPaintScheduler, scoringState, copy,
     };
   })();
   if (typeof module !== 'undefined' && module.exports) module.exports.TLRuntime = TLRuntime;
@@ -12051,6 +12106,9 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('逛商会评分类型', 'market.scoreType', { dependsOn: 'market.showScore', choices: [['combat', '实战评分'], ['power', '游戏内战力']] }) +
             f('逛商会按脚本排序', 'market.sort', { immediate: true, help: '脚本读取全部页（最多 30 页，每分钟刷新）后整体排序再按页显示：装备在前，其余按游戏顺序。超过 30 页或读取失败时只排当前这一页。商会窗口排序框右边的“脚本排序”是同一个设置', choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
             f('逛商会隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '所有页都不显示自己上架的和指定卖给他人的商品，页数按剩下的重新计算。商会窗口里“适合我的等级”左边的“隐藏无法购买”是同一个开关' })) +
+          g('商会出售',
+            f('数量框旁显示“最大”', 'convenience.marketMax', { help: '九州商会“我要出售”选中道具或材料后，数量框和“移除”之间多一个“最大”，点一下填入这件物品能卖的最大数量' }) +
+            f('确认上架后留在“我要出售”', 'convenience.marketStay', { help: '游戏上架成功后会跳到“我的交易”；开启后留在“我要出售”并刷新可上架的物品，方便连续上架。以物易物和脚本的自动上架不受影响' })) +
           g('工坊',
             f('显示“一键放入”按钮', 'fill.enabled', { help: '在游戏窗口显示' }) +
             f('完成后补回同种符和材料', 'fill.refill', { dependsOn: 'fill.enabled' }), false, { help: HELP.fill }) +
