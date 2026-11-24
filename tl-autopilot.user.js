@@ -3420,7 +3420,7 @@
       const protection = loadoutProtection(s), pending = array(s.gearProfile?.pending);
       const rejected = new Set(materials ? gearRejected(s.gearRejected, now).map((e) => e.id) : []),
         protectedGear = new Set([...rejected, s.gearCheck?.oldItemId, ...protection.keys()]);
-      if (!profileLocked(s) && !pending.length && s.gearCheck?.verdict?.state === 'worse') {
+      if (!profileLocked(s) && !pending.length && !s.profileRun && s.gearCheck?.verdict?.state === 'worse') {
         const rollback = gearCheckRollback(s.gearCheck, s);
         if (rollback) add(rollback);
       }
@@ -3757,7 +3757,8 @@
             longLabel(s.gearProfile.worn) + '：' + (bag ? '穿戴' : '取出') + '「' + template(eq).name + '」',
             'gear', { inBattle: true, profileSwitch: s.gearProfile.worn }));
         }
-      } else if (p.gear.enabled && !s.gearCheck && !profileLocked(s)) {
+      // A manual profile switch (profileRun) picks by the profile's score even during a field check, which it ends.
+      } else if (p.gear.enabled && (!s.gearCheck || s.profileRun) && !profileLocked(s)) {
         const candidatesFrom = (items) => array(items)
           .filter(
             (e) =>
@@ -3773,6 +3774,8 @@
           .sort((a, b) => b.gain.gain - a.gain.gain);
         const candidates = candidatesFrom(array(s.equipments)
           .filter((e) => num(template(e).slotType) !== 12));
+        const runFlag = s.profileRun ? { profileSwitch: s.gearProfile?.worn || 'farm' } : {},
+          runLabel = s.profileRun ? longLabel(s.gearProfile?.worn) + '：' : '';
         const warehouseCandidates = p.gear.fromWarehouse ? candidatesFrom(s.warehouseEquips) : [];
         const warehouseBest = warehouseCandidates[0];
         if (warehouseBest && (!candidates[0] || warehouseBest.gain.gain > candidates[0].gain.gain)) {
@@ -3780,9 +3783,9 @@
             action(
               'WAREHOUSE_WITHDRAW',
               { roleEquipId: num(warehouseBest.eq.id) },
-              '从仓库取出「' + template(warehouseBest.eq).name + '」准备穿戴',
+              runLabel + '从仓库取出「' + template(warehouseBest.eq).name + '」准备穿戴',
               'gear',
-              { gain: warehouseBest.gain.gain, inBattle: true },
+              { gain: warehouseBest.gain.gain, inBattle: true, ...runFlag },
             ),
           );
         } else if (candidates[0]) {
@@ -3791,9 +3794,9 @@
             action(
               'EQUIP_ITEM',
               { roleEquipId: num(candidates[0].eq.id) },
-              '穿戴「' + template(candidates[0].eq).name + '」',
+              runLabel + '穿戴「' + template(candidates[0].eq).name + '」',
               'gear',
-              { gain: candidates[0].gain.gain, inBattle: true },
+              { gain: candidates[0].gain.gain, inBattle: true, ...runFlag },
             ),
           );
         }
@@ -7172,6 +7175,16 @@
         span.style.color = up ? '#69f0ae' : '#ef5350';
         parent.appendChild(span);
       }
+      // The own 人物面板 scores under the worn 三环 or 浮屠 profile; the view needs the full state, kept for 2 s.
+      wornView(prefs) {
+        const worn = this.controller.gearProfile?.worn, now = Date.now(), memo = this.wornMemo;
+        if (!P.ASSAULT_IDS.includes(worn)) return null;
+        if (memo && memo.worn === worn && memo.prefs === prefs && now - memo.at < 2000) return memo.view;
+        const full = this.controller.bridge.state?.();
+        const view = full && P.assaultAvailable(full, prefs, worn) ? P.profileView(full, prefs, worn) : null;
+        this.wornMemo = { worn, prefs, at: now, view };
+        return view;
+      }
       profileScore(stats, state, prefs) {
         const value = P.characterScore(stats, state, MarketScore.scorePrefs(prefs, 'combat'));
         return {
@@ -7319,8 +7332,8 @@
         if (!vm && profileInstances.some(v => P.isViewedProfile(v.props))) return;
         const header = el.firstElementChild;
         if (!header) return;
-        const selected = P.profileState(vm?.props, state, entries);
-        const info = selected ? this.profileScore(vm?.props.statsOverride ?? selected.finalAttributes, selected, prefs) : null;
+        const selected = P.profileState(vm?.props, state, entries), worn = selected === state ? this.wornView(prefs) : null;
+        const info = selected ? this.profileScore(vm?.props.statsOverride ?? selected.finalAttributes, worn?.state || selected, worn?.prefs || prefs) : null;
         const list = el.querySelector('dl.identity-stats');
         let line = el.querySelector('.tl-profile-score');
         if (line && (list ? line.parentNode !== list : line.querySelector('dt'))) {
@@ -8082,6 +8095,55 @@
             '已就绪（换装 ' + g.changed + ' 件）'));
         if (dirty) this.saveProfile();
       }
+      delay(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+      // A click on 装备方案 changes the gear at once, also while 托管 is paused: the stored loadout of the chosen
+      // profile first, then the best gains by that profile's score, one item at a time. The tick waits meanwhile.
+      async switchProfile() {
+        if (this.profileRun || !this.bridge.connected || !this.bridge.sessionReady) return;
+        const first = this.bridge.state();
+        if (!first?.role) return;
+        if (P.profileLocked(first)) { this.log('新三环或无相浮屠进行中，暂不换装', 'warning'); return; }
+        this.setRole(P.num(first.role.id));
+        this.ensureGearState(P.num(first.role.id));
+        if (!this.acquireLease()) return;
+        const run = this.profileRun = { changed: 0, steps: 0 };
+        if (this.gearProfile) this.gearProfile.done = null;
+        this.paint();
+        try {
+          for (let wait = 0; this.busy && wait < 100; wait++) await this.delay(100);
+          while (run.steps < 30) {
+            const s = this.bridge.state();
+            if (!s || P.profileLocked(s)) break;
+            this.updateProfile(s, Date.now());
+            const a = this.planningPass({ ...s, profileRun: true }, this.prefs)
+              .find((v) => P.gearChange(v) && !this.bridge.responsePending?.(v));
+            if (!a) break;
+            run.steps++;
+            const id = P.num(a.payload.roleEquipId);
+            await this.execute(a);
+            if (a.type === 'EQUIP_ITEM' && P.array(this.bridge.state()?.equipments).some((e) => P.num(e.id) === id && e.isEquipped))
+              run.changed++;
+            await this.delay(ACTION_GAP_MS);
+          }
+        } finally {
+          this.profileRun = null;
+          this.finishProfileRun(run);
+          if (!this.enabled) this.releaseLease();
+          this.paint();
+        }
+      }
+      finishProfileRun(run) {
+        const g = this.gearProfile, s = this.bridge.state();
+        if (!g || !s) return;
+        this.updateProfile(s, Date.now());
+        // The loadout is what the profile now wears, so the next switch restores it.
+        g.loadouts[g.worn] = P.array(s.equipments).filter((e) => e.isEquipped && P.num(P.template(e).slotType) !== 12).map((e) => P.num(e.id));
+        g.done = { name: g.worn, changed: run.changed, at: Date.now() };
+        this.saveProfile();
+        this.log('已更换为' + P.longLabel(g.worn) + '（换装 ' + run.changed + ' 件）', 'success');
+      }
       profileFailure(a) {
         const g = this.gearProfile, id = a.payload.roleEquipId;
         if (!a.profileSwitch || !g?.pending.includes(id)) return;
@@ -8744,7 +8806,9 @@
         const scoring = (state, prefs) => ({ since: this.stats?.pressureFrom?.at ?? null, ...P.scoringStatus(state, prefs),
           pending: prefs.gear.scoring === 'combat' && !P.combatWeights(state, prefs), weights: P.combatWeights(state, prefs) });
         const status = { scoring: { mode: this.prefs.gear.scoring, aoeTargets: s?.aoeTargets, ...scoring(s, this.prefs) } };
-        const scores = { farm: { ...status.scoring } };
+        // The whole-body score under each profile, so the 装备方案 page shows the worn one changing with a switch.
+        const character = (state, prefs) => { const v = s && prefs.gear.scoring === 'combat' ? P.characterScore(state.finalAttributes, state, prefs) : null; return Number.isFinite(v) ? Math.round(v) : null; };
+        const scores = { farm: { ...status.scoring, character: character(s, this.prefs) } };
         status.scoring.profiles = scores;
         const profiles = P.PROFILE_IDS.map((id) => {
           const available = id === 'farm' || P.assaultAvailable(s, this.prefs, id);
@@ -8754,7 +8818,8 @@
             scores[id] = null;
             if (available) {
               const view = P.profileView(s, this.prefs, id);
-              scores[id] = { mode: view.prefs.gear.scoring, aoeTargets: view.state.aoeTargets, ...scoring(view.state, view.prefs) };
+              scores[id] = { mode: view.prefs.gear.scoring, aoeTargets: view.state.aoeTargets, ...scoring(view.state, view.prefs),
+                character: character(view.state, view.prefs) };
               if (id === 'tower') {
                 const floors = view.state.scoreTargets.floors;
                 Object.assign(scores[id], { floors, mapNames: floors.map((n) => '第 ' + n + ' 层'),
@@ -8773,7 +8838,7 @@
           gearProfile: { enabled: this.prefs.gear.enabled, profiles, mode, worn, pending: s ? P.array(this.gearProfile?.pending).length : 0,
             target: s ? P.gearProfileTarget({ ...s, gearProfile: this.gearProfile, gearCheck: this.gearCheck,
               activity: this.activity || this.arenaPending }, this.prefs, { rings }, Date.now()) : 'farm',
-            reason: mode === 'auto' ? '自动' : '手动' },
+            reason: mode === 'auto' ? '自动' : '手动', running: !!this.profileRun, done: this.gearProfile?.done || null },
           stats: this.stats ? { summary: this.stats.summary(), rates: this.stats.rates(), series: this.stats.series() } : null,
           smartMap: this.prefs.battle.smart && !this.prefs.battle.mapId ? this.smartDecision ?? null : null,
           potions: Object.fromEntries(['HP', 'MP'].map((attr) => {
@@ -9541,6 +9606,11 @@
             }
           }
           if (statsRole && this.prefs.battle?.smart && !this.prefs.battle.mapId) this.farmTarget(character, now);
+          this.paint();
+          return;
+        }
+        if (this.profileRun) {
+          this.reason = '切换装备方案中';
           this.paint();
           return;
         }
@@ -11075,6 +11145,9 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             const current = this.controller.prefs, profile = b.dataset.gearProfile;
             this.pending.gear.profile = profile;
             this.controller.updateConfig({ ...current, gear: { ...current.gear, profile } });
+            // The score pages follow the profile worn after the switch.
+            this.scoreProfile = null;
+            this.controller.switchProfile?.().catch((e) => this.controller.log?.('切换装备方案失败：' + e.message, 'warning'));
             this.requestBody();
             return;
           }
@@ -12907,8 +12980,12 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
       profileStatusHTML(status) {
         const g = status.gearProfile || {}, mode = g.mode || this.pending.gear.profile;
         const unavailable = (g.profiles || []).filter((profile) => !profile.available);
+        const score = status.scoring?.profiles?.[g.worn]?.character, done = g.done, pad = (n) => String(n).padStart(2, '0');
+        const at = done && new Date(done.at), when = at ? ' · ' + pad(at.getHours()) + ':' + pad(at.getMinutes()) : '';
         return this.statRow('当前穿戴', TLPolicy.longLabel(g.worn), { chip: this.chip(mode === 'auto' ? '自动' : '手动') +
-          (g.pending ? this.chip('切换中 ' + g.pending + ' 件') : '') }) +
+          (g.running ? this.chip('换装中') : g.pending ? this.chip('切换中 ' + g.pending + ' 件') : '') }) +
+          this.statRow('方案实战评分', score ?? '—', { help: '当前穿戴方案下的人物实战评分（全身装备的合计贡献），切换方案后跟着变' }) +
+          (done && !g.running ? this.statRow('切换结果', '已更换为' + TLPolicy.longLabel(done.name) + '（换装 ' + done.changed + ' 件）' + when) : '') +
           [...new Set(unavailable.map((profile) => profile.why))].map((why) => this.infoBar(why)).join('') +
           this.profileButtons('gear-profile', ['auto', ...TLPolicy.PROFILE_IDS], mode, (name) =>
             !(g.enabled ?? this.controller?.prefs?.gear.enabled ?? this.pending.gear.enabled) || (TLPolicy.ASSAULT_IDS.includes(name) &&
