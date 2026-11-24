@@ -1060,7 +1060,7 @@
         weaponId(array(state.equipments).filter((e) => !!e.isEquipped)),
         array(state.skills).map((s) => [s.currentLevel, s.skillDetail]),
         state.monsters.map((m) => [m.category, m.level, m.base, m.weight]), array(state.artifactSkills),
-        state.aoeTargets, state.survival?.weight, petOwnerBuffs(state), petShareOf(state),
+        state.aoeTargets, state.survival?.weight, petOwnerBuffs(state), petShareOf(state), state.channelTicks ?? null,
         prefs.gear.scoring, prefs.gear.autoDefense, prefs.gear.defenseWeight]);
       if (scoringPass?.state === state) scoringPass.contexts.set(gear, key);
       return key;
@@ -1074,11 +1074,27 @@
       const rules = parse(s.combatRules, {}) || {};
       return Math.max(1, Math.min(state.aoeTargets ?? 1, rules.maxTargets ?? 6));
     }
+    // Skills the client of 2026-11-24 channels: `ticks` ticks (every 2 s, 2 s and 1 s), each worth `rate` of the settled
+    // damage. The ticks replace the hits of skillDetail (1 × 100%, 1 × 100%, 3 × 40%), which add up to the same total.
+    // A channel stops when all its targets are dead, so on a farm map most ticks never land (歌's 金顶绵掌 on
+    // 2026-11-24: 2 ticks in 5 casts).
+    const CHANNEL_SKILLS = { 25: { name: '金顶绵掌', ticks: 6, rate: 1 / 6 }, 30: { name: '连珠腐尸毒', ticks: 4, rate: 0.25 },
+      35: { name: '三阳开泰', ticks: 3, rate: 0.4 } };
+    const CHANNEL_GUESS = 1;
+    // Ticks a cast lands: measured on farm maps, one until measured; the 三环 and 浮屠 enemies outlive a channel.
+    function channelTicks(s, state) {
+      const ch = CHANNEL_SKILLS[s?.id];
+      if (!ch) return null;
+      if (state.scoringProfile) return { ticks: ch.ticks, of: ch.ticks, source: 'profile' };
+      const measured = state.channelTicks?.[s.id];
+      return Number.isFinite(measured) ? { ticks: Math.max(0, Math.min(ch.ticks, measured)), of: ch.ticks, source: 'measured' }
+        : { ticks: CHANNEL_GUESS, of: ch.ticks, source: 'guess' };
+    }
     function castMultiplier(s, state) {
       if (!s) return 1;
-      const rules = parse(s.combatRules, {}) || {};
+      const rules = parse(s.combatRules, {}) || {}, channel = channelTicks(s, state);
       const area = s.effects.some((e) => e.target === 'ALL_ENEMY');
-      return Math.max(1, num(s.hitCount)) * (rules.hitDamageRate ?? 1) *
+      return (channel ? channel.ticks * CHANNEL_SKILLS[s.id].rate : Math.max(1, num(s.hitCount)) * (rules.hitDamageRate ?? 1)) *
         (area ? 1 + (skillTargets(s, state) - 1) * (rules.secondaryDamageRate ?? 1) : 1);
     }
     function enemyEffects(skills, state) {
@@ -1150,9 +1166,9 @@
             addStats(out, { [camel(e.attr)]: effectValue(e, s.level) });
         return out;
       };
-      const cast = (s, share) => ({ id: s?.id, name: s?.name, share,
-        bonus: s ? bonus(s) : {}, multiplier: castMultiplier(s, state),
-        hits: s ? Math.max(1, num(s.hitCount)) *
+      const cast = (s, share, channel = channelTicks(s, state)) => ({ id: s?.id, name: s?.name, share,
+        bonus: s ? bonus(s) : {}, multiplier: castMultiplier(s, state), ...(channel ? { channel } : {}),
+        hits: s ? (channel ? channel.ticks : Math.max(1, num(s.hitCount))) *
           (s.effects.some((e) => e.target === 'ALL_ENEMY') ? skillTargets(s, state) : 1) : 1 });
       for (const s of skills) {
         if (num(s.type) === 3) for (const e of s.effects) {
@@ -1340,6 +1356,8 @@
       if (!ctx) return null;
       return { value: combatValue(ctx.me, ctx), parts: combatParts(ctx.me, ctx), weight: ctx.defenseWeight,
         buffMult: ctx.buffMult, ...(ctx.pet.share > 0 || Object.keys(ctx.pet.buffs).length ? { pet: ctx.pet } : {}),
+        ...(ctx.casts.some((c) => c.channel)
+          ? { channels: ctx.casts.filter((c) => c.channel).map((c) => ({ name: c.name, ...c.channel })) } : {}),
         character: characterScore(state.finalAttributes, state, prefs),
         rows: SCORE_ATTRIBUTES.map(([key, name]) => ({ key, name, current: ctx.me[key],
           one: statScore({ [key]: 1 }, state, prefs), hundred: statScore({ [key]: 100 }, state, prefs) })) };
@@ -4477,6 +4495,7 @@
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, boundFilterMatch, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
+      CHANNEL_SKILLS, CHANNEL_GUESS, channelTicks,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
       tradeRules, tradeNeedsTarget, tradeTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText, tradeAssetNames,
@@ -4903,7 +4922,8 @@
       if (!held || now - held.at >= 60000 || held.mapId !== s.lastMapId ||
           (held.survival === null) !== (survival === null))
         bridge.scoringHold = { at: now, mapId: s.lastMapId, survival, aoeTargets: s.aoeTargets,
-          petShare: Number.isFinite(bridge.petShare?.(s.maps)) ? Math.round(bridge.petShare(s.maps) * 100) / 100 : null };
+          petShare: Number.isFinite(bridge.petShare?.(s.maps)) ? Math.round(bridge.petShare(s.maps) * 100) / 100 : null,
+          channelTicks: heldChannelTicks(bridge.channelTicks?.(s.maps)) };
       const profileStats = {};
       if (!untracked && prefs.gear.assault?.enabled && prefs.gear.scoring === 'combat') {
         for (const id of P.ASSAULT_IDS) profileStats[id] = { alive: bridge.cache.profileTargets?.[id]?.alive ?? 1 };
@@ -4920,7 +4940,13 @@
       return { ...(untracked ? {} : { profileStats }), aoeTargets: bridge.scoringHold.aoeTargets, monsters: selected.list, scoreTargets: { source: selected.source, mapIds: selected.mapIds },
         monsterTemplates: s.monsterTemplates, monsterTemplatesAt: bridge.cache.monsterTemplatesAt,
         survivalReason: !heal ? 'potions' : pressure?.battle < 1800000 ? 'data' : undefined,
-        survival: bridge.scoringHold.survival, petShare: bridge.scoringHold.petShare ?? null };
+        survival: bridge.scoringHold.survival, petShare: bridge.scoringHold.petShare ?? null,
+        channelTicks: bridge.scoringHold.channelTicks ?? null };
+    }
+    // Measured ticks per cast rounded to 0.1, so the score does not change with every cast.
+    function heldChannelTicks(value) {
+      const kept = Object.entries(value || {}).filter(([, v]) => Number.isFinite(v));
+      return kept.length ? Object.fromEntries(kept.map(([id, v]) => [id, Math.round(v * 10) / 10])) : null;
     }
     function farmTargets(targets, maps) {
       return P.farmMap(P.array(maps).find((map) => P.num(map.id) === P.num(targets?.mapId)))
@@ -4972,6 +4998,14 @@
     }
     const statsFields = 'wall battle exp expBase gold sell potion hpPotions mpPotions kills deaths hpLost mpUsed low'.split(' ');
     const statsTotals = () => Object.fromEntries(statsFields.map((k) => [k, 0]));
+    // Stored channel counts keep only known skills with whole [casts, ticks]. A cast that spans an hour counts in one
+    // bucket and may tick in the next, so a bucket may hold more ticks than its casts allow.
+    function savedChannels(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+      const kept = Object.entries(value).filter(([id, v]) => Object.hasOwn(P.CHANNEL_SKILLS, id) && Array.isArray(v) &&
+        v.length === 2 && v.every((n) => Number.isInteger(n) && n >= 0));
+      return kept.length ? Object.fromEntries(kept) : undefined;
+    }
     const statsNumber = P.statsNumber;
     const statsDuration = (ms) => {
       const m = Math.floor(ms / 60000);
@@ -5110,7 +5144,8 @@
             low: saved.version === 1 ? 0 : b.low ?? 0,
             potionHp: Number.isFinite(b.potionHp) && b.potionHp >= 0 ? b.potionHp : undefined,
             petDmg: Number.isFinite(b.petDmg) && b.petDmg >= 0 ? b.petDmg : undefined,
-            ownDmg: Number.isFinite(b.ownDmg) && b.ownDmg >= 0 ? b.ownDmg : undefined }]));
+            ownDmg: Number.isFinite(b.ownDmg) && b.ownDmg >= 0 ? b.ownDmg : undefined,
+            channel: savedChannels(b.channel) }]));
         const p = saved?.pressureFrom;
         if (p && Number.isFinite(p.at) && p.at >= 0 && p.hour === Math.floor(p.at / 3600000) &&
           p.base && typeof p.base === 'object' && !Array.isArray(p.base) &&
@@ -5234,6 +5269,7 @@
           this.deathState = { sessionId: d.sessionId, dead: !!dead };
         }
         if (dead) { this.previous = null; return; }
+        this.channels(d, b);
         const low = d.player?.base.hp > 0 && d.player.currentHp / d.player.base.hp < P.HP_LINE;
         if (d.stage === 'running' && low) this.lastLowHpAt = d.serverTime;
         const p = this.previous;
@@ -5277,6 +5313,44 @@
           if (battle >= 7200000) break;
         }
         return battle >= 600000 && pet + own > 0 ? pet / (pet + own) : null;
+      }
+      // Per bucket and channel skill: [casts, ticks]. A cast counts when its castId first shows in activeChannels.
+      // A tick counts from the log: 「你施展【金顶绵掌】(第1击)，对…」 has one line per target, and a tick that kills the
+      // last target leaves activeChannels empty in the same state (live on 2026-11-24).
+      channels(d, b) {
+        const count = (id, i) => { ((b.channel ||= {})[id] ||= [0, 0])[i]++; };
+        const seen = new Set(), ticks = new Set();
+        for (const c of d.stage === 'running' ? P.array(d.activeChannels) : []) {
+          if (!P.CHANNEL_SKILLS[c?.skillId] || c.sourceId !== 'player' || typeof c.castId !== 'string') continue;
+          if (!this.channelCasts?.has(c.castId)) count(c.skillId, 0);
+          seen.add(c.castId);
+        }
+        for (const line of P.array(d.logs)) {
+          const m = typeof line?.text === 'string' && /你施展【([^】]+)】\(第(\d+)击\)/.exec(line.text);
+          const id = m && Object.keys(P.CHANNEL_SKILLS).find((k) => P.CHANNEL_SKILLS[k].name === m[1]);
+          if (id) ticks.add(id + ':' + m[2]);
+        }
+        for (const key of ticks) count(key.split(':')[0], 1);
+        this.channelCasts = seen;
+      }
+      // Average ticks per cast over the latest two battle hours of farm maps, for skills cast at least 20 times there.
+      channelTicks(isFarmMap) {
+        const byHour = Map.groupBy(Object.entries(this.buckets), ([key]) => Number(key.split(':')[0]));
+        const totals = {};
+        let battle = 0;
+        for (const hour of Array.from(byHour.keys()).sort((a, b) => b - a)) {
+          for (const [key, bucket] of byHour.get(hour)) {
+            if (!isFarmMap(Number(key.split(':')[1]))) continue;
+            battle += bucket.battle;
+            for (const [id, [casts, ticks]] of Object.entries(bucket.channel || {})) {
+              const t = totals[id] ||= [0, 0];
+              t[0] += casts; t[1] += ticks;
+            }
+          }
+          if (battle >= 7200000) break;
+        }
+        return Object.fromEntries(Object.entries(totals).filter(([, [casts]]) => casts >= 20)
+          .map(([id, [casts, ticks]]) => [id, ticks / casts]));
       }
       trim() {
         const end = Math.max(this.now(), this.window.at(-1)?.time || 0);
@@ -7784,6 +7858,7 @@
         this.bridge.profilePressure = (name) => this.stats?.pressure((id) => P.mapProfile(id) === name);
         this.bridge.pressure = (maps) => this.stats?.pressure((id) => P.farmMap(P.array(maps).find((m) => P.num(m.id) === id)));
         this.bridge.petShare = (maps) => this.stats?.petShare((id) => P.farmMap(P.array(maps).find((m) => P.num(m.id) === id)));
+        this.bridge.channelTicks = (maps) => this.stats?.channelTicks((id) => P.farmMap(P.array(maps).find((m) => P.num(m.id) === id)));
         window.addEventListener('pagehide', () => {
           if (storageBlocked) return;
           this.stats?.flush();
@@ -12900,6 +12975,11 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           html += this.statRow('珍兽加成', petBuffs.length ? petBuffs.map(([key, value]) => (names[key] || key) + ' +' + value).join('、') : '—') +
             this.statRow('珍兽伤害占比', detail.pet?.share > 0 ? (detail.pet.share * 100).toFixed(0) + '%' : '—', {
               help: '按服务器标记实测最近两个战斗小时；珍兽的伤害不随换装变化，评分把它当作固定输出' });
+          const sources = { measured: '实测', guess: '未测满 20 次，按 1 段', profile: '攻坚按全部打出' };
+          if (detail.channels?.length)
+            html += this.statRow('引导技能', detail.channels.map((c) => c.name + ' 每次 ' + Number(c.ticks.toFixed(1)) + '/' + c.of +
+              ' 段（' + sources[c.source] + '）').join('、'), {
+              help: '金顶绵掌等技能改为持续引导：每隔一段时间结算一段，目标全死就中断。挂机图按最近两个战斗小时实测每次打出的段数；三环、浮屠的敌人耐打，按全部打出计算' });
           if (detail.parts.artifact)
             html += this.statRow('神器技能', detail.parts.artifact.skillName) +
               this.statRow('覆盖率', (detail.parts.artifact.uptime * 100).toFixed(1) + '%');
