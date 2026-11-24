@@ -458,6 +458,7 @@
         price: tradeInt(rule.price, 1, TRADE_MAX_PRICE),
         unitPrice: unit <= 0 ? 1 : Math.max(0.01, Number(unit.toFixed(2))),
         targetId: tradePositiveId(rule.targetId) ? String(rule.targetId).trim().replace(/^0+/, '') : '',
+        targetName: typeof rule.targetName === 'string' ? rule.targetName.trim() : '',
         keep: tradeInt(rule.keep, 0) };
     }
     function tradeRuleList(value, kind) {
@@ -2329,14 +2330,18 @@
     const tradeBuyMatches = (rule, entry) => !rule.item || (tradeCategoryKey(rule.item)
       ? rule.item === tradeCategory(entry.template) : tradeNameMatches(rule.item, entry));
     const tradeNeedsTarget = item => !item || tradeCategoryKey(item);
+    // The buyer a sell rule names: a full player name (client of 2026-11-24) or a role ID.
+    const tradeTarget = rule => rule.targetName || rule.targetId;
     const tradePriceError = '每单价格不能超过 20 亿';
     // Integer hundredths avoid rounding an exact whole-lot price up by one.
     const tradeLotPrice = (rule, count) => rule.priceMode === 'unit'
       ? Math.max(1, Math.ceil(Math.round(rule.unitPrice * 100) * count / 100)) : rule.price;
     function tradeSellReason(rule, role) {
       if (!rule.item) return '请选择可上架的物品';
-      if (tradeCategoryKey(rule.item) && !rule.targetId) return '大类仅用于指定角色ID的转移';
+      if (rule.targetId && rule.targetName) return '角色ID和玩家名称只填一个';
+      if (tradeCategoryKey(rule.item) && !tradeTarget(rule)) return '大类仅用于指定角色ID或玩家名称的转移';
       if (rule.targetId && num(rule.targetId) === num(role?.id)) return '不能指定自己的角色ID';
+      if (rule.targetName && rule.targetName === String(role?.nickname ?? '').trim()) return '不能指定自己的玩家名称';
       if (tradeLotPrice(rule, rule.maxMode ? rule.minCount : rule.count) > TRADE_MAX_PRICE) return tradePriceError;
       return '';
     }
@@ -3042,11 +3047,12 @@
       if (!tradeSellMatches(rule, item)) return null;
       const count = tradeLotCount(rule, item, stored), price = tradeLotPrice(rule, count);
       if (!count || price > TRADE_MAX_PRICE) return null;
-      const { currency, targetId } = rule;
+      const { currency, targetId, targetName } = rule, target = tradeTarget(rule);
       const label = '上架「' + (item.name || item.id) + '」×' + count + '（' + price + ' ' + tradeCurrency(currency) +
-        '，单价 ' + tradeUnitText(price, count) + '）' + (targetId ? '，指定 ' + targetId : '');
+        '，单价 ' + tradeUnitText(price, count) + '）' + (target ? '，指定 ' + target : '');
+      // Only one target field is sent: the server accepts either, and how it treats both is unknown.
       const a = tradeRequest('create', { mode: 'SALE', assets: [{ kind: 'BAG', id: String(item.largest.id), count }],
-        price, currency, targetId: targetId || null, note: '' }, label);
+        price, currency, ...targetName ? { targetNickname: targetName } : { targetId: targetId || null }, note: '' }, label);
       a.key = 'MARKET_COMMAND:create:' + JSON.stringify([rule.id, item.id]);
       return a;
     }
@@ -4473,7 +4479,7 @@
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
-      tradeRules, tradeNeedsTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText, tradeAssetNames,
+      tradeRules, tradeNeedsTarget, tradeTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText, tradeAssetNames,
       tradeOwnReads, tradeReads, tradePlans, tradeSells, tradeLotPrice, tradeBalance, tradeFunds, tradeProgress, tradeBought, tradeDone,
       transferFile, configChanges, transferKey, transferRoleKey, transferSettings, transferSummary,
       transferKind, transferKeyRole, transferMerge, transferMergeData,
@@ -10471,7 +10477,7 @@
       sellAppraised: "不勾选时，资质不是外攻、内攻双完美（都高于 1500）的已鉴定武器按其余规则出售；品质上限、强化、套装等保护照常生效。",
       sell: "穿戴、强化、镶宝和星级装备始终保留。材料仅按填写的模板ID处理。",
       trade: '查询商会（搜索商品、看自己的交易和可上架物品）不用停止战斗，也不用打开商会窗口。上架、购买、领取、下架要先停止战斗：只在城里或普通野外挂机图上短暂停一下，办完继续打；珍珑棋局、熊林、伪宋军领地、无相浮屠、新三环、宵小入侵和比武时不交易，结束后再办。只在托管运行时工作。卖出的钱和买到的物品自动领取。',
-      tradeSell: '只上架未绑定的道具和材料，每单只用背包里的一组。关闭最大个数时，攒够一单才上架；开启后，扣掉保留数量，达到每单最少个数才上架，最多卖到每单最大个数。从仓库取出时也要够每单最少个数。按物品单价时，整单价向上取整。大类（宝石、棉布、秘银、残页、技能书）只能指定角色ID，用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
+      tradeSell: '只上架未绑定的道具和材料，每单只用背包里的一组。关闭最大个数时，攒够一单才上架；开启后，扣掉保留数量，达到每单最少个数才上架，最多卖到每单最大个数。从仓库取出时也要够每单最少个数。按物品单价时，整单价向上取整。大类（宝石、棉布、秘银、残页、技能书）必须指定角色ID或玩家名称（二选一，名称要填完整），用于大小号之间转移资源。72 小时没卖掉的自动下架、领回后重新上架。商会收税：金币 5%，元宝 1%，由卖家付。',
       tradeWarehouse: '商会只能上架背包里的物品；开启后，仓库里符合上架规则的未绑定物品会自动取出到背包再上架（战斗中取出，不用停战）',
       tradeBuy: '只买一口价的道具和材料（不买装备、珍兽、以物易物）。按物品名完全一致匹配，单价 = 整单价 ÷ 数量。买的人只能买下整单。物品留空或选大类时，只买别人指定卖给你的商品。为防止高频扫货，采购最快 5 分钟查一次商会（查询间隔更长时按查询间隔）。',
       warehouse: "装备存仓只处理未穿戴的装备；可穿戴的更优装备会先穿戴。仓库装备格满 200 时暂停存装备。符合存仓条件的装备不会被自动出售。",
@@ -12284,7 +12290,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           field('计价方式', 'priceMode', { choices: [['lot', '每单价格'], ['unit', '物品单价']] }) +
           '<div class="trade-price">' + this.tradeSellPriceHTML(rule) + '</div>' +
           '<div class="trade-preview">' + this.tradeSellPreview(rule) + '</div>' +
-          field('指定角色ID', 'targetId', { text: true, placeholder: '可空；大类必填' }) +
+          field('指定角色ID', 'targetId', { text: true, placeholder: '可空；与名称二选一' }) +
+          field('指定玩家名称', 'targetName', { text: true, placeholder: '可空；填完整名称' }) +
           field(this.tradeKeepLabel(), 'keep', { min: 0 });
       }
       tradeMinHTML(rule) {
@@ -12347,7 +12354,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           : rule.item || '指定给我的商品');
         const summary = sell
           ? this.tradeSellQuantity(rule) + ' · ' + (rule.priceMode === 'unit' ? '单价 ' + rule.unitPrice : rule.price) +
-            ' ' + currency + (rule.targetId ? ' · 指定 ' + rule.targetId : '')
+            ' ' + currency + (TLPolicy.tradeTarget(rule) ? ' · 指定 ' + TLPolicy.tradeTarget(rule) : '')
           : '单价≤' + rule.maxUnit + ' ' + currency + ' · ' + (rule.mode === 'count'
             ? '已买 ' + TLPolicy.tradeBought(rule, progress) + '/' + rule.count : '持续');
         return '<span class="trade-rule-heading"><span class="trade-rule-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
