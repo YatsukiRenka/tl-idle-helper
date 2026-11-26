@@ -700,10 +700,12 @@
               if (p.sell.keepBestBackup && !reserve.has(num(e.id)))
                 reserve.set(num(e.id), '该部位' + (name === 'farm' ? '' : profileLabel(name)) + '最佳备用');
               if (name === (s.gearProfile?.worn || 'farm') || reserve.has(num(e.id))) continue;
-              const baseline = owned.find((v) => num(template(v).slotType) === slot &&
-                array(s.gearProfile?.loadouts?.[name]).includes(num(v.id))) ||
-                owned.find((v) => v.isEquipped && num(template(v).slotType) === slot);
-              if (value > (baseline ? score(baseline) : 0)) reserve.set(num(e.id), longLabel(name) + '更优');
+              // Better than the weakest of a full ring or amulet pair, or than nothing in a free slot.
+              const listed = owned.filter((v) => num(template(v).slotType) === slot &&
+                array(s.gearProfile?.loadouts?.[name]).includes(num(v.id)));
+              const baseline = listed.length ? listed : owned.filter((v) => v.isEquipped && num(template(v).slotType) === slot);
+              const floor = baseline.length < slotCapacity(slot) ? 0 : Math.min(...baseline.map(score));
+              if (value > floor) reserve.set(num(e.id), longLabel(name) + '更优');
             }
           });
         }
@@ -881,16 +883,43 @@
       const key = wornSignature(state) + ':' + scoringKey([equipmentInputs(eq, state), weights]);
       return scoreMemo(ctx, 'equipment', key, () => {
         if (!ctx.weights) return fallback();
-        const worn = wornBaseline(state, ctx), slot = num(template(eq).slotType);
-        const rest = worn.items.filter((e) => num(template(e).slotType) !== slot);
-        if (!worn.slots.has(slot)) {
-          worn.slots.set(slot, { value: combatValue(equipmentValues(rest, state, ctx), ctx) });
+        // The score is against the gear without the item it would take the place of (none for a free slot).
+        const worn = wornBaseline(state, ctx);
+        let best = null;
+        for (const { rest } of gearOptions(eq, worn.items)) {
+          const out = num(worn.items.find((e) => !rest.includes(e))?.id);
+          if (!worn.bases.has(out)) worn.bases.set(out, { value: combatValue(equipmentValues(rest, state, ctx), ctx) });
+          const after = combatValue(equipmentValues(rest.concat(eq), state, ctx), ctx);
+          if (!best || after > best.after) best = { base: worn.bases.get(out), after };
         }
-        const base = worn.slots.get(slot);
-        const after = combatValue(equipmentValues(rest.concat(eq), state, ctx), ctx);
-        return positiveValue(base.value) && positiveValue(after) ?
-          SCORE_UNIT * Math.log(after / base.value) : fallback() * SCORE_UNIT / ctx.scale;
+        return positiveValue(best.base.value) && positiveValue(best.after) ?
+          SCORE_UNIT * Math.log(best.after / best.base.value) : fallback() * SCORE_UNIT / ctx.scale;
       });
+    }
+    // Rings (7) and amulets (8) have two worn slots since the client of 2026-11-26.
+    const SLOT_CAPACITY = { 7: 2, 8: 2 };
+    function slotCapacity(slot) {
+      return SLOT_CAPACITY[num(slot)] || 1;
+    }
+    function wornOfSlot(equipments, slot) {
+      return array(equipments).filter((e) => e.isEquipped && num(template(e).slotType) === num(slot));
+    }
+    // The worn gear a candidate can join: a free slot of its type, else the place of each worn item of that type.
+    function gearOptions(candidate, worn) {
+      const slot = num(template(candidate).slotType), id = num(candidate?.id);
+      const others = worn.filter((e) => !(id && num(e.id) === id));
+      const same = others.filter((e) => num(template(e).slotType) === slot);
+      if (same.length < slotCapacity(slot)) return [{ replaced: null, rest: others }];
+      // A one-slot type replaces everything worn of its type, as before.
+      if (slotCapacity(slot) === 1) return [{ replaced: same[0], rest: others.filter((v) => !same.includes(v)) }];
+      return same.map((e) => ({ replaced: e, rest: others.filter((v) => v !== e) }));
+    }
+    // EQUIP_ITEM leaves the slot to the server, so a full two-slot type has the outgoing item taken off first.
+    function takeOffFirst(s, candidate, outgoingId) {
+      const slot = num(template(candidate).slotType);
+      if (slotCapacity(slot) < 2 || wornOfSlot(s.equipments, slot).length < slotCapacity(slot)) return {};
+      const out = wornOfSlot(s.equipments, slot).find((e) => num(e.id) === num(outgoingId));
+      return out ? { unequipFirst: num(out.id), unequipName: template(out).name || String(out.id) } : {};
     }
     const positiveValue = (value) => Number.isFinite(value) && value > 0;
     function gemScoreOrder(state, prefs, tie = () => 0, gems = array(state.bagItems).filter((b) => b.itemTmpl)) {
@@ -930,7 +959,7 @@
         return ctx.worn;
       }
       ctx.worn = { key, items, stats: sumEquipment(items, state),
-        sets: setEffects(items, state), jade: bloodJadeSet(items), slots: new Map() };
+        sets: setEffects(items, state), jade: bloodJadeSet(items), bases: new Map() };
       return ctx.worn;
     }
     function equipmentValues(items, state, ctx) {
@@ -1397,36 +1426,48 @@
       return withScoringPass(state, () => projectedGainFrom(candidate, state, prefs));
     }
     function projectedGainFrom(candidate, state, prefs) {
-      const equipped = array(state.equipments).filter((e) => !!e.isEquipped),
-        slot = num(template(candidate).slotType);
-      const next = equipped.filter((e) => num(template(e).slotType) !== slot).concat(candidate);
+      const equipped = array(state.equipments).filter((e) => !!e.isEquipped);
+      // A ring or amulet takes the place that leaves the best gear; replaceId names the item it takes off.
+      const options = gearOptions(candidate, equipped)
+        .map(({ replaced, rest }) => ({ replaceId: replaced ? num(replaced.id) : null, next: rest.concat(candidate) }));
       if (prefs.gear.scoring === 'combat') {
         const ctx = combatContext(state, prefs);
         if (!ctx) return { current: 0, after: 0, gain: 0, percent: 0, pending: true };
         const key = wornSignature(state) + ':' + scoringKey(equipmentInputs(candidate, state));
         return { ...scoreMemo(ctx, 'gain', key, () => {
-          const values = equipmentValues(next, state, ctx);
           if (!ctx.gainBaseline) {
             const parts = combatParts(ctx.me, ctx);
             ctx.gainBaseline = { parts, value: combatPartsValue(parts, ctx) };
           }
-          const beforeParts = ctx.gainBaseline.parts, afterParts = combatParts(values, ctx);
-          const current = ctx.gainBaseline.value, after = combatPartsValue(afterParts, ctx);
+          let best = null;
+          for (const { replaceId, next } of options) {
+            const parts = combatParts(equipmentValues(next, state, ctx), ctx), value = combatPartsValue(parts, ctx);
+            if (!best || value > best.value) best = { replaceId, parts, value };
+          }
+          const beforeParts = ctx.gainBaseline.parts, afterParts = best.parts;
+          const current = ctx.gainBaseline.value, after = best.value;
           const percent = (a, b) => a > 0 ? (b - a) / a * 100 : b > 0 ? 100 : 0;
           const survival = (p) => p.taken > 0 ? p.hp / p.taken : 0;
           return { current, after, gain: after - current, percent: percent(current, after),
             outputPercent: percent(beforeParts.out + ctx.pet.out, afterParts.out + ctx.pet.out),
             survivalPercent: percent(survival(beforeParts), survival(afterParts)),
+            ...(options.length > 1 ? { replaceId: best.replaceId } : {}),
           };
         }) };
       }
-      const current = setScore(equipped, state, prefs),
-        after = setScore(next, state, prefs);
+      const current = setScore(equipped, state, prefs);
+      let best = null;
+      for (const { replaceId, next } of options) {
+        const value = setScore(next, state, prefs);
+        if (!best || value > best.value) best = { replaceId, value };
+      }
+      const after = best.value;
       return {
         current,
         after,
         gain: after - current,
         percent: current > 0 ? ((after - current) / current) * 100 : after > 0 ? 100 : 0,
+        ...(options.length > 1 ? { replaceId: best.replaceId } : {}),
       };
     }
     const countItem = (s, id) =>
@@ -2182,9 +2223,11 @@
     }
     const gearCheckCounts = (bucket) => Object.fromEntries(['battle', 'kills', 'deaths']
       .map((key) => [key, Math.max(0, num(bucket?.[key]))]));
-    const gearCheckWorn = (s, slot) => array(s.equipments)
-      .filter((e) => e.isEquipped && num(template(e).slotType) !== slot)
+    // The rest of the worn gear: with two ring or amulet slots, the item's partner belongs to it.
+    const gearCheckWorn = (s, itemId) => array(s.equipments)
+      .filter((e) => e.isEquipped && num(e.id) !== num(itemId))
       .map((e) => num(e.id)).sort((a, b) => a - b);
+    const wornId = (s, id) => array(s.equipments).some((e) => e.isEquipped && num(e.id) === num(id));
     function gearCheckTotals(buckets, mapId, firstHour, lastHour, base = {}) {
       const total = gearCheckCounts();
       for (const [key, bucket] of Object.entries(buckets || {})) {
@@ -2202,18 +2245,18 @@
       const item = array(before.equipments).find((e) => num(e.id) === num(a.payload.roleEquipId));
       if (!item || item.isEquipped || !array(s.equipments).some((e) => num(e.id) === num(item.id) && e.isEquipped)) return null;
       const slot = num(template(item).slotType), mapId = num(s.role.mapId), hour = Math.floor(now / 3600000),
-        old = array(before.equipments).find((e) => e.isEquipped && num(template(e).slotType) === slot),
+        old = wornOfSlot(before.equipments, slot).find((e) => !wornId(s, e.id)),
         key = hour + ':' + mapId;
       return { itemId: num(item.id), itemName: template(item).name || String(item.id),
         oldItemId: old ? num(old.id) : null, oldName: old ? template(old).name || String(old.id) : '',
-        slot, mapId, startedAt: now, level: num(s.role.level), worn: gearCheckWorn(s, slot),
+        slot, mapId, startedAt: now, level: num(s.role.level), worn: gearCheckWorn(s, item.id),
         before: gearCheckTotals(buckets, mapId, hour - 2, hour),
         base: { [key]: gearCheckCounts(buckets?.[key]) } };
     }
     function gearCheckAfter(check, buckets, s) {
       return { ...gearCheckTotals(buckets, check.mapId, Math.floor(check.startedAt / 3600000), Infinity, check.base),
-        ...(s ? { level: num(s.role.level), worn: gearCheckWorn(s, check.slot),
-          itemId: num(array(s.equipments).find((e) => e.isEquipped && num(template(e).slotType) === check.slot)?.id) } : {}) };
+        ...(s ? { level: num(s.role.level), worn: gearCheckWorn(s, check.itemId),
+          itemId: wornId(s, check.itemId) ? check.itemId : 0 } : {}) };
     }
     function gearCheckVerdict(check, after, prefs, now) {
       const gear = config(prefs).gear, before = check.before,
@@ -2237,16 +2280,18 @@
       return { ...result, state: (change !== null && change <= -gear.fieldDropPercent && z <= -2) || deathWorse ? 'worse' : 'ok' };
     }
     function gearCheckRestored(check, s) {
-      const worn = array(s.equipments).find((e) => e.isEquipped && num(template(e).slotType) === check.slot);
-      return check.oldItemId !== null ? num(worn?.id) === check.oldItemId :
-        !worn && array(s.equipments).some((e) => num(e.id) === check.itemId && !e.isEquipped);
+      if (wornId(s, check.itemId)) return false;
+      return check.oldItemId !== null ? wornId(s, check.oldItemId) :
+        array(s.equipments).some((e) => num(e.id) === check.itemId) &&
+        wornOfSlot(s.equipments, check.slot).length < slotCapacity(check.slot);
     }
     function gearCheckRollback(check, s) {
       if (!array(s.equipments).some((e) => e.isEquipped && num(e.id) === check.itemId)) return null;
       if (check.oldItemId !== null && !array(s.equipments).some((e) => !e.isEquipped && num(e.id) === check.oldItemId)) return null;
+      const off = check.oldItemId !== null ? takeOffFirst(s, { equipTmpl: { slotType: check.slot } }, check.itemId) : {};
       return action('EQUIP_ITEM', { roleEquipId: check.oldItemId ?? check.itemId },
         check.oldItemId !== null ? '实测变差，换回「' + check.oldName + '」' : '实测变差，脱下「' + check.itemName + '」',
-        'gear', { inBattle: true, gearSwapBack: true });
+        'gear', { inBattle: true, gearSwapBack: true, ...off });
     }
     function gearRejected(entries, now) {
       const seen = new Set();
@@ -3753,9 +3798,14 @@
           warehouse = p.gear.fromWarehouse && array(s.warehouseEquips).find((e) => num(e.id) === id), eq = bag || warehouse;
         if (profileWearable(eq, s, p) && !eq.isEquipped) {
           gearChosenId = id;
+          // A full ring or amulet pair gives up an item the profile does not list.
+          const loadout = array(s.gearProfile.loadouts?.[s.gearProfile.worn]).map(num),
+            outgoing = wornOfSlot(s.equipments, template(eq).slotType).find((e) => !loadout.includes(num(e.id))),
+            off = bag ? takeOffFirst(s, eq, outgoing?.id) : {};
           add(action(bag ? 'EQUIP_ITEM' : 'WAREHOUSE_WITHDRAW', { roleEquipId: id },
-            longLabel(s.gearProfile.worn) + '：' + (bag ? '穿戴' : '取出') + '「' + template(eq).name + '」',
-            'gear', { inBattle: true, profileSwitch: s.gearProfile.worn }));
+            longLabel(s.gearProfile.worn) + '：' + (bag ? '穿戴' : '取出') + '「' + template(eq).name + '」' +
+              (off.unequipName ? '（换下「' + off.unequipName + '」）' : ''),
+            'gear', { inBattle: true, profileSwitch: s.gearProfile.worn, ...off }));
         }
       // A manual profile switch (profileRun) picks by the profile's score even during a field check, which it ends.
       } else if (p.gear.enabled && (!s.gearCheck || s.profileRun) && !profileLocked(s)) {
@@ -3790,13 +3840,15 @@
           );
         } else if (candidates[0]) {
           gearChosenId = num(candidates[0].eq.id);
+          const off = takeOffFirst(s, candidates[0].eq, candidates[0].gain.replaceId);
           add(
             action(
               'EQUIP_ITEM',
               { roleEquipId: num(candidates[0].eq.id) },
-              runLabel + '穿戴「' + template(candidates[0].eq).name + '」',
+              runLabel + '穿戴「' + template(candidates[0].eq).name + '」' +
+                (off.unequipName ? '（换下「' + off.unequipName + '」）' : ''),
               'gear',
-              { gain: candidates[0].gain.gain, inBattle: true, ...runFlag },
+              { gain: candidates[0].gain.gain, inBattle: true, ...runFlag, ...off },
             ),
           );
         }
@@ -4527,7 +4579,7 @@
       scoreStats,
       equipmentScore, equipmentValues, characterScore, SCORE_UNIT, CRIT_CHANCE_OFFSET, scoringDetail, SCORE_ATTRIBUTES,
       artifactUptime, artifactEffects, artifactAdvice, gearAdvice, PET_LEVEL_HELP,
-      projectedGain,
+      projectedGain, slotCapacity, gearOptions, takeOffFirst, action,
       countItem,
       bagItem,
       byFunction,
@@ -8144,6 +8196,24 @@
         this.saveProfile();
         this.log('已更换为' + P.longLabel(g.worn) + '（换装 ' + run.changed + ' 件）', 'success');
       }
+      // EQUIP_ITEM on a worn item takes it off (live 2026-11-26), so the equip that follows fills exactly that slot.
+      async takeOff(a) {
+        const id = P.num(a.unequipFirst);
+        let message = '';
+        try {
+          const result = await this.bridge.request(P.action('EQUIP_ITEM', { roleEquipId: id },
+            '换下「' + a.unequipName + '」', 'gear', { inBattle: true }), this.responseTimeout());
+          if (!(result.success ?? result.code === 200)) message = result.message || '操作未成功';
+        } catch (e) {
+          if (e.code !== 'SERVER_ERROR') throw e;
+          message = safeMessage(e.serverMessage || e.message);
+        }
+        if (!message && !P.array(this.bridge.state()?.equipments).some((e) => P.num(e.id) === id && e.isEquipped)) return true;
+        this.log(a.label + '：未能先换下「' + a.unequipName + '」' + (message ? '：' + message : ''), 'warning');
+        if (a.profileSwitch) this.profileFailure(a);
+        else this.suppress(a, 300000);
+        return false;
+      }
       profileFailure(a) {
         const g = this.gearProfile, id = a.payload.roleEquipId;
         if (!a.profileSwitch || !g?.pending.includes(id)) return;
@@ -9241,6 +9311,7 @@
             this.ringsPotionAt = Date.now();
             this.ringsPotionLast = { attr: a.potionAttr, field, value: this.bridge.ringsCombatState?.[field], pending: true };
           }
+          if (a.unequipFirst && !(await this.takeOff(a))) return;
           const result = await this.bridge.request(a, this.responseTimeout());
           if (trade) { await this.tradeResult(a, before, result, buyFunds); return; }
           if (a.warehouseMove) {
