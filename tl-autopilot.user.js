@@ -1088,7 +1088,7 @@
       // Filler and artifact records retain metadata as well as the fields used in damage formulas.
       const key = scoringKey([state.scoringProfile, STAT_KEYS.map((k) => num(state.finalAttributes[k])), num(state.role?.level),
         weaponId(array(state.equipments).filter((e) => !!e.isEquipped)),
-        array(state.skills).map((s) => [s.currentLevel, s.skillDetail]),
+        array(state.skills).map((s) => [s.currentLevel, s.skillDetail]), heartSkills(state),
         state.monsters.map((m) => [m.category, m.level, m.base, m.weight]), array(state.artifactSkills),
         state.aoeTargets, state.survival?.weight, petOwnerBuffs(state), petShareOf(state), state.channelTicks ?? null,
         prefs.gear.scoring, prefs.gear.autoDefense, prefs.gear.defenseWeight]);
@@ -1112,20 +1112,60 @@
       35: { name: '三阳开泰', ticks: 3, rate: 0.4 } };
     const CHANNEL_GUESS = 1;
     // Ticks a cast lands: measured on farm maps, one until measured; the 三环 and 浮屠 enemies outlive a channel.
+    // A 心法 skill is measured under its own id or under the old id its channel still reports.
     function channelTicks(s, state) {
-      const ch = CHANNEL_SKILLS[s?.id];
-      if (!ch) return null;
-      if (state.scoringProfile) return { ticks: ch.ticks, of: ch.ticks, source: 'profile' };
-      const measured = state.channelTicks?.[s.id];
-      return Number.isFinite(measured) ? { ticks: Math.max(0, Math.min(ch.ticks, measured)), of: ch.ticks, source: 'measured' }
-        : { ticks: CHANNEL_GUESS, of: ch.ticks, source: 'guess' };
+      const of = s?.channelOf ?? CHANNEL_SKILLS[s?.id]?.ticks;
+      if (!of) return null;
+      if (state.scoringProfile) return { ticks: of, of, source: 'profile' };
+      const measured = [s.id, s.legacy].map((id) => state.channelTicks?.[id]).find(Number.isFinite);
+      return Number.isFinite(measured) ? { ticks: Math.max(0, Math.min(of, measured)), of, source: 'measured' }
+        : { ticks: CHANNEL_GUESS, of, source: 'guess' };
     }
+    const isArea = (s) => s.coefficient != null ? !!s.area : s.effects.some((e) => e.target === 'ALL_ENEMY');
     function castMultiplier(s, state) {
       if (!s) return 1;
       const rules = parse(s.combatRules, {}) || {}, channel = channelTicks(s, state);
-      const area = s.effects.some((e) => e.target === 'ALL_ENEMY');
-      return (channel ? channel.ticks * CHANNEL_SKILLS[s.id].rate : Math.max(1, num(s.hitCount)) * (rules.hitDamageRate ?? 1)) *
-        (area ? 1 + (skillTargets(s, state) - 1) * (rules.secondaryDamageRate ?? 1) : 1);
+      const area = isArea(s) ? 1 + (skillTargets(s, state) - 1) * (rules.secondaryDamageRate ?? 1) : 1;
+      if (s.coefficient != null) return s.coefficient * (channel ? channel.ticks / channel.of : 1) * area;
+      return (channel ? channel.ticks * CHANNEL_SKILLS[s.id].rate : Math.max(1, num(s.hitCount)) * (rules.hitDamageRate ?? 1)) * area;
+    }
+    // The 心法 skills of the client of 2026-11-28 (store `characterSkills`). A hit of such a skill is the old hit formula
+    // times the skill's total coefficient `damage[0]` (spread evenly over a channel's ticks; `secondary` on each further
+    // target), with no flat attack bonus, and the sect's element rates (`rates`, %) replace the old stance's PASSIVE_DMG.
+    // Fitted on recorded hits of roles 588, 587 and 184 on 2026-11-28: main and element parts agree to 0.01% up to one
+    // factor per role (1.07, 0.845, 1.54) and 7–10% more for skills than for the basic attack. Those factors scale all
+    // damage alike, so they do not change a gear comparison and are left out. Only skills that deal damage take part;
+    // a rage skill only when it is the chosen one. The old type 3 skill still carries the sect's PASSIVE_STAT (the
+    // combat state's 门派属性 has the same ones), and the chosen stance's 「提升X」 effects act like a buff.
+    const HEART_STATS = { 外攻: 'EXT_ATK', 内攻: 'INT_ATK', 外防: 'EXT_DEF', 内防: 'INT_DEF', 冰攻: 'ICE_ATK', 火攻: 'FIRE_ATK',
+      毒攻: 'POISON_ATK', 玄攻: 'HOLY_ATK', 最大气血: 'HP', 会心: 'CRIT_RATE', 命中: 'PRECISION', 闪避: 'AVOIDANCE' };
+    const HEART_ELEMENTS = ['ICE', 'FIRE', 'POISON', 'HOLY'];
+    function heartSkills(state) {
+      const book = state?.characterSkills;
+      if (!book || !Array.isArray(book.skills)) return null;
+      const heartLevel = (d) => num(array(book.hearts).find((h) => num(h?.definition?.id) === num(d.heart))?.level);
+      const skills = [];
+      for (const entry of book.skills) {
+        const d = entry?.definition, coefficient = num(array(d?.damage)[0]);
+        if (!d || !entry.learned || !(coefficient > 0) || d.kind === '被动' || String(d.kind).endsWith('姿态') ||
+            (num(d.rage) > 0 && num(d.id) !== num(book.rageSkill))) continue;
+        const hits = Math.max(1, num(d.hits)), targets = Math.max(1, num(d.maxTargets));
+        skills.push({ id: num(d.id), legacy: num(d.legacy) || null, name: d.name, type: 1, cd: num(d.cooldown), level: heartLevel(d),
+          hitCount: hits, coefficient, area: targets > 1, combatRules: { maxTargets: targets, secondaryDamageRate: num(d.secondary) / coefficient },
+          ...(hits > 1 && num(d.interval) > 0 ? { channelOf: hits } : {}), effects: [] });
+      }
+      const passive = array(state.skills).filter((s) => num(s?.skillDetail?.type) === 3 && num(s.currentLevel) > 0 &&
+          num(s.skillDetail.unlockLevel) <= num(state.role?.level))
+        .flatMap((s) => array(parse(s.skillDetail.effectConfig, [])).filter((e) => e?.type === 'PASSIVE_STAT'));
+      array(book.rates).slice(0, 4).forEach((rate, i) => {
+        if (Number.isFinite(Number(rate))) passive.push({ type: 'PASSIVE_DMG', attr: HEART_ELEMENTS[i] + '_DMG', calc: 'MULTIPLY', base: num(rate) / 100 });
+      });
+      const stance = book.stance ? book.skills.find((e) => num(e?.definition?.id) === num(book.stance)) : null;
+      const buffs = array(stance?.learned ? stance.definition.effects : []).flatMap((e) => {
+        const attr = HEART_STATS[/^提升(?:基础)?(.+)$/.exec(e?.kind)?.[1]], value = Number(e?.value);
+        return attr && Number.isFinite(value) && String(e.unit).startsWith('%') ? [{ attr, value: value / 100 }] : [];
+      });
+      return { skills, passive, buffs };
     }
     function enemyEffects(skills, state) {
       const defenseMult = {};
@@ -1177,7 +1217,9 @@
         [k, num(state.finalAttributes[k])]));
       me.level = num(state.role?.level);
       me.weaponId = weaponId(array(state.equipments).filter((e) => !!e.isEquipped));
-      const skills = array(state.skills).filter((s) => num(s.currentLevel) > 0 &&
+      const hearts = heartSkills(state);
+      const skills = hearts ? [...copyScoringInput(hearts.skills), { id: 0, name: '门派属性', type: 3, cd: 0, level: 1,
+        effects: copyScoringInput(hearts.passive) }] : array(state.skills).filter((s) => num(s.currentLevel) > 0 &&
         s.skillDetail && num(s.skillDetail.unlockLevel) <= me.level).map((s) => ({
           ...copyScoringInput(s.skillDetail), level: num(s.currentLevel),
           effects: copyScoringInput(array(parse(s.skillDetail.effectConfig, []))),
@@ -1198,8 +1240,7 @@
       };
       const cast = (s, share, channel = channelTicks(s, state)) => ({ id: s?.id, name: s?.name, share,
         bonus: s ? bonus(s) : {}, multiplier: castMultiplier(s, state), ...(channel ? { channel } : {}),
-        hits: s ? (channel ? channel.ticks : Math.max(1, num(s.hitCount))) *
-          (s.effects.some((e) => e.target === 'ALL_ENEMY') ? skillTargets(s, state) : 1) : 1 });
+        hits: s ? (channel ? channel.ticks : Math.max(1, num(s.hitCount))) * (isArea(s) ? skillTargets(s, state) : 1) : 1 });
       for (const s of skills) {
         if (num(s.type) === 3) for (const e of s.effects) {
           if (calcType(e) !== 'MULTIPLY') continue;
@@ -1227,6 +1268,7 @@
         }
       }
       casts.push(cast(filler, filler ? Math.max(0, 1 - used) : 1));
+      for (const b of hearts?.buffs || []) buffMult[camel(b.attr)] = (buffMult[camel(b.attr)] ?? 1) * (1 + b.value);
       const petBuffs = petOwnerBuffs(state);
       addStats(buffs, petBuffs);
       const normal = state.scoringProfile ? [] : state.monsters.filter((m) => m.category === 'MONSTER');
@@ -2171,6 +2213,9 @@
           expiresAt: team.expiresAt, leader: team.leaderId === role.id } : null,
         fighting: board ? fighting : null, unclaimed: board ? unclaimed : null,
         fragments: board ? array(board.fragments).filter(f => f.count > 0).map(({ name, count }) => ({ name, count })) : null,
+        // 心法 and 招式 fragments of the client of 2026-11-28: five of one name exchange into its 秘籍 or 要诀.
+        study: board ? array(board.studyFragments).filter(f => num(f?.count) > 0).map(f => ({ name: f.rewardName || f.name,
+          heart: !!f.heart, count: num(f.count), required: num(f.required) })) : null,
         today: Object.fromEntries(['visits','joined','created','fights','claimed','won','lost'].map(k => [k, num(daily?.[k])])),
         nextVisitAt: exhausted ? board.endsAt + INVASION_ROUND_DELAY : Math.min(regular, roundStart),
         boardAt: s?.invasion?.at ?? null };
@@ -2937,71 +2982,60 @@
       // 0 means unlimited.
       return cap == null || cap <= 0 || num(ledger.ops[a.family]) < cap;
     }
-    function skillCandidates(s, p) {
-      const level = num(s.role?.level);
-      return array(s.skills)
-        .filter(
-          (sk) =>
-            sk.skillDetail &&
-            level >= num(sk.skillDetail.unlockLevel) &&
-            num(sk.currentLevel) < Math.min(num(sk.skillDetail.maxLevel), p.growth.maxSkillLevel),
-        )
-        .sort((a, b) => {
-          const ai = p.growth.skillPriority.indexOf(num(a.skillDetail.id)),
-            bi = p.growth.skillPriority.indexOf(num(b.skillDetail.id));
-          return (
-            (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) ||
-            num(a.currentLevel) - num(b.currentLevel) ||
-            skillCost(a).exp - skillCost(b).exp
-          );
+    // What the growth automation can level: the 心法 of the client of 2026-11-28 (the server gives each its next cost
+    // and level cap; UPGRADE_SKILL {action: 'upgrade', id, expectedLevel}), else the old skills. A 心法 is ranked by its
+    // own id or by the id of any of its skills in the priority list. The client disables 升级心法 in battle and the
+    // server refuses 姿态 and 怒气招式 changes in battle (「请先结束挂机…」, live 2026-11-28), so it waits for a pause.
+    function upgradeEntries(s) {
+      const book = s?.characterSkills;
+      if (book && Array.isArray(book.hearts))
+        return book.hearts.filter((h) => h?.definition && num(h.level) > 0 && h.cost).map((h) => {
+          const id = num(h.definition.id);
+          return { id, name: h.definition.name, kind: '心法', level: num(h.level), max: num(h.cap),
+            unlock: num(h.definition.minLevel), cost: { exp: num(h.cost.exp), money: num(h.cost.money) },
+            ranks: [id, ...array(book.skills).filter((e) => num(e?.definition?.heart) === id).map((e) => num(e.definition.id))],
+            payload: { action: 'upgrade', id, expectedLevel: num(h.level) }, inBattle: false };
         });
+      return array(s?.skills).filter((sk) => sk.skillDetail).map((sk) => ({ id: num(sk.id), name: sk.skillDetail.name,
+        kind: '技能', level: num(sk.currentLevel), max: num(sk.skillDetail.maxLevel), unlock: num(sk.skillDetail.unlockLevel),
+        cost: skillCost(sk), ranks: [num(sk.skillDetail.id)], payload: { roleSkillId: num(sk.id) }, inBattle: true }));
     }
-    function skillAction(sk) {
-      const cost = skillCost(sk);
-      return action(
-        'UPGRADE_SKILL',
-        { roleSkillId: num(sk.id) },
-        '升级技能「' + sk.skillDetail.name + '」',
-        'growth',
-        { moneyCost: cost.money, expCost: cost.expCost || cost.exp, inBattle: true },
-      );
+    function skillCandidates(s, p) {
+      const level = num(s.role?.level), rank = (entry) => {
+        const found = entry.ranks.map((id) => p.growth.skillPriority.indexOf(id)).filter((i) => i >= 0);
+        return found.length ? Math.min(...found) : 999;
+      };
+      return upgradeEntries(s)
+        .filter((entry) => level >= entry.unlock && entry.level < Math.min(entry.max, p.growth.maxSkillLevel))
+        .sort((a, b) => rank(a) - rank(b) || a.level - b.level || a.cost.exp - b.cost.exp);
+    }
+    function skillAction(entry) {
+      const cost = entry.cost;
+      return action('UPGRADE_SKILL', entry.payload, '升级' + entry.kind + '「' + entry.name + '」', 'growth',
+        { moneyCost: cost.money, expCost: cost.expCost || cost.exp, inBattle: entry.inBattle });
     }
     function skillProgress(s, prefs, ledger) {
       if (!s?.role || !num(s.role.id) || !ledger) return null;
       const p = config(prefs);
-      const done = (code, reason, ready = false, skill = null) => ({ code, reason, ready, skill });
+      const done = (code, reason, ready = false, skill = null, key = null) => ({ code, reason, ready, skill, key });
       if (!p.growth.skills) return done('disabled', '自动升级技能已关闭');
-      if (!array(s.skills).length) return done('data', '等待技能数据');
+      if (!upgradeEntries(s).length) return done('data', '等待技能数据');
       const list = skillCandidates(s, p);
       if (!list.length)
         return done(
           'target',
           '已解锁技能均达上限（目标 ' + p.growth.maxSkillLevel + ' 级），或尚未到解锁等级',
         );
-      for (const sk of list)
-        if (!budgetBlock(skillAction(sk), s, p, ledger)) {
-          const c = skillCost(sk);
-          return done(
-            'ready',
-            '技能「' +
-              sk.skillDetail.name +
-              '」Lv.' +
-              num(sk.currentLevel) +
-              ' 可升级（' +
-              num(c.exp).toLocaleString('zh-CN') +
-              ' 经验 · ' +
-              num(c.money).toLocaleString('zh-CN') +
-              ' 金币）',
-            true,
-            num(sk.id),
-          );
-        }
+      for (const entry of list) {
+        const a = skillAction(entry);
+        if (!budgetBlock(a, s, p, ledger))
+          return done('ready', entry.kind + '「' + entry.name + '」Lv.' + entry.level + ' 可升级（' +
+            entry.cost.exp.toLocaleString('zh-CN') + ' 经验 · ' + entry.cost.money.toLocaleString('zh-CN') + ' 金币）',
+          true, entry.id, a.key + ':level=' + entry.level);
+      }
       const top = list[0],
         block = budgetBlock(skillAction(top), s, p, ledger);
-      return done(
-        block.code,
-        '技能「' + top.skillDetail.name + '」Lv.' + num(top.currentLevel) + ' 暂不能升级：' + block.reason,
-      );
+      return done(block.code, top.kind + '「' + top.name + '」Lv.' + top.level + ' 暂不能升级：' + block.reason);
     }
     function action(type, payload, label, family, options = {}) {
       return {
@@ -4333,9 +4367,8 @@
       for (const a of out) {
         if (a.type === 'LEVEL_UP') a.key += ':level=' + num(role.level);
         else if (a.type === 'UPGRADE_SKILL')
-          a.key +=
-            ':level=' +
-            num(s.skills.find((sk) => num(sk.id) === num(a.payload.roleSkillId))?.currentLevel);
+          a.key += ':level=' + num(a.payload.expectedLevel ??
+            array(s.skills).find((sk) => num(sk.id) === num(a.payload.roleSkillId))?.currentLevel);
       }
       return out;
     }
@@ -4564,7 +4597,7 @@
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, boundFilterMatch, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
-      CHANNEL_SKILLS, CHANNEL_GUESS, channelTicks,
+      CHANNEL_SKILLS, CHANNEL_GUESS, channelTicks, heartSkills,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
       tradeRules, tradeNeedsTarget, tradeTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText, tradeAssetNames,
@@ -4611,7 +4644,7 @@
       potionPick,
       potionThreshold,
       potionOrder,
-      skillCost,
+      skillCost, upgradeEntries, skillCandidates, skillAction,
       synthRate, synthUnits,
       petScreenable, claimedLocked, petRoomBlocked, PET_FULL_TEXT,
       breedable, breedingReady, breedingPick, breedingStatus,
@@ -5067,11 +5100,11 @@
     }
     const statsFields = 'wall battle exp expBase gold sell potion hpPotions mpPotions kills deaths hpLost mpUsed low'.split(' ');
     const statsTotals = () => Object.fromEntries(statsFields.map((k) => [k, 0]));
-    // Stored channel counts keep only known skills with whole [casts, ticks]. A cast that spans an hour counts in one
+    // Stored channel counts keep skill ids with whole [casts, ticks]. A cast that spans an hour counts in one
     // bucket and may tick in the next, so a bucket may hold more ticks than its casts allow.
     function savedChannels(value) {
       if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-      const kept = Object.entries(value).filter(([id, v]) => Object.hasOwn(P.CHANNEL_SKILLS, id) && Array.isArray(v) &&
+      const kept = Object.entries(value).filter(([id, v]) => /^[1-9]\d*$/.test(id) && Array.isArray(v) &&
         v.length === 2 && v.every((n) => Number.isInteger(n) && n >= 0));
       return kept.length ? Object.fromEntries(kept) : undefined;
     }
@@ -5383,24 +5416,34 @@
         }
         return battle >= 600000 && pet + own > 0 ? pet / (pet + own) : null;
       }
-      // Per bucket and channel skill: [casts, ticks]. A cast counts when its castId first shows in activeChannels.
-      // A tick counts from the log: 「你施展【金顶绵掌】(第1击)，对…」 has one line per target, and a tick that kills the
-      // last target leaves activeChannels empty in the same state (live on 2026-11-24).
+      // Per bucket and channel skill: [casts, ticks], keyed by the skill id the channel reports (the 心法 client of
+      // 2026-11-28 still reports the old ids 25, 30 and 35). A cast counts when its skill shows up in activeChannels or
+      // its elapsedMs starts over; castId no longer works, it changes with every tick since 2026-11-28. A tick counts from
+      // the log: 「你施展【金顶绵掌】(第1击)，对…」 has one line per target (every tick is 第1击 since 2026-11-28), and a tick
+      // that kills the last target leaves activeChannels empty in the same state (live on 2026-11-24). A log name maps to
+      // the id of a channel active now or in the state before, through the combat state's skills (id and old id).
       channels(d, b) {
         const count = (id, i) => { ((b.channel ||= {})[id] ||= [0, 0])[i]++; };
-        const seen = new Set(), ticks = new Set();
+        const elapsed = new Map(), ticks = new Set(), before = this.channelElapsed || new Map();
         for (const c of d.stage === 'running' ? P.array(d.activeChannels) : []) {
-          if (!P.CHANNEL_SKILLS[c?.skillId] || c.sourceId !== 'player' || typeof c.castId !== 'string') continue;
-          if (!this.channelCasts?.has(c.castId)) count(c.skillId, 0);
-          seen.add(c.castId);
+          const id = String(P.num(c?.skillId)), at = P.num(c?.elapsedMs);
+          if (c?.sourceId !== 'player' || id === '0' || elapsed.has(id)) continue;
+          if (!before.has(id) || at < before.get(id)) count(id, 0);
+          elapsed.set(id, at);
         }
+        const channelId = (name) => {
+          const skill = P.array(d.player?.skills).find((sk) => sk?.name === name);
+          const ids = [skill?.id, skill?.character?.legacy].filter((v) => P.num(v) > 0).map(String);
+          return ids.find((id) => elapsed.has(id) || before.has(id)) ??
+            Object.keys(P.CHANNEL_SKILLS).find((k) => P.CHANNEL_SKILLS[k].name === name);
+        };
         for (const line of P.array(d.logs)) {
           const m = typeof line?.text === 'string' && /你施展【([^】]+)】\(第(\d+)击\)/.exec(line.text);
-          const id = m && Object.keys(P.CHANNEL_SKILLS).find((k) => P.CHANNEL_SKILLS[k].name === m[1]);
+          const id = m && channelId(m[1]);
           if (id) ticks.add(id + ':' + m[2]);
         }
         for (const key of ticks) count(key.split(':')[0], 1);
-        this.channelCasts = seen;
+        this.channelElapsed = elapsed;
       }
       // Average ticks per cast over the latest two battle hours of farm maps, for skills cast at least 20 times there.
       channelTicks(isFarmMap) {
@@ -6475,6 +6518,7 @@
           equipments: copy(c.equipments) || [],
           bagItems: copy(c.bagItems) || [],
           skills: copy(c.skills) || [],
+          characterSkills: copy(c.characterSkills),
           artifactSkills: copy(Array.from(c.artifactSkillConfigs?.values() || [])),
           maps: copy(c.maps) || [],
           equipSets: copy(c.equipSets) || [],
@@ -6670,8 +6714,12 @@
         });
       }
     }
-    // 九州商会「我要出售」: a 「最大」 button between each picked item's count box and its 「移除」, and staying on the
-    // tab after the player's own sale listing. The client switches to 「我的交易」 on success (market-window, 2026-11-24).
+    // The selected tab of the bag and the warehouse: class is-active, and aria-pressed since the client of 2026-11-28.
+    const ACTIVE_TAB = '.game-tab-button.is-active, .game-tab-button[aria-pressed="true"]';
+    // 九州商会「我要出售」: a 「最大」 button right after each picked item's count box, and staying on the tab after the
+    // player's own sale listing. The client switches to 「我的交易」 on success (market-window, 2026-11-24). Since
+    // 2026-11-28 a sale holds one item in .single-shelf-actions and a barter up to six in .picked rows; the button
+    // beside the box reads 「移出」 (「移除」 before).
     class MarketSellTools {
       constructor(controller, schedule = (fn, ms) => setTimeout(fn, ms)) {
         this.controller = controller;
@@ -6683,17 +6731,18 @@
           for (const button of doc.querySelectorAll('.tl-max')) button.remove();
           return;
         }
-        for (const row of doc.querySelectorAll('.market-window .picked')) {
+        for (const row of doc.querySelectorAll('.market-window .picked, .market-window .single-shelf-actions')) {
           const input = row.querySelector('input[type=number]');
-          const remove = [...row.children].find((b) => b.tagName === 'BUTTON' && b.textContent.trim() === '移除');
-          if (!input || !remove || row.querySelector('.tl-max')) continue;
+          const remove = [...row.children].find((b) => b.tagName === 'BUTTON' && ['移除', '移出'].includes(b.textContent.trim()));
+          const box = input && [...row.children].find((n) => n === input || n.querySelector?.('input[type=number]') === input);
+          if (!box || !remove || row.querySelector('.tl-max')) continue;
           const button = remove.cloneNode(false);
           button.type = 'button';
           button.classList.add('tl-max');
           button.textContent = '最大';
           button.title = '填入最大数量';
           button.addEventListener('click', () => this.fillMax(input));
-          remove.before(button);
+          box.after(button);
         }
       }
       // The count box is a v-model number input: the game reads it on the input event.
@@ -7252,6 +7301,7 @@
               role,
               ...(this.controller.bridge.noBatchSell ? { batchSell: false } : {}),
               skills: copy(field('skills')),
+              characterSkills: copy(field('characterSkills')),
               artifactSkills: copy(Array.from(field('artifactSkillConfigs')?.values() || [])),
               maps: field('maps'),
               finalAttributes: copy(field('finalAttributes')),
@@ -7354,7 +7404,8 @@
       // White "ID:<id>" in the bottom right corner of a character window, because 商会 trades name buyers by role id
       // and the game shows none. A viewed window (class character-window-center) takes the id of its own component.
       drawRoleIds() {
-        const windows = document.querySelectorAll('.original-profile');
+        // Since 2026-11-28 most windows carry original-profile; only the character windows get the id.
+        const windows = document.querySelectorAll('.original-profile.character-window, .original-profile.character-window-center');
         if (!windows.length) return;
         const bridge = this.controller.bridge, viewed = (win) => /\bcharacter-window-center\b/.test(win.className);
         const instances = Array.from(windows).some(viewed) ?
@@ -7663,10 +7714,10 @@
       }
       bagTab(grid, frame) {
         let root = grid,
-          tab = frame?.querySelector('.game-tab-button.is-active');
+          tab = frame?.querySelector(ACTIVE_TAB);
         for (let i = 0; root && !tab; i++) {
           root = root.parentElement;
-          tab = root?.querySelector('.game-tab-button.is-active');
+          tab = root?.querySelector(ACTIVE_TAB);
         }
         return tab ? tab.textContent.trim() : null;
       }
@@ -7744,7 +7795,7 @@
         if (grid._tlBagObserver || typeof MutationObserver === 'undefined') return;
         grid._tlBagObserver = new MutationObserver(() => this.schedule());
         grid._tlBagObserver.observe(frame.closest('.inventory-window, .warehouse-window') || frame,
-          { subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+          { subtree: true, attributes: true, attributeFilter: ['class', 'style', 'aria-pressed'] });
       }
       scanBagGrid(grid, state, prefs, view, getCollection) {
         const { bagFilter, setTag } = prefs.market, filter = this.bagFilter;
@@ -7803,7 +7854,7 @@
           global = visible?.length === rows.length && found.every(({ info }, i) => MarketScore.rowKey(info) === visible[i]),
           role = !global && prefs.market.hideUnbuyable ? this.role() : null;
         rows.forEach((row, i) => {
-          const text = row.querySelector('.product-info > span'),
+          const text = [...row.querySelectorAll('.product-info > span')].find((n) => !n.classList.contains('service-icon')),
             old = Array.from(row.querySelectorAll('.tl-market-score'));
           const want = state && text ? this.label(row, state, prefs, view, found[i]) : null;
           const keep = want && old.find((n) => n.parentElement === text);
@@ -8832,8 +8883,7 @@
           : null;
         const skillUp = P.skillProgress(s, this.prefs, ledger);
         if (skillUp?.ready) {
-          const sk = P.array(s.skills).find((v) => P.num(v.id) === skillUp.skill);
-          const key = 'UPGRADE_SKILL:' + JSON.stringify({ roleSkillId: skillUp.skill }) + ':level=' + P.num(sk?.currentLevel);
+          const key = skillUp.key;
           if (!this.enabled) skillUp.reason += '；点击“开始托管”后继续';
           else if ((this.suppressed.get(key) || 0) > Date.now())
             skillUp.reason += '；上次升级未确认，暂缓重试';
@@ -10092,7 +10142,7 @@
         // a filled cell is one that holds an icon.
         const filled = (node) => !!node.querySelector('.v-img, img');
         if (!win || !grid?.matches('.inventory-grid') || !filled(cell)) return null;
-        const tab = win.querySelector('.game-tab-button.is-active')?.textContent.trim();
+        const tab = win.querySelector(ACTIVE_TAB)?.textContent.trim();
         const bound = win.querySelector(BAG_BOUND_SELECT)?.value || 'all';
         const cells = Array.from(grid.children).filter(node => node.matches('.grid-slot'));
         const character = this.bridge.character(), count = P.bagTabItems(tab, character, bound).length;
@@ -10102,7 +10152,7 @@
         return P.bagCellItem(tab, index, character, bound);
       }
       warehouseTab(target) {
-        return target?.closest?.('.warehouse-window')?.querySelector('.game-tab-button.is-active')?.textContent.trim();
+        return target?.closest?.('.warehouse-window')?.querySelector(ACTIVE_TAB)?.textContent.trim();
       }
       warehouseCell(target) {
         const cell = target?.closest?.('div.grid-slot'), grid = cell?.parentElement;
@@ -10325,7 +10375,8 @@
         this.doc.querySelectorAll('div.gem-shop-window, div.smithy-shop-window, div.tailor-shop-window, section.pet-panel').forEach((root) => this.insert(root));
       }
       insert(root) {
-        const header = root.querySelector('div.game-header > div.d-flex.align-center') || root.closest('[class*="window"]')?.querySelector('div.game-header > div.d-flex.align-center');
+        const header = root.querySelector('div.game-header > div.d-flex.align-center') || root.closest('[class*="window"]')?.querySelector('div.game-header > div.d-flex.align-center') ||
+          root.querySelector('nav.workshop-tabs');
         if (!header || header.querySelector('[data-tl-fill]')) return;
         const button = this.doc.createElement('button');
         button.type = 'button';
@@ -12164,8 +12215,8 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             g('人物与技能',
             f('自动升级人物', 'growth.level') +
             f('人物目标等级', 'growth.maxLevel', { unit: '级', dependsOn: 'growth.level' }) +
-            f('自动升级技能', 'growth.skills') +
-            f('技能最高等级', 'growth.maxSkillLevel', { unit: '级', dependsOn: 'growth.skills' }) +
+            f('自动升级技能', 'growth.skills', { help: '游戏 11 月 28 日起技能按心法升级：升级的是心法，招式随所属心法的等级。心法只能在不战斗时升级，脚本会暂停一轮战斗去升级。优先技能模板ID可填心法ID或它任一招式的ID' }) +
+            f('技能最高等级', 'growth.maxSkillLevel', { unit: '级', dependsOn: 'growth.skills', help: '心法另受游戏给的当前上限限制' }) +
             f('技能优先于人物升级', 'growth.skillBeforeLevel', { dependsOn: 'growth.skills' }) +
             f('优先技能模板ID', 'growth.skillPriority', { help: '逗号分隔', dependsOn: 'growth.skills' }), true) +
             g('装备方案', '<div class="gear-profile-status">' + this.profileStatusHTML(status) + '</div>' +
@@ -12251,7 +12302,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('逛商会按脚本排序', 'market.sort', { immediate: true, help: '脚本读取全部页（最多 30 页，每分钟刷新）后整体排序再按页显示：装备在前，其余按游戏顺序。超过 30 页或读取失败时只排当前这一页。商会窗口排序框右边的“脚本排序”是同一个设置', choices: [['off', '关'], ['power', '战斗力从高到低'], ['combat', '实战评分从高到低'], ['gain', '实战提升从高到低']] }) +
             f('逛商会隐藏无法购买的商品', 'market.hideUnbuyable', { immediate: true, help: '所有页都不显示自己上架的和指定卖给他人的商品，页数按剩下的重新计算。商会窗口里“适合我的等级”左边的“隐藏无法购买”是同一个开关' })) +
           g('商会出售',
-            f('数量框旁显示“最大”', 'convenience.marketMax', { help: '九州商会“我要出售”选中道具或材料后，数量框和“移除”之间多一个“最大”，点一下填入这件物品能卖的最大数量' }) +
+            f('数量框旁显示“最大”', 'convenience.marketMax', { help: '九州商会“我要出售”选中道具或材料后，数量框后面多一个“最大”，点一下填入这件物品能卖的最大数量' }) +
             f('确认上架后留在“我要出售”', 'convenience.marketStay', { help: '游戏上架成功后会跳到“我的交易”；开启后留在“我要出售”并刷新可上架的物品，方便连续上架。以物易物和脚本的自动上架不受影响' })) +
           g('工坊',
             f('显示“一键放入”按钮', 'fill.enabled', { help: '在游戏窗口显示' }) +
@@ -12866,6 +12917,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
           this.statRow('我的队伍', team) + this.statRow('待领取', r.unclaimed + ' 场') +
           this.statRow('今日', '回城 ' + r.today.visits + ' 次 · 参加 ' + r.today.fights + ' 场 · 领取 ' + r.today.claimed + ' 次') +
           this.statRow('残页', r.fragments.map(f => f.name + ' × ' + f.count).join('、') || '—') +
+          (r.study?.length ? this.statRow('碎片', r.study.map(f => f.name + (f.heart ? ' 心法碎片 ' : ' 招式碎片 ') + f.count + '/' + f.required).join('、')) : '') +
           this.statRow('下次回大理', time(r.nextVisitAt));
       }
       gearCheckHTML(gear) {
