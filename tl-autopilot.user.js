@@ -120,7 +120,7 @@
         smeltExpPerDay: 1000000,
       },
       battle: { enabled: true, mapId: 0, levelOffset: 5, smart: false, smartGoal: 'exp', smartMaps: 4,
-        smartMinutes: 10, smartHours: 6, recoverDeath: true, deathDowngrade: true, maxDeathsPerHour: 3 },
+        smartMinutes: 10, smartHours: 6, recoverDeath: true, deathDowngrade: true, maxDeathsPerHour: 3, queueSkills: true },
       activities: {
         enabled: true,
         zl: true,
@@ -1140,6 +1140,27 @@
     const HEART_STATS = { 外攻: 'EXT_ATK', 内攻: 'INT_ATK', 外防: 'EXT_DEF', 内防: 'INT_DEF', 冰攻: 'ICE_ATK', 火攻: 'FIRE_ATK',
       毒攻: 'POISON_ATK', 玄攻: 'HOLY_ATK', 最大气血: 'HP', 会心: 'CRIT_RATE', 命中: 'PRECISION', 闪避: 'AVOIDANCE' };
     const HEART_ELEMENTS = ['ICE', 'FIRE', 'POISON', 'HOLY'];
+    // 预约招式 (client of 2026-11-28): the server's own choice casts the 心法 skills rarely on farm maps (歌: 9 of a
+    // possible 80 西子捧心 in 22 minutes). Queuing (COMBAT_QUEUE_SKILL, the skill bar's left click) a ready damage skill
+    // worth more than the basic attack (coefficient 1) whenever the queue is empty raised own damage per second by 38%,
+    // 19% and 33% for 歌, 华 and Ai (2 × 2 minutes each, live 2026-11-28). The chosen rage skill goes first when it has
+    // the rage and is off cooldown; queuing past it cut its casts by half. An area skill counts its further targets.
+    function queueChoice(d) {
+      const p = d?.player;
+      if (d?.stage !== 'running' || !p || p.isDead || p.queuedSkillId != null) return null;
+      const now = num(d.serverTime), skills = array(p.skills), ready = (s) => num(s.nextAvailableAt) <= now;
+      const rageSkill = skills.find((s) => num(s?.character?.rage) > 0);
+      if (rageSkill && num(p.characterState?.rage) >= num(rageSkill.character.rage) && ready(rageSkill)) return null;
+      const alive = array(d.monsterSlots).filter((m) => m && !m.isDead).length;
+      let best = null, bestValue = 1;
+      for (const s of skills) {
+        const c = s?.character, coefficient = num(array(c?.damage)[0]);
+        if (!c || c.kind === '普攻' || num(c.rage) > 0 || !(coefficient > 0) || !ready(s)) continue;
+        const value = coefficient + num(c.secondary) * Math.max(0, Math.min(alive, num(c.maxTargets)) - 1);
+        if (value > bestValue) { best = s; bestValue = value; }
+      }
+      return best ? num(best.id) : null;
+    }
     function heartSkills(state) {
       const book = state?.characterSkills;
       if (!book || !Array.isArray(book.skills)) return null;
@@ -4597,7 +4618,7 @@
       template, equipQuality, setTemplateIds, sellPlan, gemScoreOrder, smeltProtected, MATERIAL_TYPES,
       SLOT_NAMES, SLOT_SHORT, setCollection, setOfTemplate, boundFilterMatch, bagFilterMatch, equipmentTemplateId, setIndex,
       poolMaps, scoreTargets, survivalWeight, healPerSecond, scoringStatus, scoringText, SUSTAIN_LINE, LOW_HP_SHARE, HP_LINE,
-      CHANNEL_SKILLS, CHANNEL_GUESS, channelTicks, heartSkills,
+      CHANNEL_SKILLS, CHANNEL_GUESS, channelTicks, heartSkills, queueChoice,
       viewedState, isViewedProfile, viewedSkillsMissing, listingBuyable, profileRoleId, profileState, profileScoreText, profileScoreValue, tooltipContext,
       TRADE_CATEGORIES, TRADE_CURRENCIES, TRADE_FEED, tradeCategory, tradeCategoryKey, tradeRuleId, tradeRule, tradeConfig,
       tradeRules, tradeNeedsTarget, tradeTarget, tradeSafe, tradeCurrency, tradeUnitText, tradeNet, tradeExpiry, tradeClaimText, tradeAssetNames,
@@ -9018,7 +9039,14 @@
           version: '1.5.6',
         };
       }
+      // At most one 预约 a second, while the autopilot runs; the next state shows whether the queue took it.
+      queueSkill(data, now = Date.now()) {
+        if (!this.enabled || !this.prefs.battle.queueSkills || now - (this.queuedSkillAt || 0) < 1000) return;
+        const id = P.queueChoice(data);
+        if (id && this.bridge.sendManual('COMBAT_QUEUE_SKILL', { skillId: id })) this.queuedSkillAt = now;
+      }
       received(type, packet) {
+        if (type === 'COMBAT_STATE') this.queueSkill?.(packet?.data);
         if (type === 'XIAOXIAO_STATE') {
           const roleId = P.num(this.bridge.character()?.role?.id);
           if (roleId && (!packet.data?.roleInfo?.role || roleId === packet.data.roleInfo.role.id)) {
@@ -12148,6 +12176,7 @@ footer{position:absolute;bottom:0;width:100%;flex-wrap:wrap;justify-content:cent
             f('候选地图数', 'battle.smartMaps', { unit: '张', dependsOn: 'battle.smart', min: 2, max: 8 }) +
             f('每图试打', 'battle.smartMinutes', { unit: '分钟', dependsOn: 'battle.smart', min: 5, max: 60 }) +
             f('复查间隔', 'battle.smartHours', { unit: '小时', dependsOn: 'battle.smart', min: 1, max: 48, help: '实测数据超过这个时间就重新试打；明显较差的地图按 4 倍间隔复查' }) +
+            f('自动预约招式', 'battle.queueSkills', { help: '游戏 11 月 28 日起挂机时很少自己放招式。开启后战斗中预约位空着时，替你预约一个已冷却好、比普攻伤害高的招式（同左键点技能栏），群攻按在场怪物数算；出战怒气技能放时先让它放。实测三个角色的输出提高约两到四成' }) +
             f('阵亡后返城重新选择', 'battle.recoverDeath') +
             f('阵亡后降低选图等级', 'battle.deathDowngrade', { help: '每次阵亡把自动选图的等级再降 5 级，刷新页面后恢复；关闭后按原选图等级差挂机。智能选图时改为阵亡的地图暂停 4 个复查间隔（默认 24 小时）', dependsOn: 'battle.recoverDeath' }) +
             f('每小时阵亡上限', 'battle.maxDeathsPerHour', { unit: '次', help: '达到后暂停托管，0 不限', dependsOn: 'battle.recoverDeath' }) +
